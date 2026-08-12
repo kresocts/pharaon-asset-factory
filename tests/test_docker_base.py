@@ -3,8 +3,10 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
-from pathlib import Path
 from unittest import mock
+
+
+from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +28,7 @@ class DockerfilePolicyTests(unittest.TestCase):
         self.text = DOCKERFILE.read_text(encoding="utf-8")
 
     def test_uses_pinned_official_cuda_development_base(self):
-        self.assertIn("FROM nvidia/cuda:12.4.1-devel-ubuntu22.04", self.text)
+        self.assertIn("FROM nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:", self.text)
         self.assertNotIn("nvidia/cuda:latest", self.text.lower())
 
     def test_defines_python_non_root_user_and_stable_layout(self):
@@ -37,6 +39,7 @@ class DockerfilePolicyTests(unittest.TestCase):
             "INPUT_DIR=/data/input",
             "OUTPUT_DIR=/data/output",
             "WORKSPACE_DIR=/workspace",
+            "HUNYUAN_SOURCE_DIR=/opt/hunyuan3d",
             "WORKDIR /app",
         ):
             self.assertIn(value, self.text)
@@ -78,43 +81,69 @@ class HealthTests(unittest.TestCase):
     def setUpClass(cls):
         cls.health = _load_health_module()
 
-    @mock.patch("shutil.which", return_value=None)
-    def test_cpu_only_health_is_successful_and_truthful(self, _which):
-        report = self.health.collect_health({})
-        self.assertEqual("GPU_NOT_AVAILABLE", report["status"])
-        self.assertEqual("GPU_NOT_AVAILABLE", report["nvidia"]["status"])
-        self.assertFalse(report["nvidia"]["smi_available"])
+    def _ready_cpu_report(self):
+        with (
+            mock.patch.object(self.health.platform, "python_version", return_value="3.10.16"),
+            mock.patch.object(
+                self.health,
+                "_nvidia_diagnostics",
+                return_value={"smi_available": False, "status": "GPU_NOT_AVAILABLE", "devices": []},
+            ),
+            mock.patch.object(self.health, "_cuda_diagnostics", return_value={"version_environment": "12.4", "home": "/usr/local/cuda", "nvcc_available": True}),
+            mock.patch.object(self.health, "_pytorch_diagnostics", return_value={"status": "PYTORCH_AVAILABLE", "cuda_available": False, "cuda_operation": "NOT_ATTEMPTED_NO_GPU"}),
+            mock.patch.object(self.health, "_dependency_diagnostics", return_value={"status": "DEPENDENCY_IMPORTS_READY", "imports": {}}),
+            mock.patch.object(self.health, "_hunyuan_diagnostics", return_value={
+                "source_path": "/opt/hunyuan3d",
+                "source_present": True,
+                "expected_revision": self.health.DEFAULT_HUNYUAN_COMMIT,
+                "revision": self.health.DEFAULT_HUNYUAN_COMMIT,
+                "revision_matches": True,
+                "custom_rasterizer": {"status": "CUSTOM_RASTERIZER_NOT_BUILT_EXPECTED", "compiled_artifacts": []},
+                "differentiable_renderer": {"status": "DIFFERENTIABLE_RENDERER_NOT_BUILT_EXPECTED", "compiled_artifacts": []},
+            }),
+            mock.patch.object(self.health, "_model_diagnostics", return_value={"status": "MODEL_WEIGHTS_NOT_PRESENT_EXPECTED", "detected_files": [], "download_attempted": False}),
+        ):
+            return self.health.collect_health({})
+
+    def test_cpu_only_health_is_successful_and_truthful(self):
+        report = self._ready_cpu_report()
+        self.assertEqual("HUNYUAN_DEPENDENCIES_READY", report["status"])
+        self.assertEqual("GPU_NOT_AVAILABLE", report["gpu_status"])
+        self.assertFalse(report["full_hunyuan_ready"])
+        self.assertFalse(report["pytorch"]["cuda_available"])
 
         output = io.StringIO()
         with mock.patch.object(self.health, "collect_health", return_value=report), redirect_stdout(output):
             self.assertEqual(0, self.health.main(["--json"]))
-        self.assertEqual("GPU_NOT_AVAILABLE", json.loads(output.getvalue())["status"])
+        self.assertEqual("HUNYUAN_DEPENDENCIES_READY", json.loads(output.getvalue())["status"])
 
-    @mock.patch("shutil.which", return_value=None)
-    def test_strict_mode_rejects_missing_gpu(self, _which):
+    def test_strict_mode_rejects_missing_pytorch_gpu(self):
+        report = self._ready_cpu_report()
         output = io.StringIO()
-        with redirect_stdout(output):
+        with mock.patch.object(self.health, "collect_health", return_value=report), redirect_stdout(output):
             self.assertEqual(2, self.health.main(["--require-gpu"]))
         self.assertIn("GPU_STATUS=GPU_NOT_AVAILABLE", output.getvalue())
 
     @mock.patch("shutil.which", return_value=None)
     def test_path_defaults_and_environment_overrides(self, _which):
-        defaults = self.health.collect_health({})["paths"]
+        defaults = self.health._configured_paths({})
         self.assertEqual(self.health.DEFAULT_PATHS, defaults)
-        overridden = self.health.collect_health(
+        overridden = self.health._configured_paths(
             {
                 "MODEL_CACHE_DIR": "/cache/models",
                 "INPUT_DIR": "/job/in",
                 "OUTPUT_DIR": "/job/out",
                 "WORKSPACE_DIR": "/job/work",
+                "HUNYUAN_SOURCE_DIR": "/third-party/hunyuan",
             }
-        )["paths"]
+        )
         self.assertEqual(
             {
                 "model_cache": "/cache/models",
                 "input": "/job/in",
                 "output": "/job/out",
                 "workspace": "/job/work",
+                "hunyuan_source": "/third-party/hunyuan",
             },
             overridden,
         )
@@ -124,12 +153,10 @@ class HealthTests(unittest.TestCase):
             return "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
 
         with mock.patch("shutil.which", side_effect=executable):
-            with mock.patch.object(
-                self.health, "_command_output", return_value=(False, "driver unavailable")
-            ):
-                report = self.health.collect_health({})
+            with mock.patch.object(self.health, "_command_output", return_value=(False, "driver unavailable")):
+                report = self.health._nvidia_diagnostics()
         self.assertEqual("GPU_RUNTIME_ERROR", report["status"])
-        self.assertEqual("driver unavailable", report["nvidia"]["detail"])
+        self.assertEqual("driver unavailable", report["detail"])
 
 
 if __name__ == "__main__":
