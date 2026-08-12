@@ -11,3 +11,7 @@ Create `NNNN-short-title.md` with:
 - **Alternatives considered:** credible options and why they were not chosen
 
 Keep ADRs concise and link the relevant ticket and pull request. Do not rewrite accepted history. If a decision changes, add a new ADR and mark the old one superseded.
+
+## Accepted decisions
+
+- [0001: Stateless run-once orchestrator](0001-stateless-run-once-orchestrator.md)

@@ -40,6 +40,7 @@ They should then verify dependencies, create `ticket/T-XXXX-short-description` f
 - `tests/` — validator tests
 - `worker/` — provider-neutral worker context, evidence, and Git/GitHub boundaries
 - `reviewer/` - independent review context, decision, validation, and GitHub boundaries
+- `orchestrator/` - run-once selection, claims, persisted state, dispatch boundaries, and reconciliation
 - `.github/` — issue/PR templates and minimal CI
 
 Application, container, and provider-specific directories will be introduced only by tickets that need them.
@@ -81,6 +82,21 @@ python -m reviewer.cli path/to/reviewer-package.json
 ```
 
 The package deliberately combines the unchanged canonical ticket with T-0003 worker evidence, PR identity/diff, CI checks, prior comments, and distinct worker/reviewer identities. See [the reviewer workflow contract](reviewer/README.md) for the two decisions, explicit failure states, stateless repeated reviews, and guarded GitHub posting boundary.
+
+## Orchestrator
+
+Inspect deterministic eligibility or advance at most one bounded orchestration step:
+
+```bash
+python -m orchestrator.cli list-ready
+python -m orchestrator.cli run-once --owner local-run
+```
+
+The state machine persists compare-and-set workflow state and atomic claims, reconstructs
+progress from worker/PR/CI/reviewer evidence after restart, and exposes provider-neutral
+dispatch interfaces only. It includes no LLM, paid/cloud provider, merge operation, or
+endless loop. See [the orchestrator contract](orchestrator/README.md).
+
 
 ## Security and cost control
 
