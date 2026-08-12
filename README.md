@@ -38,6 +38,7 @@ They should then verify dependencies, create `ticket/T-XXXX-short-description` f
 - `tickets/` — canonical specifications and machine-readable ticket state
 - `validation/` — dependency-free repository metadata validator
 - `tests/` — validator tests
+- `worker/` — provider-neutral worker context, evidence, and Git/GitHub boundaries
 - `.github/` — issue/PR templates and minimal CI
 
 Application, container, and provider-specific directories will be introduced only by tickets that need them.
@@ -59,6 +60,16 @@ The command runs the complete automated test suite followed by repository metada
 GitHub Actions runs baseline CI for pull requests targeting `main` and pushes to `main`, with read-only repository permissions. Tests and metadata validation remain separate workflow steps for clear failure reporting. New commits supersede older in-progress runs for the same pull request or branch without cancelling unrelated work.
 
 Future tickets should extend the canonical entry point with a distinct, documented stage and add a corresponding workflow step when separate CI reporting is useful. They should not add another workflow that repeats existing baseline checks.
+
+## Worker preparation
+
+Prepare the deterministic context for exactly one runnable ticket without an AI provider or GitHub credentials:
+
+```bash
+python -m worker.cli T-0003
+```
+
+Use `--ensure-branch` only when the caller intends to create or reuse the canonical ticket branch from `origin/main`. See [the worker workflow contract](worker/README.md) for result states, evidence requirements, and the optional GitHub boundary.
 
 ## Security and cost control
 
