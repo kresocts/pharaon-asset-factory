@@ -4,7 +4,7 @@ Pharaon Asset Factory is the foundation for a future reproducible AI game-asset 
 
 ## Current status
 
-Phase 0 is complete. Phase 1 now includes the reproducible CUDA/Python base plus a pinned PyTorch and Hunyuan3D dependency layer. The image includes CPU-safe diagnostics and stable mount paths but intentionally does **not** include model weights, native Hunyuan rendering extensions, inference, GPU provisioning, or a web interface. See [the GPU image guide](docker/README.md).
+Phase 0 is complete. Phase 1 now includes the reproducible CUDA/Python base, pinned PyTorch and Hunyuan3D dependencies, and compiled Hunyuan native rasterizer/mesh-painter extensions for CUDA architectures 8.6 and 8.9. CPU-safe diagnostics distinguish native readiness from full inference readiness; model weights, inference, GPU provisioning, and a web interface remain intentionally absent. See [the GPU image guide](docker/README.md).
 
 ## Intended architecture
 

@@ -98,16 +98,17 @@ class HealthTests(unittest.TestCase):
                 "expected_revision": self.health.DEFAULT_HUNYUAN_COMMIT,
                 "revision": self.health.DEFAULT_HUNYUAN_COMMIT,
                 "revision_matches": True,
-                "custom_rasterizer": {"status": "CUSTOM_RASTERIZER_NOT_BUILT_EXPECTED", "compiled_artifacts": []},
-                "differentiable_renderer": {"status": "DIFFERENTIABLE_RENDERER_NOT_BUILT_EXPECTED", "compiled_artifacts": []},
+                "custom_rasterizer": {"status": "CUSTOM_RASTERIZER_BUILT", "compiled_artifacts": []},
+                "differentiable_renderer": {"status": "DIFFERENTIABLE_RENDERER_BUILT", "compiled_artifacts": []},
             }),
+            mock.patch.object(self.health, "_native_diagnostics", return_value={"status": "NATIVE_IMPORTS_READY", "gpu_operation": {"status": "NOT_ATTEMPTED"}, "cuda_architectures": "8.6;8.9", "modules": {}}),
             mock.patch.object(self.health, "_model_diagnostics", return_value={"status": "MODEL_WEIGHTS_NOT_PRESENT_EXPECTED", "detected_files": [], "download_attempted": False}),
         ):
             return self.health.collect_health({})
 
     def test_cpu_only_health_is_successful_and_truthful(self):
         report = self._ready_cpu_report()
-        self.assertEqual("HUNYUAN_DEPENDENCIES_READY", report["status"])
+        self.assertEqual("HUNYUAN_NATIVE_EXTENSIONS_READY", report["status"])
         self.assertEqual("GPU_NOT_AVAILABLE", report["gpu_status"])
         self.assertFalse(report["full_hunyuan_ready"])
         self.assertFalse(report["pytorch"]["cuda_available"])
@@ -115,7 +116,7 @@ class HealthTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(self.health, "collect_health", return_value=report), redirect_stdout(output):
             self.assertEqual(0, self.health.main(["--json"]))
-        self.assertEqual("HUNYUAN_DEPENDENCIES_READY", json.loads(output.getvalue())["status"])
+        self.assertEqual("HUNYUAN_NATIVE_EXTENSIONS_READY", json.loads(output.getvalue())["status"])
 
     def test_strict_mode_rejects_missing_pytorch_gpu(self):
         report = self._ready_cpu_report()

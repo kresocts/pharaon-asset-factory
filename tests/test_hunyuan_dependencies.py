@@ -49,17 +49,18 @@ class DependencyPolicyTests(unittest.TestCase):
         self.assertNotIn("mirrors.cloud.tencent.com", self.lockfile)
         self.assertNotIn("mirrors.aliyun.com", self.lockfile)
 
-    def test_no_model_download_or_native_extension_compile_step(self):
+    def test_no_model_download_and_non_editable_native_install(self):
         lower = self.dockerfile.lower()
         for forbidden in (
             "wget ",
             "curl ",
             "from_pretrained",
             "pip install -e",
-            "compile_mesh_painter.sh",
+
             "realesrgan_x4plus.pth",
         ):
             self.assertNotIn(forbidden, lower)
+        self.assertIn("compile_mesh_painter.sh", lower)
         self.assertNotIn("/models/", lower)
         self.assertIn('VOLUME ["/models", "/data/input", "/data/output"]', self.dockerfile)
 
@@ -75,7 +76,7 @@ class DiagnosticContractTests(unittest.TestCase):
         cls.health = _load(HEALTH_PATH, "t0011_health")
         cls.smoke = _load(SMOKE_PATH, "t0011_dependency_smoke")
 
-    def test_native_extensions_are_reported_as_intentionally_absent(self):
+    def test_missing_native_extensions_are_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "hunyuan3d"
             (source / "hy3dpaint" / "custom_rasterizer").mkdir(parents=True)
@@ -87,10 +88,10 @@ class DiagnosticContractTests(unittest.TestCase):
                 {"HUNYUAN_COMMIT": EXPECTED_COMMIT, "HUNYUAN_REVISION_FILE": str(revision)},
             )
         self.assertTrue(report["revision_matches"])
-        self.assertEqual("CUSTOM_RASTERIZER_NOT_BUILT_EXPECTED", report["custom_rasterizer"]["status"])
-        self.assertEqual("DIFFERENTIABLE_RENDERER_NOT_BUILT_EXPECTED", report["differentiable_renderer"]["status"])
+        self.assertEqual("CUSTOM_RASTERIZER_NOT_BUILT", report["custom_rasterizer"]["status"])
+        self.assertEqual("DIFFERENTIABLE_RENDERER_NOT_BUILT", report["differentiable_renderer"]["status"])
 
-    def test_compiled_native_artifact_is_not_false_readiness(self):
+    def test_compiled_native_artifact_is_reported(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "hunyuan3d"
             custom = source / "hy3dpaint" / "custom_rasterizer"
@@ -99,7 +100,7 @@ class DiagnosticContractTests(unittest.TestCase):
             renderer.mkdir(parents=True)
             (custom / "rasterizer.so").write_bytes(b"not a real extension")
             report = self.health._hunyuan_diagnostics({"hunyuan_source": str(source)}, {})
-        self.assertEqual("CUSTOM_RASTERIZER_BUILT_UNEXPECTED", report["custom_rasterizer"]["status"])
+        self.assertEqual("CUSTOM_RASTERIZER_BUILT", report["custom_rasterizer"]["status"])
 
     def test_dependency_smoke_imports_representatives_with_offline_guards(self):
         modules = {
