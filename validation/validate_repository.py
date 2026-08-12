@@ -33,7 +33,7 @@ REQUIRED_PATHS = {
     "tickets/README.md",
     ".github/ISSUE_TEMPLATE/implementation-ticket.yml",
     ".github/pull_request_template.md",
-    ".github/workflows/metadata.yml",
+    ".github/workflows/ci.yml",
     ".gitignore",
 }
 
