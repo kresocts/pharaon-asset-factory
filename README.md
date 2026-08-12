@@ -39,6 +39,7 @@ They should then verify dependencies, create `ticket/T-XXXX-short-description` f
 - `validation/` — dependency-free repository metadata validator
 - `tests/` — validator tests
 - `worker/` — provider-neutral worker context, evidence, and Git/GitHub boundaries
+- `reviewer/` - independent review context, decision, validation, and GitHub boundaries
 - `.github/` — issue/PR templates and minimal CI
 
 Application, container, and provider-specific directories will be introduced only by tickets that need them.
@@ -70,6 +71,16 @@ python -m worker.cli T-0003
 ```
 
 Use `--ensure-branch` only when the caller intends to create or reuse the canonical ticket branch from `origin/main`. See [the worker workflow contract](worker/README.md) for result states, evidence requirements, and the optional GitHub boundary.
+
+## Reviewer preparation
+
+Validate a deterministic local reviewer evidence package without an AI provider or GitHub credentials:
+
+```bash
+python -m reviewer.cli path/to/reviewer-package.json
+```
+
+The package deliberately combines the unchanged canonical ticket with T-0003 worker evidence, PR identity/diff, CI checks, prior comments, and distinct worker/reviewer identities. See [the reviewer workflow contract](reviewer/README.md) for the two decisions, explicit failure states, stateless repeated reviews, and guarded GitHub posting boundary.
 
 ## Security and cost control
 
