@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+htmlcov/
+
+# Virtual environments and local environment/secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.*
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build, generated artifacts, caches, and temporary files
+build/
+dist/
+artifacts/
+outputs/
+tmp/
+temp/
+*.tmp
+*.log
+
+# Models and large ML caches
+models/
+weights/
+checkpoints/
+.cache/
+huggingface/
+*.ckpt
+*.safetensors
+*.onnx
+*.pt
+*.pth

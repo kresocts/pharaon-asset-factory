@@ -1,0 +1,65 @@
+name: Implementation ticket
+description: Propose one focused, testable implementation ticket
+title: "[T-XXXX] "
+labels:
+  - ticket
+body:
+  - type: markdown
+    attributes:
+      value: Before submitting, read `AGENTS.md` and `tickets/README.md`. Do not include secrets.
+  - type: input
+    id: ticket_id
+    attributes:
+      label: Ticket ID
+      placeholder: T-XXXX
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: State one concrete outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and dependencies
+      description: Explain why this is needed and list prerequisite ticket IDs.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Allowed scope
+      description: Identify the systems and files that may change.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Provide an objective checklist that reviewers can verify.
+      placeholder: "- [ ] Observable outcome"
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Required tests
+      description: List exact validation commands or review evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of scope
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: This ticket contains no credentials or secrets and does not authorize paid resource creation.
+          required: true
