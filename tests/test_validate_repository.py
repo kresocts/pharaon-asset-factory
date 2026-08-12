@@ -79,7 +79,10 @@ class RepositoryTests(unittest.TestCase):
     def test_current_repository_is_valid(self) -> None:
         root = Path(__file__).resolve().parents[1]
         tickets = validate_repository(root)
-        self.assertEqual({ticket.ticket_id for ticket in tickets}, {f"T-{number:04d}" for number in range(1, 7)})
+        self.assertEqual(
+            {ticket.ticket_id for ticket in tickets},
+            {*(f"T-{number:04d}" for number in range(1, 7)), "T-0010"},
+        )
 
     def test_rejects_missing_dependency(self) -> None:
         root = Path(__file__).resolve().parents[1]
