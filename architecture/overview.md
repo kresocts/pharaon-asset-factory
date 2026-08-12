@@ -35,6 +35,19 @@ An asset request will contain a prompt and/or reference image plus bounded confi
 
 GPU workers should eventually be ephemeral and provider-independent at the job boundary. Models and large caches should live outside the disposable container filesystem. Job inputs, outputs, status, and failure classification should use stable interfaces so a local GPU or a rented provider such as Vast.ai can be substituted without changing the asset pipeline.
 
+The Phase 1 runtime boundary is:
+
+```mermaid
+flowchart LR
+    D["Host NVIDIA driver"] --> N["NVIDIA container runtime"]
+    N --> C["Pinned CUDA development container"]
+    C --> P["Python runtime"]
+    P --> H["Future Hunyuan dependency layer"]
+    M["External model cache volume"] --> H
+```
+
+The host driver exposes GPUs to pinned CUDA userspace through NVIDIA Container Toolkit; the host CUDA toolkit does not need to match the container toolkit. Application code lives under `/app`, while model weights remain outside the image under the separately mounted `/models` cache boundary. See [ADR 0002](decisions/0002-containerized-cuda-runtime.md).
+
 ## Architectural boundaries
 
 - The control plane schedules and records work; it does not contain GPU model logic.
