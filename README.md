@@ -63,6 +63,16 @@ GitHub Actions runs baseline CI for pull requests targeting `main` and pushes to
 
 Future tickets should extend the canonical entry point with a distinct, documented stage and add a corresponding workflow step when separate CI reporting is useful. They should not add another workflow that repeats existing baseline checks.
 
+## Phase 0 handoff validation
+
+T-0006 validates the real ephemeral worker/reviewer handoff with a deliberately small repository health command; it does not begin Phase 1. Run:
+
+```bash
+python validation/phase0_status.py
+```
+
+The command reads T-0001 through T-0005, counts the canonical worker, reviewer, and orchestrator workflow tests, and verifies that the documented baseline CI entry point exists. It prints `PHASE_0_READY` and exits zero when all Phase 0 tickets are `DONE`; otherwise it identifies the incomplete state, prints `PHASE_0_INCOMPLETE`, and exits non-zero.
+
 ## Worker preparation
 
 Prepare the deterministic context for exactly one runnable ticket without an AI provider or GitHub credentials:
