@@ -1,53 +1,54 @@
-# GPU base image
+# Hunyuan dependency image
 
-T-0010 provides the provider-neutral CUDA/Python foundation for later asset-worker images. It does not contain Hunyuan3D, PyTorch, model weights, model downloads, or a service.
+T-0011 extends the T-0010 CUDA/Python foundation with pinned PyTorch and Hunyuan3D 2.1 software dependencies. It contains no model weights, automatic downloads, compiled Hunyuan rendering extensions, inference, service, or cloud/provider logic.
 
-## Version choices
+## Immutable version contract
 
-The image uses the official `nvidia/cuda:12.4.1-devel-ubuntu22.04` base pinned to manifest-list digest `sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5` and explicitly installs Python 3.10 into `/opt/venv`. CUDA 12.4 is suitable for modern NVIDIA drivers and Ampere/Ada GPUs such as RTX 3090 and RTX 4090. The development variant includes the compiler toolchain that a later ticket will need for native CUDA extensions. PyTorch is intentionally deferred to T-0011 so its version can be pinned together with the actual model dependency layer.
+| Component | Pinned value |
+| --- | --- |
+| CUDA base | `nvidia/cuda:12.4.1-devel-ubuntu22.04` at digest `sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5` |
+| Python | 3.10 in `/opt/venv` |
+| PyTorch stack | `torch==2.5.1`, `torchvision==0.20.1`, `torchaudio==2.5.1` from `https://download.pytorch.org/whl/cu124` |
+| Hunyuan source | Official Tencent repository at `82920d643c0dc2f7bfd7255f45f62d386edfe60c`, installed in `/opt/hunyuan3d` |
 
-The host supplies the NVIDIA kernel driver; NVIDIA Container Toolkit exposes the GPU and driver libraries to the pinned CUDA userspace in the container. The host does not need an exactly matching CUDA toolkit, but its driver must support the container's CUDA version.
+The build fetches only the full Hunyuan commit, verifies `HEAD` and the pinned upstream `requirements.txt` SHA256 (`ce8954023db68966a6fb2b80253b24c9da81ae48ee9d96f8f4a8d98b4cead289`), records `/opt/hunyuan3d.commit`, and removes `.git`. OCI labels repeat immutable version and purpose data.
+
+To upgrade intentionally, inspect official guidance and the candidate commit, then update `HUNYUAN_COMMIT`, the upstream-requirements checksum, health default, tests, this guide, and ADR 0003 together. Repeat CPU/GPU validation. Never substitute mutable `main`.
+
+## Dependency strategy
+
+The verified upstream file remains at `/opt/hunyuan3d.requirements.upstream.txt`. The local lock removes Tencent/Aliyun mirror directives, retains upstream pins, normalizes `bpy==4.0` to `bpy==4.0.0`, and freezes upstream's four unversioned entries as `timm==1.0.15`, `pythreejs==2.4.2`, `torchdiffeq==0.2.5`, and `deepspeed==0.17.1`. Standard PyPI is used except for Blender's official package index, required for `bpy`. The build runs `pip check` and records `/opt/hunyuan3d.dependencies.freeze.txt`. The top-level lock does not constitute a hash-locked transitive wheelhouse, so package-index availability remains an external dependency.
+
+Real build validation required three explicit compatibility accommodations. The official cu124 index remains the primary PyTorch source, while standard PyPI is an extra source because the cu124 index's current NVIDIA dependency link does not expose the pinned `nvidia-cudnn-cu12==9.1.0.70`; build assertions still require `torch==2.5.1+cu124` and CUDA 12.4. The Linux Blender wheel needs small X11 runtime libraries for deterministic `bpy` import. Finally, `pip check` currently emits only its known platform-tag false positives for `bpy==4.0.0` and `ninja==1.11.1.1`; the build rejects any other issue and separately imports both packages.
 
 ## Build and diagnostics
 
-From the repository root:
-
 ```bash
-docker build --tag pharaon-asset-factory-gpu-base --file docker/Dockerfile .
-docker run --rm pharaon-asset-factory-gpu-base health
-docker run --rm pharaon-asset-factory-gpu-base health --json
+docker build --pull --tag pharaon-asset-factory-gpu:t0011 --file docker/Dockerfile .
+docker run --rm pharaon-asset-factory-gpu:t0011 health --json
+docker run --rm pharaon-asset-factory-gpu:t0011 dependency-smoke
 ```
 
-The CPU smoke test succeeds with `GPU_NOT_AVAILABLE`. On a configured NVIDIA host, require a visible GPU with:
+CPU health must exit zero with `HUNYUAN_DEPENDENCIES_READY`; `GPU_NOT_AVAILABLE` and `torch.cuda.is_available() == false` are expected without GPU passthrough. Dependency smoke imports torch, torchvision, torchaudio, transformers, diffusers, accelerate, trimesh, and numpy with process-local offline guards. It loads no model pipeline and downloads nothing.
+
+Health reports Python, CUDA runtime/compiler data, GPU visibility, exact PyTorch versions, `torch.version.cuda`, `torch.cuda.is_available()`, GPU name, Hunyuan source/revision, dependency imports, native extensions, external model cache, and model-weight state. This layer always reports `full_hunyuan_ready: false`. Expected states are `CUSTOM_RASTERIZER_NOT_BUILT_EXPECTED`, `DIFFERENTIABLE_RENDERER_NOT_BUILT_EXPECTED`, and `MODEL_WEIGHTS_NOT_PRESENT_EXPECTED`.
+
+For real PyTorch CUDA validation:
 
 ```bash
-docker run --rm --gpus all pharaon-asset-factory-gpu-base health --require-gpu
+docker run --rm --gpus all pharaon-asset-factory-gpu:t0011 gpu-smoke
+docker run --rm --gpus all pharaon-asset-factory-gpu:t0011 health --require-gpu --json
 ```
 
-Startup makes no network calls or downloads. The default command exits after diagnostics; it does not run a server. The health script reports Python and OS details, configured paths, CUDA environment and compiler state, `nvidia-smi`/GPU visibility, and PyTorch state. `GPU_RUNTIME_ERROR` means `nvidia-smi` was found but failed, while `GPU_NOT_AVAILABLE` is expected on CPU-only hosts.
+The GPU smoke test allocates a small CUDA tensor, performs an operation, synchronizes, and reports the NVIDIA device. It does not run Hunyuan inference.
 
-## Filesystem and mounts
+## Runtime layout and boundary
 
-| Path | Environment variable | Purpose |
-| --- | --- | --- |
-| `/app` | n/a | Immutable application/runtime code |
-| `/models` | `MODEL_CACHE_DIR` | External future model cache |
-| `/data/input` | `INPUT_DIR` | Input assets |
-| `/data/output` | `OUTPUT_DIR` | Generated artifacts |
-| `/workspace` | `WORKSPACE_DIR` | Optional temporary working area |
+| Path | Purpose |
+| --- | --- |
+| `/app` | Small Pharaon diagnostics |
+| `/opt/hunyuan3d` | Immutable third-party source |
+| `/models` | Unchanged external future model cache |
+| `/data/input`, `/data/output`, `/workspace` | Job data and temporary workspace |
 
-Keep weights outside `/app`. Named volumes or bind mounts work without application changes:
-
-```bash
-docker run --rm --gpus all \
-  --mount type=volume,source=pharaon-models,target=/models \
-  --mount type=bind,source="$PWD/input",target=/data/input,readonly \
-  --mount type=bind,source="$PWD/output",target=/data/output \
-  pharaon-asset-factory-gpu-base health --require-gpu
-```
-
-The process runs as fixed unprivileged user/group `10001:10001`; bind-mounted writable directories must grant that identity access. No privileged mode or Docker socket mount is required.
-
-## Current limitations
-
-This image proves only the CUDA/Python container boundary. T-0011 is expected to add a pinned PyTorch and Hunyuan dependency layer. It must not bake model weights into the image; `/models` remains the portable cache boundary for local Docker, Vast.ai, or RunPod volumes. This ticket does not publish an image or integrate any provider.
+Startup never downloads into `/models`. The process remains fixed unprivileged user/group `10001:10001`. T-0012 will compile the custom rasterizer and DifferentiableRenderer; later work will define licensed weight acquisition. Until then, do not claim that Hunyuan generation works.
