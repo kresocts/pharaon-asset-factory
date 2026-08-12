@@ -46,12 +46,19 @@ Application, container, and provider-specific directories will be introduced onl
 
 Ticket metadata uses YAML front matter with an ID, workflow status, dependencies, and priority. The human-readable body defines immutable acceptance criteria and required tests. Status changes are committed so future orchestration can derive state from the repository. See `tickets/README.md`.
 
-Run the bootstrap checks with:
+## Baseline validation and CI
+
+Run the same baseline checks locally from the repository root with:
 
 ```bash
-python -m unittest discover -s tests -v
-python validation/validate_repository.py
+python validation/run_ci.py
 ```
+
+The command runs the complete automated test suite followed by repository metadata validation and stops at the first failed stage. Its stage labels and exit code identify whether automated tests or metadata validation failed. Individual stages can be reproduced with `python validation/run_ci.py --stage tests` and `python validation/run_ci.py --stage metadata`.
+
+GitHub Actions runs baseline CI for pull requests targeting `main` and pushes to `main`, with read-only repository permissions. Tests and metadata validation remain separate workflow steps for clear failure reporting. New commits supersede older in-progress runs for the same pull request or branch without cancelling unrelated work.
+
+Future tickets should extend the canonical entry point with a distinct, documented stage and add a corresponding workflow step when separate CI reporting is useful. They should not add another workflow that repeats existing baseline checks.
 
 ## Security and cost control
 
