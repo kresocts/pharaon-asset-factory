@@ -173,9 +173,11 @@ checksums, missing or non-positive sizes, absolute or `..` traversal paths, dupl
 destinations, unsupported URL schemes, and URLs with embedded credentials. Production
 sources must use HTTPS; HTTP is accepted only for loopback and `host.docker.internal`
 test fixtures. Redirects are followed only when the target still obeys the same
-policy: redirects to non-HTTP(S) schemes and HTTP redirects away from loopback or
-test hosts are refused. The destination namespace and every file path are validated
-so nothing can be written outside the configured model-cache root.
+policy: unsupported schemes, embedded credentials, and mutable source references are
+refused; HTTPS sources never downgrade to HTTP and never redirect into loopback or
+test hosts; loopback/test HTTP redirects are allowed only for already-allowed
+loopback/test fixture URLs. The destination namespace and every file path are
+validated so nothing can be written outside the configured model-cache root.
 
 ### Cache layout
 

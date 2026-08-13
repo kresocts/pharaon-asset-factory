@@ -189,6 +189,62 @@ class LockTests(unittest.TestCase):
         finally:
             first.release()
 
+    def test_lock_root_symlink_escape_is_refused(self):
+        outside = self.root / "outside-locks"
+        outside.mkdir()
+        locks = self.cache / ".locks"
+        try:
+            locks.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        output = io.StringIO()
+        with (
+            mock.patch.object(module, "_download_file", side_effect=AssertionError("network access")),
+            redirect_stdout(output),
+        ):
+            exit_code = module.main(
+                [
+                    "acquire",
+                    "--manifest",
+                    str(self.manifest_path),
+                    "--confirm-download",
+                    "--max-bytes",
+                    "48",
+                    "--json",
+                ],
+                {"MODEL_CACHE_DIR": str(self.cache)},
+            )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", payload["classification"])
+        self.assertIn("lock root is a symlink", payload["detail"])
+        self.assertEqual(0, payload["network"]["requests_attempted"])
+        self.assertEqual([], list(outside.iterdir()))
+        self.assertFalse(any(self.cache.rglob("*.bin")))
+
+    def test_lock_root_non_directory_is_refused(self):
+        (self.cache / ".locks").write_text("not a directory", encoding="utf-8")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exit_code = module.main(
+                [
+                    "acquire",
+                    "--manifest",
+                    str(self.manifest_path),
+                    "--confirm-download",
+                    "--max-bytes",
+                    "48",
+                    "--json",
+                ],
+                {"MODEL_CACHE_DIR": str(self.cache)},
+            )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", payload["classification"])
+        self.assertIn("not a directory", payload["detail"])
+        self.assertEqual(0, payload["network"]["requests_attempted"])
+        self.assertFalse(any(self.cache.rglob("*.bin")))
+
 
 if __name__ == "__main__":
     unittest.main()

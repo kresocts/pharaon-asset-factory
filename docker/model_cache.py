@@ -505,7 +505,8 @@ class _ArtifactLock:
     """
 
     def __init__(self, cache_root: Path, plan_id: str) -> None:
-        self.lock_root = _absolute(cache_root) / ".locks"
+        self.cache_root = _absolute(cache_root)
+        self.lock_root = self.cache_root / ".locks"
         self.lock_dir = self.lock_root / plan_id
         self.owner_path = self.lock_dir / "owner.json"
         self.owner = {
@@ -513,6 +514,34 @@ class _ArtifactLock:
             "pid": os.getpid(),
             "start_epoch": time.time(),
         }
+
+    def _validate_lock_root(self) -> None:
+        """Ensure the lock root cannot escape the configured cache root.
+
+        An existing `.locks` symlink, a non-directory `.locks` path, or a lock
+        root that resolves outside the resolved cache root is refused with a
+        stable path-policy failure before any lock or owner metadata is
+        created.
+        """
+        real_root = Path(os.path.realpath(self.cache_root))
+        if self.lock_root.is_symlink():
+            raise ManifestValidationError(f"lock root is a symlink: {self.lock_root}")
+        if self.lock_root.exists() and not self.lock_root.is_dir():
+            raise ManifestValidationError(
+                f"lock root exists and is not a directory: {self.lock_root}"
+            )
+        try:
+            self.lock_root.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise LockConflictError(
+                f"cannot create lock root {self.lock_root}: {error}"
+            ) from error
+        try:
+            Path(os.path.realpath(self.lock_root)).relative_to(real_root)
+        except ValueError as error:
+            raise ManifestValidationError(
+                f"lock root escapes the model cache: {self.lock_root} resolves outside {real_root}"
+            ) from error
 
     @staticmethod
     def _owner_alive(pid: int) -> bool:
@@ -563,10 +592,12 @@ class _ArtifactLock:
             pass
 
     def acquire(self) -> None:
+        self._validate_lock_root()
+        if self.lock_dir.is_symlink():
+            raise ManifestValidationError(f"lock directory is a symlink: {self.lock_dir}")
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
             try:
-                self.lock_root.mkdir(parents=True, exist_ok=True)
                 os.mkdir(self.lock_dir)
                 break
             except FileExistsError:
@@ -583,6 +614,20 @@ class _ArtifactLock:
                 raise LockConflictError(
                     f"cannot create artifact-set lock {self.lock_dir}: {error}"
                 ) from error
+        try:
+            Path(os.path.realpath(self.lock_dir)).relative_to(
+                Path(os.path.realpath(self.cache_root))
+            )
+        except ValueError as error:
+            self.release()
+            raise ManifestValidationError(
+                f"lock directory escapes the model cache: {self.lock_dir}"
+            ) from error
+        if self.owner_path.is_symlink():
+            self.release()
+            raise ManifestValidationError(
+                f"lock owner metadata is a symlink: {self.owner_path}"
+            )
         try:
             self.owner_path.write_text(
                 json.dumps(self.owner, sort_keys=True), encoding="utf-8"
@@ -636,18 +681,26 @@ class _TimedHTTPSHandler(urllib.request.HTTPSHandler):
 class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Follow redirects only when the target still obeys the manifest policy.
 
-    Redirects to non-http(s) schemes and http redirects to non-loopback,
-    non-test hosts are refused so a validated manifest cannot silently extend
-    the network boundary through a server-controlled redirect.
+    Every redirect target is validated with the same rules as a manifest URL:
+    unsupported schemes, embedded credentials, and mutable source references
+    are refused. HTTPS sources never downgrade to HTTP and never redirect into
+    loopback or test hosts. Loopback/test HTTP redirects are allowed only when
+    the original request was itself an allowed loopback/test fixture URL.
     """
 
     def redirect_request(self, request, fp, code, msg, headers, newurl):  # type: ignore[override]
+        original = urllib.parse.urlparse(request.full_url)
+        try:
+            _validated_url(newurl)
+        except ManifestValidationError:
+            return None
         parsed = urllib.parse.urlparse(newurl)
-        if parsed.scheme not in ("http", "https"):
-            return None
-        host = (parsed.hostname or "").lower()
-        if parsed.scheme == "http" and not (_is_loopback_host(host) or host in TEST_HOSTS):
-            return None
+        if original.scheme == "https":
+            if parsed.scheme == "http":
+                return None
+            host = (parsed.hostname or "").lower()
+            if _is_loopback_host(host) or host in TEST_HOSTS:
+                return None
         return super().redirect_request(request, fp, code, msg, headers, newurl)
 
 
@@ -937,6 +990,20 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
         # Re-inspect the cache after acquiring the lock so files verified by a
         # concurrent acquirer are reused instead of downloaded again.
         entries = _collect_states(cache_root, manifest)
+        # The pre-lock required-byte calculation can become stale while the
+        # lock is being acquired (for example a previously verified file may
+        # disappear), so the hard allowance is enforced again under the lock
+        # and before the first network request.
+        required = sum(entry["expected_size"] for entry in entries if entry["state"] != "VERIFIED")
+        if args.max_bytes < required:
+            error = PolicyRefusalError(
+                f"required {required} bytes exceeds --max-bytes {args.max_bytes} "
+                "after cache recheck; no network access was attempted"
+            )
+            error.entries = entries
+            error.stats = stats
+            error.manifest = manifest
+            raise error
         for entry in entries:
             entry["downloaded"] = False
             target_part: Path | None = None

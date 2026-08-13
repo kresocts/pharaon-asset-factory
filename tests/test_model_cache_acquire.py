@@ -210,6 +210,37 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual("INVALID_REQUEST", report["classification"])
         self.assertEqual(0, report["network"]["requests_attempted"])
 
+    def test_post_lock_budget_recheck_refuses_when_cache_invalidated(self):
+        # Preflight sees a fully verified cache, so --max-bytes 0 is accepted.
+        for name, data in self.fixture.files.items():
+            target = self.fixture.target(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        original_acquire = module._ArtifactLock.acquire
+
+        def invalidate_then_acquire(lock):
+            # Simulate a verified file disappearing while the lock is acquired.
+            self.fixture.target("a.bin").unlink()
+            return original_acquire(lock)
+
+        with (
+            mock.patch.object(module._ArtifactLock, "acquire", new=invalidate_then_acquire),
+            mock.patch.object(module, "_download_file", side_effect=AssertionError("network access")) as download,
+        ):
+            exit_code, report = self._acquire(max_bytes=0)
+        self.assertEqual(2, exit_code)
+        self.assertEqual("POLICY_REFUSAL", report["classification"])
+        download.assert_not_called()
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertEqual([], self.fixture.server.requests)
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual("ABSENT", by_path["data/a.bin"]["state"])
+        self.assertEqual("VERIFIED", by_path["data/b.bin"]["state"])
+        self.assertEqual(16, report["bytes"]["required"])
+        self.assertEqual(0, report["bytes"]["max_bytes"])
+
     def test_cache_reuse_makes_zero_additional_requests_and_does_not_rewrite(self):
         first_exit, first_report = self._acquire()
         self.assertEqual(0, first_exit)
@@ -415,6 +446,22 @@ class RedirectPolicyTests(unittest.TestCase):
     def test_https_redirect_is_allowed(self):
         request = self._redirect("https://example.invalid/a", "https://cdn.example.invalid/b")
         self.assertIsNotNone(request)
+
+    def test_redirect_with_userinfo_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://user:pass@example.invalid/b"))
+        self.assertIsNone(self._redirect("http://127.0.0.1:8000/a", "http://user:pass@127.0.0.1:8000/b"))
+
+    def test_redirect_to_mutable_path_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://example.invalid/resolve/main/b"))
+
+    def test_https_production_to_loopback_http_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "http://127.0.0.1:8000/b"))
+
+    def test_https_production_to_loopback_https_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://127.0.0.1:8443/b"))
+
+    def test_https_production_to_host_docker_internal_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://host.docker.internal:8443/b"))
 
 
 if __name__ == "__main__":
