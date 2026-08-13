@@ -512,7 +512,7 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(0, report["network"]["requests_attempted"])
         self.assertEqual([], self.fixture.server.requests)
 
-    def test_broken_temporary_symlink_is_never_followed(self):
+    def test_broken_temporary_symlink_is_refused(self):
         target = self.fixture.target("a.bin")
         target.parent.mkdir(parents=True)
         outside = self.fixture.root / "outside-target.bin"
@@ -522,14 +522,16 @@ class AcquisitionTests(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest("symlinks are not available on this platform")
         exit_code, report = self._acquire()
-        self.assertEqual(0, exit_code)
-        self.assertTrue(report["success"])
-        self.assertEqual(self.fixture.files["a.bin"], target.read_bytes())
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertIn("reserved temporary path is unsafe", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
         self.assertFalse(outside.exists(), "outside target must not be created through the symlink")
-        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
-        self.assertFalse(target.is_symlink())
+        self.assertFalse(target.exists())
+        self.assertTrue(part.is_symlink())
 
-    def test_temporary_symlink_is_never_followed(self):
+    def test_temporary_symlink_is_refused(self):
         target = self.fixture.target("a.bin")
         target.parent.mkdir(parents=True)
         outside = self.fixture.root / "outside-target.bin"
@@ -540,10 +542,106 @@ class AcquisitionTests(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest("symlinks are not available on this platform")
         exit_code, report = self._acquire()
-        self.assertEqual(0, exit_code)
-        self.assertEqual(self.fixture.files["a.bin"], target.read_bytes())
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertIn("reserved temporary path is unsafe", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
         self.assertEqual(b"outside payload", outside.read_bytes())
+        self.assertFalse(target.exists())
+        self.assertTrue(part.is_symlink())
+
+    def test_unsafe_reserved_temp_directory_is_refused(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True)
+        reserved = target.parent / "_acq-stale.part"
+        reserved.mkdir()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status_code = module.main(
+                ["status", "--manifest", str(self.fixture.manifest_path), "--json"],
+                {"MODEL_CACHE_DIR": str(self.fixture.cache)},
+            )
+        status_report = json.loads(output.getvalue())
+        self.assertEqual(0, status_code)
+        self.assertEqual("CORRUPTED", status_report["files"][0]["state"])
+        self.assertIn("reserved temporary path is unsafe", status_report["files"][0]["detail"])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            verify_code = module.main(
+                ["verify", "--manifest", str(self.fixture.manifest_path), "--json"],
+                {"MODEL_CACHE_DIR": str(self.fixture.cache)},
+            )
+        verify_report = json.loads(output.getvalue())
+        self.assertEqual(4, verify_code)
+        exit_code, report = self._acquire()
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertIn("reserved temporary path is unsafe", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
+        self.assertFalse(report["fully_cached"])
+        self.assertFalse(any(self.fixture.cache.rglob("*.bin")))
+
+    def test_safe_stale_regular_temp_is_cleaned(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True)
+        reserved = target.parent / "_acq-stale.part"
+        reserved.write_bytes(b"stale")
+        exit_code, report = self._acquire()
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        self.assertTrue(report["fully_cached"])
+        self.assertFalse(reserved.exists())
         self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+        self.assertEqual(self.fixture.files["a.bin"], self.fixture.target("a.bin").read_bytes())
+
+    def test_stale_temp_cleanup_failure_is_not_success(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.fixture.files["a.bin"])
+        reserved = target.parent / "_acq-stale.part"
+        reserved.write_bytes(b"stale")
+        original_unlink = module.Path.unlink
+
+        def failing_unlink(self):
+            if self.name == "_acq-stale.part":
+                raise OSError(13, "Permission denied")
+            return original_unlink(self)
+
+        with mock.patch.object(module.Path, "unlink", new=failing_unlink):
+            exit_code, report = self._acquire()
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertIn("reserved temporary file", report["detail"])
+        self.assertFalse(report["success"])
+        self.assertEqual(self.fixture.files["a.bin"], self.fixture.target("a.bin").read_bytes())
+        self.assertTrue(reserved.exists())
+
+    def test_final_zero_temporary_invariant(self):
+        self.fixture.server.files["one.bin"] = b"x"
+        manifest = {
+            "schema_version": 1,
+            "artifact_set": "zero-temp-set",
+            "revision": "v1-abcdef0123456789",
+            "namespace": "zero-temp-set/v1-abcdef0123456789",
+            "files": [
+                {
+                    "path": "one.bin",
+                    "url": f"http://127.0.0.1:{self.fixture.server.port}/one.bin",
+                    "size": 1,
+                    "sha256": hashlib.sha256(b"x").hexdigest(),
+                }
+            ],
+        }
+        self.fixture.write_manifest(manifest)
+        exit_code, report = self._acquire(max_bytes=1)
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        self.assertTrue(report["fully_cached"])
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+        for entry in report["files"]:
+            self.assertEqual("VERIFIED", entry["state"])
 
     def test_final_temp_collision_paths_acquire_safely(self):
         self.fixture.server.files["foo.part"] = b"part-content"
@@ -605,6 +703,83 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(4, exit_code)
         self.assertEqual("INTEGRITY_FAILURE", report["classification"])
         self.assertIn("final verification failed", report["detail"])
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+
+    def test_redirect_overhead_leaves_insufficient_final_budget(self):
+        payload = b"0123456789"
+        self.fixture.server.files["one.bin"] = payload
+        manifest = {
+            "schema_version": 1,
+            "artifact_set": "budget-set",
+            "revision": "v1-abcdef0123456789",
+            "namespace": "budget-set/v1-abcdef0123456789",
+            "files": [
+                {
+                    "path": "one.bin",
+                    "url": f"http://127.0.0.1:{self.fixture.server.port}/one.bin",
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            ],
+        }
+        self.fixture.write_manifest(manifest)
+        self.fixture.server.redirect_with_body_next(
+            "one.bin", f"http://127.0.0.1:{self.fixture.server.port}/one.bin", b"r" * 5
+        )
+        exit_code, report = self._acquire(max_bytes=10)
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        self.assertIn("remaining allowance", report["detail"])
+        self.assertEqual(5, report["network"]["bytes_received"])
+        self.assertEqual(2, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        final_path = self.fixture.cache / "budget-set" / "v1-abcdef0123456789" / "one.bin"
+        self.assertFalse(final_path.exists())
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+        self.assertEqual(["/one.bin", "/one.bin"], self.fixture.server.requests)
+
+    def test_redirect_overhead_with_sufficient_final_budget(self):
+        payload = b"0123456789"
+        self.fixture.server.files["one.bin"] = payload
+        manifest = {
+            "schema_version": 1,
+            "artifact_set": "budget-set",
+            "revision": "v1-abcdef0123456789",
+            "namespace": "budget-set/v1-abcdef0123456789",
+            "files": [
+                {
+                    "path": "one.bin",
+                    "url": f"http://127.0.0.1:{self.fixture.server.port}/one.bin",
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            ],
+        }
+        self.fixture.write_manifest(manifest)
+        self.fixture.server.redirect_with_body_next(
+            "one.bin", f"http://127.0.0.1:{self.fixture.server.port}/one.bin", b"r" * 5
+        )
+        exit_code, report = self._acquire(max_bytes=15)
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        self.assertEqual(15, report["network"]["bytes_received"])
+        self.assertEqual(2, report["network"]["requests_attempted"])
+        final_path = self.fixture.cache / "budget-set" / "v1-abcdef0123456789" / "one.bin"
+        self.assertEqual(payload, final_path.read_bytes())
+
+    def test_multi_file_remaining_budget_is_not_consumed(self):
+        port = self.fixture.server.port
+        self.fixture.server.redirect_with_body_next(
+            "a.bin", f"http://127.0.0.1:{port}/a.bin", b"r" * 8
+        )
+        exit_code, report = self._acquire(max_bytes=55)
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        self.assertEqual(24, report["network"]["bytes_received"])
+        self.assertEqual(3, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertEqual(self.fixture.files["a.bin"], self.fixture.target("a.bin").read_bytes())
+        self.assertFalse(self.fixture.target("b.bin").exists())
         self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
 
     def test_redirect_body_exceeding_allowance_is_budgeted(self):

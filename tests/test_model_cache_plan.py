@@ -272,6 +272,23 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertEqual(4, verify_code)
         self.assertEqual(0, verify_report["network"]["requests_attempted"])
 
+    def test_verified_final_with_unsafe_reserved_temp_is_corrupted(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.fixture.files["a.bin"])
+        reserved = target.parent / "_acq-unsafe.part"
+        reserved.write_bytes(b"")
+
+        def fake_is_symlink(path):
+            return Path.__fspath__(path) == str(reserved)
+
+        with mock.patch.object(module.Path, "is_symlink", new=fake_is_symlink):
+            exit_code, report = self._run("status")
+        self.assertEqual(0, exit_code)
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual("CORRUPTED", by_path["data/a.bin"]["state"])
+        self.assertIn("reserved temporary path is unsafe", by_path["data/a.bin"]["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

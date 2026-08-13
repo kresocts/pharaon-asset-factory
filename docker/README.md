@@ -183,7 +183,7 @@ for cross-platform determinism (so `A.bin` and `a.bin` are rejected as ambiguous
 file destination cannot be an ancestor of another destination, acquisition-owned
 temporary names use an underscore prefix that is not representable as a manifest
 destination, and every existing symlink in a destination ancestor below the cache
-root is rejected ? including symlinks that resolve to another location inside the
+root is rejected — including symlinks that resolve to another location inside the
 same cache, because such internal aliases would let different namespace locks
 manipulate one physical destination. Redirects are followed only when the target still obeys the same
 policy: unsupported schemes, embedded credentials, and mutable source references are
@@ -225,6 +225,10 @@ matching the manifest size: responses without a `Content-Length` or with chunked
 is bounded by the remaining expected size, and every consumed byte is accounted.
 Redirect response bodies are consumed in bounded chunks against the same shared
 budget, so a redirect cannot bypass `--max-bytes` or under-report `bytes_received`.
+Before any final artifact body byte is consumed, the expected artifact size must fit
+within the remaining allowance; every final-body read is bounded by the remaining
+expected size and the remaining allowance, and `network.bytes_received` can never
+exceed `--max-bytes`.
 
 ### Retries and timeouts
 
@@ -254,11 +258,15 @@ file. The temporary file is created with exclusive, no-follow flags
 (`O_CREAT|O_EXCL|O_NOFOLLOW`), flushed and synced, then promoted to the final path
 with an atomic rename only after exact size and SHA-256 verification succeed.
 Acquisition-owned temporary files are removed after success, and the complete
-manifest is re-verified under the lock before success is reported. A stale
-acquisition-owned temporary path that is a symlink (broken or not) or not a regular
-file is reported `CORRUPTED` by status/verify. Corrupted, incomplete, oversized, or
-checksum-mismatched content is never reported as valid and never leaves a verified
-final file behind.
+manifest is re-verified under the lock before success is reported. A stale reserved
+temporary path (`_acq-*.part`) that is a symlink (broken or not), a directory, a
+device, or any other non-regular entry is reported `CORRUPTED` by status/verify, and
+acquisition refuses it with `LOCAL_IO_FAILURE` before any network request. Safe stale
+regular temporary files are removed under the namespace lock as part of the
+restart-from-zero policy; a cleanup failure or any remaining reserved temporary path
+prevents success, and existing verified finals are never touched. Corrupted,
+incomplete, oversized, or checksum-mismatched content is never reported as valid and
+never leaves a verified final file behind.
 
 Per-file states are `ABSENT`, `PARTIAL`, `CORRUPTED`, and `VERIFIED`. `PARTIAL` means an
 incomplete `.part` download file exists; `CORRUPTED` means the final file exists but

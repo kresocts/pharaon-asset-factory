@@ -481,6 +481,14 @@ def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[
             }
         if _sha256_file(target) != expected_sha256:
             return {"state": "CORRUPTED", "detail": "SHA-256 mismatch"}
+        if target.parent.is_dir():
+            unsafe_reserved = [
+                path
+                for path in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}")
+                if path.is_symlink() or not path.is_file()
+            ]
+            if unsafe_reserved:
+                return {"state": "CORRUPTED", "detail": "reserved temporary path is unsafe"}
         return {"state": "VERIFIED", "detail": None}
     if target.parent.is_dir():
         temps = list(target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"))
@@ -489,7 +497,7 @@ def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[
             if unsafe:
                 return {
                     "state": "CORRUPTED",
-                    "detail": "temporary path is unsafe (symlink or non-regular file)",
+                    "detail": "reserved temporary path is unsafe",
                 }
             return {"state": "PARTIAL", "detail": "incomplete acquisition temporary file present"}
     return {"state": "ABSENT", "detail": None}
@@ -972,6 +980,13 @@ def _stream_once(
             raise IntegrityError(
                 f"Content-Length {declared} does not match expected size {expected_size}"
             )
+        # The final response body must fit within the remaining shared transfer
+        # allowance before any body byte is consumed; redirect bodies have
+        # already consumed their share of the same budget.
+        if expected_size > budget.remaining:
+            raise IntegrityError(
+                f"remaining allowance {budget.remaining} bytes is less than the expected size {expected_size}"
+            )
         # Create the temporary file with O_EXCL/O_NOFOLLOW before writing any
         # response bytes so a symlink planted at the temporary path is never
         # followed. The descriptor is owned by os.fdopen below, so it is
@@ -986,7 +1001,11 @@ def _stream_once(
         try:
             with os.fdopen(fd, "wb") as handle:
                 while written < expected_size:
-                    read_size = min(CHUNK_SIZE, expected_size - written)
+                    if budget.remaining <= 0:
+                        raise IntegrityError(
+                            f"remaining allowance exhausted before {url} completed"
+                        )
+                    read_size = min(CHUNK_SIZE, expected_size - written, budget.remaining)
                     try:
                         chunk = response.read(read_size)
                     except http.client.IncompleteRead as error:
@@ -1288,6 +1307,22 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
             error.manifest = manifest
             raise error
         budget = _TransferBudget(args.max_bytes)
+        # Unsafe acquisition-reserved temporary paths (symlinks, directories,
+        # devices, or other non-regular files) are refused before any network
+        # request; only safe regular stale temporaries follow the documented
+        # restart-from-zero cleanup policy.
+        for entry in entries:
+            target = _target_path(cache_root, manifest, entry["path"])
+            if not target.parent.is_dir():
+                continue
+            for reserved in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"):
+                if reserved.is_symlink() or not reserved.is_file():
+                    error = LocalIOError(f"reserved temporary path is unsafe: {reserved}")
+                    error.entries = entries
+                    error.stats = stats
+                    error.budget = budget
+                    error.manifest = manifest
+                    raise error
         for entry in entries:
             entry["downloaded"] = False
             target_part: Path | None = None
@@ -1340,12 +1375,22 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
         # expected size and SHA-256.
         for entry in entries:
             target = _target_path(cache_root, manifest, entry["path"])
-            if target.parent.is_dir():
-                for stale in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"):
-                    try:
-                        stale.unlink()
-                    except OSError:
-                        pass
+            if not target.parent.is_dir():
+                continue
+            for reserved in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"):
+                if reserved.is_symlink() or not reserved.is_file():
+                    error = LocalIOError(f"reserved temporary path is unsafe: {reserved}")
+                    error.entries = entries
+                    error.stats = stats
+                    error.budget = budget
+                    error.manifest = manifest
+                    raise error
+                try:
+                    reserved.unlink()
+                except OSError as error:
+                    raise LocalIOError(
+                        f"cannot remove reserved temporary file {reserved}: {error}"
+                    ) from error
         final_entries = _collect_states(cache_root, manifest)
         for entry in final_entries:
             if entry["state"] != "VERIFIED":
