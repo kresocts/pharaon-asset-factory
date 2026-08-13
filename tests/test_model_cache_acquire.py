@@ -41,6 +41,7 @@ class _FixtureServer:
         self.files = dict(files)
         self.requests = []
         self._failures = {}
+        self._redirects = {}
         handler = self._handler()
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -53,6 +54,12 @@ class _FixtureServer:
             def do_GET(self):
                 server.requests.append(self.path)
                 name = self.path.lstrip("/")
+                if name in server._redirects:
+                    location = server._redirects.pop(name)
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.end_headers()
+                    return
                 if name in server._failures:
                     status = server._failures.pop(name)
                     self.send_error(status)
@@ -73,6 +80,9 @@ class _FixtureServer:
 
     def fail_next(self, name, status):
         self._failures[name] = status
+
+    def redirect_next(self, name, location):
+        self._redirects[name] = location
 
     def start(self):
         self.thread.start()
@@ -389,6 +399,28 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(0, report["network"]["requests_attempted"])
         self.assertEqual([], self.fixture.server.requests)
         self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_refused_redirect_is_classified_transport_failure(self):
+        self.fixture.server.redirect_next("a.bin", "http://example.invalid/evil.bin")
+        exit_code, report = self._acquire()
+        self.assertEqual(5, exit_code)
+        self.assertEqual("TRANSPORT_FAILURE", report["classification"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_allowed_loopback_redirect_succeeds(self):
+        self.fixture.server.redirect_next(
+            "a.bin", f"http://127.0.0.1:{self.fixture.server.port}/a.bin"
+        )
+        exit_code, report = self._acquire()
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        for name, data in self.fixture.files.items():
+            self.assertEqual(data, self.fixture.target(name).read_bytes())
+        self.assertEqual(3, len(self.fixture.server.requests))
+        self.assertEqual(0, report["network"]["retries"])
 
     def test_acquire_refuses_when_ancestor_symlink_escapes(self):
         root = Path(os.path.abspath(str(self.fixture.cache)))
