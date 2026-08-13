@@ -59,6 +59,7 @@ class _FixtureServer:
         corrupt: str | None,
         partial: str | None = None,
         no_length: str | None = None,
+        redirect_body: str | None = None,
     ) -> None:
         _validated_manifest(manifest_path)
         self.corrupt = corrupt
@@ -67,6 +68,10 @@ class _FixtureServer:
             name, _, count = partial.partition(":")
             self.partial = (name, int(count))
         self.no_length = no_length
+        self.redirect_body = None
+        if redirect_body:
+            name, _, count = redirect_body.partition(":")
+            self.redirect_body = (name, int(count))
         self.requests: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -74,6 +79,19 @@ class _FixtureServer:
                 server.requests.append(self.path)
                 print(f"REQUEST {self.path}", flush=True)
                 name = self.path.lstrip("/")
+                if server.redirect_body is not None and name == server.redirect_body[0]:
+                    count = server.redirect_body[1]
+                    server.redirect_body = None  # one-shot
+                    data = server._bytes_for(name)
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(302)
+                    self.send_header("Location", f"/{name}")
+                    self.send_header("Content-Length", str(count))
+                    self.end_headers()
+                    self.wfile.write(b"r" * count)
+                    return
                 if server.no_length is not None and name == server.no_length:
                     server.no_length = None  # one-shot
                     data = server._bytes_for(name)
@@ -156,9 +174,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="serve one artifact without a Content-Length header, e.g. data/a.bin",
     )
+    parser.add_argument(
+        "--redirect-body",
+        default=None,
+        help="serve a 302 with an N-byte body for one artifact path, e.g. data/a.bin:100000",
+    )
     args = parser.parse_args(argv)
     try:
-        server = _FixtureServer(args.manifest, args.bind, args.port, args.corrupt, args.partial, args.no_length)
+        server = _FixtureServer(
+            args.manifest, args.bind, args.port, args.corrupt, args.partial, args.no_length, args.redirect_body
+        )
     except (OSError, RuntimeError, json.JSONDecodeError) as error:
         print(f"FIXTURE_SERVER_ERROR {error}", file=sys.stderr)
         return 1

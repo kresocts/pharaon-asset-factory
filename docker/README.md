@@ -172,10 +172,17 @@ lowercase `sha256`. Mutable references such as `main`, `latest`, `master`, `HEAD
 checksums, missing or non-positive sizes, absolute or `..` traversal paths, duplicate
 destinations, unsupported URL schemes, and URLs with embedded credentials. Production
 sources must use HTTPS; HTTP is accepted only for loopback and `host.docker.internal`
-test fixtures. Mutable-reference checks run against the percent-decoded URL path, so
-encoded forms such as `/resolve/%6dain/` are rejected too; malformed percent escapes
-are rejected, non-empty URL fragments are refused, and query strings are not treated
-as mutable source references. Redirects are followed only when the target still obeys the same
+test fixtures. Mutable-reference checks run against the recursively percent-decoded
+URL path, so single- and double-encoded forms such as `/resolve/%6dain/` or
+`/resolve/%256dain/` are rejected too; malformed percent escapes are rejected,
+non-empty URL fragments are refused, and targeted revision-like query parameters
+(`revision`, `rev`, `ref`, `branch`, `tag`) are rejected when they carry mutable
+values (`main`, `master`, `latest`, `head`), while other query strings (including
+signed HTTPS parameters) are preserved. Destinations are compared case-insensitively
+for cross-platform determinism (so `A.bin` and `a.bin` are rejected as ambiguous), a
+file destination cannot be an ancestor of another destination, and acquisition-owned
+temporary names use an underscore prefix that is not representable as a manifest
+destination. Redirects are followed only when the target still obeys the same
 policy: unsupported schemes, embedded credentials, and mutable source references are
 refused; HTTPS sources never downgrade to HTTP and never redirect into loopback or
 test hosts; loopback/test HTTP redirects are allowed only for already-allowed
@@ -213,6 +220,8 @@ exceeding the cap. The cumulative received-body count is reported in
 matching the manifest size: responses without a `Content-Length` or with chunked
 `Transfer-Encoding` are refused before any body byte is consumed, every accepted read
 is bounded by the remaining expected size, and every consumed byte is accounted.
+Redirect response bodies are consumed in bounded chunks against the same shared
+budget, so a redirect cannot bypass `--max-bytes` or under-report `bytes_received`.
 
 ### Retries and timeouts
 
@@ -231,14 +240,19 @@ machine-readable `network.retries`, `network.requests_attempted`, and
 
 ### Streaming, atomicity, and states
 
-Downloads stream in 64 KiB chunks into a temporary `<final>.part` file on the
-destination filesystem, never into memory. The temporary file is created with
-exclusive, no-follow flags (`O_CREAT|O_EXCL|O_NOFOLLOW`), flushed and synced, then
-promoted to the final path with an atomic rename only after exact size and SHA-256
-verification succeed. A `.part` path that is a symlink (broken or not) or is not a
-regular file is refused before any network request and is reported `CORRUPTED` by
-status/verify. Corrupted, incomplete, oversized, or checksum-mismatched content is
-never reported as valid and never leaves a verified final file behind.
+Downloads stream in bounded chunks into a genuinely unique acquisition-owned
+temporary file (`_acq-<token>.part`) in the final destination directory, never into
+memory. The underscore prefix is not representable as a manifest destination, so a
+final artifact can never collide with or be mistaken for another artifact's temporary
+file. The temporary file is created with exclusive, no-follow flags
+(`O_CREAT|O_EXCL|O_NOFOLLOW`), flushed and synced, then promoted to the final path
+with an atomic rename only after exact size and SHA-256 verification succeed.
+Acquisition-owned temporary files are removed after success, and the complete
+manifest is re-verified under the lock before success is reported. A stale
+acquisition-owned temporary path that is a symlink (broken or not) or not a regular
+file is reported `CORRUPTED` by status/verify. Corrupted, incomplete, oversized, or
+checksum-mismatched content is never reported as valid and never leaves a verified
+final file behind.
 
 Per-file states are `ABSENT`, `PARTIAL`, `CORRUPTED`, and `VERIFIED`. `PARTIAL` means an
 incomplete `.part` download file exists; `CORRUPTED` means the final file exists but

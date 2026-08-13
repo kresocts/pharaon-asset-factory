@@ -91,6 +91,10 @@ MUTABLE_URL_FRAGMENTS = (
 TEST_HOSTS = {"host.docker.internal"}
 FILE_STATES = ("ABSENT", "PARTIAL", "CORRUPTED", "VERIFIED")
 USER_AGENT = "pharaon-model-cache/" + str(SCHEMA_VERSION)
+TEMP_PREFIX = "_acq-"
+TEMP_SUFFIX = ".part"
+MAX_URL_DECODE_DEPTH = 3
+REVISION_QUERY_KEYS = {"revision", "rev", "ref", "branch", "tag"}
 
 
 class ModelCacheError(Exception):
@@ -209,6 +213,17 @@ def _validated_components(value: str, field: str) -> list[str]:
     return components
 
 
+def _recursively_decoded(value: str, subject: str) -> str:
+    """Percent-decode *value* repeatedly (bounded) with strict escapes."""
+    for _ in range(MAX_URL_DECODE_DEPTH):
+        if "%" not in value:
+            return value
+        if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+            raise ManifestValidationError(f"{subject} contains malformed percent-encoding")
+        value = urllib.parse.unquote(value, errors="replace")
+    raise ManifestValidationError(f"{subject} contains excessive percent-encoding nesting")
+
+
 def _validated_url(url: str) -> str:
     if not isinstance(url, str) or not url:
         raise ManifestValidationError("file url must be a non-empty string")
@@ -230,15 +245,10 @@ def _validated_url(url: str) -> str:
         raise ManifestValidationError(
             "file url must not contain a fragment; fragments are not sent in HTTP requests but would change plan identity"
         )
-    # Mutable-reference checks run against the percent-decoded path so encoded
-    # forms such as /resolve/%6dain/ cannot bypass the policy. The query string
-    # is intentionally not inspected: legitimate signed HTTPS query parameters
-    # are not mutable source references.
-    path = parsed.path
-    if "%" in path:
-        if re.search(r"%(?![0-9A-Fa-f]{2})", path):
-            raise ManifestValidationError("file url contains malformed percent-encoding")
-        path = urllib.parse.unquote(path, errors="replace")
+    # Mutable-reference checks run against the recursively percent-decoded
+    # path so single- and double-encoded forms such as /resolve/%6dain/ or
+    # /resolve/%256dain/ cannot bypass the policy.
+    path = _recursively_decoded(parsed.path, "file url path")
     lowered_path = path.lower()
     if any(mutable in lowered_path for mutable in MUTABLE_URL_FRAGMENTS):
         raise ManifestValidationError("mutable source reference in URL is not allowed")
@@ -247,6 +257,15 @@ def _validated_url(url: str) -> str:
     ]
     if mutable_segments:
         raise ManifestValidationError("mutable source reference in URL is not allowed")
+    # Targeted revision-like query parameters are inspected (recursively
+    # decoded) for mutable values; other query parameters, including signed
+    # HTTPS credentials, are preserved.
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        decoded_key = _recursively_decoded(key, "file url query").lower()
+        if decoded_key in REVISION_QUERY_KEYS:
+            decoded_value = _recursively_decoded(value, "file url query")
+            if decoded_value.lower() in MUTABLE_REVISION_WORDS:
+                raise ManifestValidationError("mutable source reference in URL query is not allowed")
     return url
 
 
@@ -339,6 +358,31 @@ def _parse_manifest_file(path: Path) -> dict[str, Any]:
             }
         )
 
+    # Destination graph validation. Destinations are compared
+    # case-insensitively for cross-platform determinism (Windows and Linux
+    # filesystems differ), a file destination cannot be an ancestor of another
+    # destination, and acquisition-owned temporary names use a prefix that is
+    # not representable as a manifest destination so a final artifact can
+    # never be mistaken for another artifact's temporary file.
+    normalized_destinations: dict[str, str] = {}
+    for file in files:
+        target = namespace + "/" + file["path"]
+        normalized = target.lower()
+        if normalized in normalized_destinations:
+            raise ManifestValidationError(
+                f"duplicate or case-ambiguous destination path: {target!r} conflicts with "
+                f"{normalized_destinations[normalized]!r}"
+            )
+        normalized_destinations[normalized] = target
+    for normalized in sorted(normalized_destinations):
+        prefix = normalized + "/"
+        for other in sorted(normalized_destinations):
+            if other.startswith(prefix):
+                raise ManifestValidationError(
+                    f"destination {normalized_destinations[normalized]!r} is a file ancestor of "
+                    f"{normalized_destinations[other]!r}"
+                )
+
     total_size = sum(file["size"] for file in files)
     return {
         "schema_version": schema_version,
@@ -412,8 +456,18 @@ def _target_path(cache_root: Path, manifest: dict[str, Any], rel_path: str) -> P
     return _absolute(cache_root) / manifest["namespace"] / rel_path
 
 
+def _temp_path(target: Path, token: str) -> Path:
+    """Return the acquisition-owned temporary path for *target*.
+
+    The name uses a leading underscore, which is not representable as a valid
+    manifest destination component, so a final artifact can never collide with
+    or be mistaken for another artifact's temporary file. The file is created
+    with O_EXCL/O_NOFOLLOW on the same filesystem as the final destination.
+    """
+    return target.parent / f"{TEMP_PREFIX}{token}{TEMP_SUFFIX}"
+
+
 def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[str, Any]:
-    part = Path(str(target) + ".part")
     if target.is_symlink():
         return {"state": "CORRUPTED", "detail": "final path is a symlink"}
     if target.exists():
@@ -428,12 +482,16 @@ def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[
         if _sha256_file(target) != expected_sha256:
             return {"state": "CORRUPTED", "detail": "SHA-256 mismatch"}
         return {"state": "VERIFIED", "detail": None}
-    if part.is_symlink():
-        return {"state": "CORRUPTED", "detail": "temporary path is a symlink"}
-    if part.exists():
-        if not part.is_file():
-            return {"state": "CORRUPTED", "detail": "temporary path is not a regular file"}
-        return {"state": "PARTIAL", "detail": "incomplete download file present"}
+    if target.parent.is_dir():
+        temps = list(target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"))
+        if temps:
+            unsafe = [path for path in temps if path.is_symlink() or not path.is_file()]
+            if unsafe:
+                return {
+                    "state": "CORRUPTED",
+                    "detail": "temporary path is unsafe (symlink or non-regular file)",
+                }
+            return {"state": "PARTIAL", "detail": "incomplete acquisition temporary file present"}
     return {"state": "ABSENT", "detail": None}
 
 
@@ -740,7 +798,13 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     are refused. HTTPS sources never downgrade to HTTP and never redirect into
     loopback or test hosts. Loopback/test HTTP redirects are allowed only when
     the original request was itself an allowed loopback/test fixture URL.
+    Redirect response bodies are consumed in bounded chunks and counted against
+    the same shared transfer budget as final artifacts, attempts, and retries.
     """
+
+    def __init__(self, budget: _TransferBudget | None = None) -> None:
+        super().__init__()
+        self._budget = budget
 
     def redirect_request(self, request, fp, code, msg, headers, newurl):  # type: ignore[override]
         original = urllib.parse.urlparse(request.full_url)
@@ -757,9 +821,61 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
                 return None
         return super().redirect_request(request, fp, code, msg, headers, newurl)
 
+    def _redirect_with_budget(self, req, fp, code, msg, headers):  # type: ignore[override]
+        if "location" in headers:
+            newurl = headers["location"]
+        elif "uri" in headers:
+            newurl = headers["uri"]
+        else:
+            return
+        url = urllib.parse.urljoin(req.full_url, newurl)
+        new = self.redirect_request(req, fp, code, msg, headers, url)
+        if new is None:
+            return
+        try:
+            if self._budget is not None:
+                while True:
+                    remaining = self._budget.remaining
+                    if remaining <= 0:
+                        raise IntegrityError(
+                            f"redirect body exceeded the total byte allowance {self._budget.max_bytes}"
+                        )
+                    try:
+                        chunk = fp.read(min(CHUNK_SIZE, remaining))
+                    except http.client.IncompleteRead as error:
+                        partial = getattr(error, "partial", None)
+                        if partial:
+                            self._budget.record(len(partial))
+                        raise
+                    except (TimeoutError, http.client.HTTPException, OSError) as error:
+                        raise _NetworkReadError() from error
+                    if not chunk:
+                        break
+                    self._budget.record(len(chunk))
+            else:
+                fp.read()
+        finally:
+            fp.close()
+        return self.parent.open(new, timeout=req.timeout)
 
-def _opener() -> urllib.request.OpenerDirector:
-    handlers: list[Any] = [urllib.request.ProxyHandler({}), _RestrictedRedirectHandler()]
+    def http_error_301(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_302(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_303(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_307(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_308(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+
+def _opener(budget: _TransferBudget | None = None) -> urllib.request.OpenerDirector:
+    handlers: list[Any] = [urllib.request.ProxyHandler({}), _RestrictedRedirectHandler(budget)]
     if getattr(ssl, "create_default_context", None) is not None:
         handlers.append(_TimedHTTPHandler())
         handlers.append(_TimedHTTPSHandler())
@@ -810,7 +926,7 @@ def _stream_once(
 ) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     stats["requests_attempted"] += 1
-    response = _opener().open(request, timeout=CONNECT_TIMEOUT)
+    response = _opener(budget).open(request, timeout=CONNECT_TIMEOUT)
     try:
         # Bounded acquisition requires an exact declared body size. Responses
         # without Content-Length or with chunked transfer encoding are refused
@@ -1159,28 +1275,17 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
                 continue
             try:
                 target = _validate_destination(cache_root, manifest, entry["path"])
-                target_part = Path(str(target) + ".part")
-                if target_part.is_symlink():
-                    raise ManifestValidationError(
-                        f"temporary path is a symlink: {target_part}"
-                    )
-                if target_part.exists() and not target_part.is_file():
-                    raise ManifestValidationError(
-                        f"temporary path exists and is not a regular file: {target_part}"
-                    )
-                if target_part.exists():
-                    try:
-                        target_part.unlink()
-                    except OSError as error:
-                        raise LocalIOError(
-                            f"cannot remove stale temporary file {target_part}: {error}"
-                        ) from error
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                 except OSError as error:
                     raise LocalIOError(
                         f"cannot create destination directory {target.parent}: {error}"
                     ) from error
+                # Each acquisition uses a genuinely unique temporary filename
+                # that is not representable as a manifest destination, created
+                # with O_EXCL/O_NOFOLLOW on the destination filesystem.
+                token = os.urandom(8).hex()
+                target_part = _temp_path(target, token)
                 _download_file(
                     url=entry["url"],
                     expected_size=entry["expected_size"],
@@ -1208,6 +1313,30 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
                 error.manifest = manifest
                 _remove_part(target_part)
                 raise
+        # No acquisition-owned temporary files may remain after success, and
+        # the complete manifest is re-verified under the lock so success is
+        # reported only when every final artifact exists and matches its exact
+        # expected size and SHA-256.
+        for entry in entries:
+            target = _target_path(cache_root, manifest, entry["path"])
+            if target.parent.is_dir():
+                for stale in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"):
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
+        final_entries = _collect_states(cache_root, manifest)
+        for entry in final_entries:
+            if entry["state"] != "VERIFIED":
+                detail = f" ({entry['detail']})" if entry.get("detail") else ""
+                error = IntegrityError(
+                    f"final verification failed for {entry['path']}: {entry['state']}{detail}"
+                )
+                error.entries = final_entries
+                error.stats = stats
+                error.budget = budget
+                error.manifest = manifest
+                raise error
     finally:
         lock.release()
 

@@ -45,6 +45,7 @@ class _FixtureServer:
         self._partials = {}
         self._no_lengths = {}
         self._chunked = {}
+        self._redirect_bodies = {}
         handler = self._handler()
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -62,6 +63,14 @@ class _FixtureServer:
                     self.send_response(302)
                     self.send_header("Location", location)
                     self.end_headers()
+                    return
+                if name in server._redirect_bodies:
+                    location, body = server._redirect_bodies.pop(name)
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
                 if name in server._no_lengths:
                     server._no_lengths.pop(name)
@@ -135,6 +144,9 @@ class _FixtureServer:
 
     def chunked_next(self, name):
         self._chunked[name] = True
+
+    def redirect_with_body_next(self, name, location, body):
+        self._redirect_bodies[name] = (location, body)
 
     def start(self):
         self.thread.start()
@@ -356,12 +368,13 @@ class AcquisitionTests(unittest.TestCase):
     def test_stale_partial_file_is_replaced_by_fresh_download(self):
         target = self.fixture.target("a.bin")
         target.parent.mkdir(parents=True)
-        part = Path(str(target) + ".part")
+        part = Path(str(target)).with_name("_acq-stale.part")
         part.write_bytes(b"stale partial bytes")
         exit_code, report = self._acquire()
         self.assertEqual(0, exit_code)
         self.assertEqual(self.fixture.files["a.bin"], target.read_bytes())
         self.assertFalse(part.exists())
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
         self.assertEqual(2, len(self.fixture.server.requests))
         self.assertTrue(report["files"][0]["downloaded"])
 
@@ -412,10 +425,10 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(2, report["network"]["retries"])
         self.assertFalse(self.fixture.target("a.bin").exists())
 
-    def test_streaming_writes_via_part_file_and_uses_atomic_replace(self):
+    def test_streaming_writes_via_unique_temp_and_uses_atomic_replace(self):
         exit_code, _report = self._acquire()
         self.assertEqual(0, exit_code)
-        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
         for name in self.fixture.files:
             self.assertTrue(self.fixture.target(name).is_file())
 
@@ -473,6 +486,7 @@ class AcquisitionTests(unittest.TestCase):
             self.assertEqual(data, self.fixture.target(name).read_bytes())
         self.assertEqual(3, len(self.fixture.server.requests))
         self.assertEqual(0, report["network"]["retries"])
+        self.assertEqual(48, report["network"]["bytes_received"])
 
     def test_acquire_refuses_when_ancestor_symlink_escapes(self):
         root = Path(os.path.abspath(str(self.fixture.cache)))
@@ -496,44 +510,164 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(0, report["network"]["requests_attempted"])
         self.assertEqual([], self.fixture.server.requests)
 
-    def test_broken_temporary_symlink_is_refused_before_network(self):
+    def test_broken_temporary_symlink_is_never_followed(self):
         target = self.fixture.target("a.bin")
         target.parent.mkdir(parents=True)
         outside = self.fixture.root / "outside-target.bin"
-        part = Path(str(target) + ".part")
+        part = target.parent / "_acq-attacker.part"
         try:
             part.symlink_to(outside)
         except (OSError, NotImplementedError):
             self.skipTest("symlinks are not available on this platform")
         exit_code, report = self._acquire()
-        self.assertEqual(3, exit_code)
-        self.assertEqual("MANIFEST_INVALID", report["classification"])
-        self.assertIn("temporary path is a symlink", report["detail"])
-        self.assertEqual(0, report["network"]["requests_attempted"])
-        self.assertEqual(0, report["network"]["bytes_received"])
-        self.assertEqual([], self.fixture.server.requests)
-        self.assertFalse(outside.exists())
-        self.assertFalse(target.exists())
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        self.assertEqual(self.fixture.files["a.bin"], target.read_bytes())
+        self.assertFalse(outside.exists(), "outside target must not be created through the symlink")
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
         self.assertFalse(target.is_symlink())
 
-    def test_temporary_symlink_is_refused_before_network(self):
+    def test_temporary_symlink_is_never_followed(self):
         target = self.fixture.target("a.bin")
         target.parent.mkdir(parents=True)
         outside = self.fixture.root / "outside-target.bin"
         outside.write_bytes(b"outside payload")
-        part = Path(str(target) + ".part")
+        part = target.parent / "_acq-attacker.part"
         try:
             part.symlink_to(outside)
         except (OSError, NotImplementedError):
             self.skipTest("symlinks are not available on this platform")
         exit_code, report = self._acquire()
+        self.assertEqual(0, exit_code)
+        self.assertEqual(self.fixture.files["a.bin"], target.read_bytes())
+        self.assertEqual(b"outside payload", outside.read_bytes())
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+
+    def test_final_temp_collision_paths_acquire_safely(self):
+        self.fixture.server.files["foo.part"] = b"part-content"
+        self.fixture.server.files["foo"] = b"final-content"
+        manifest = {
+            "schema_version": 1,
+            "artifact_set": "collision-set",
+            "revision": "v1-abcdef0123456789",
+            "namespace": "collision-set/v1-abcdef0123456789",
+            "files": [
+                {
+                    "path": "foo.part",
+                    "url": f"http://127.0.0.1:{self.fixture.server.port}/foo.part",
+                    "size": len(b"part-content"),
+                    "sha256": hashlib.sha256(b"part-content").hexdigest(),
+                },
+                {
+                    "path": "foo",
+                    "url": f"http://127.0.0.1:{self.fixture.server.port}/foo",
+                    "size": len(b"final-content"),
+                    "sha256": hashlib.sha256(b"final-content").hexdigest(),
+                },
+            ],
+        }
+        self.fixture.write_manifest(manifest)
+        exit_code, report = self._acquire(max_bytes=100)
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        base = self.fixture.cache / "collision-set" / "v1-abcdef0123456789"
+        self.assertEqual(b"part-content", (base / "foo.part").read_bytes())
+        self.assertEqual(b"final-content", (base / "foo").read_bytes())
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+        states = {entry["path"]: entry["state"] for entry in report["files"]}
+        self.assertEqual({"foo.part": "VERIFIED", "foo": "VERIFIED"}, states)
+
+    def test_ancestor_destination_conflict_is_refused_before_network(self):
+        manifest = dict(self.fixture.manifest)
+        manifest["files"].append(dict(manifest["files"][0], path="data", role=None))
+        self.fixture.write_manifest(manifest)
+        exit_code, report = self._acquire()
         self.assertEqual(3, exit_code)
         self.assertEqual("MANIFEST_INVALID", report["classification"])
-        self.assertIn("temporary path is a symlink", report["detail"])
         self.assertEqual(0, report["network"]["requests_attempted"])
         self.assertEqual([], self.fixture.server.requests)
-        self.assertEqual(b"outside payload", outside.read_bytes())
-        self.assertFalse(target.exists())
+
+    def test_final_under_lock_verification_failure_is_not_success(self):
+        original_collect = module._collect_states
+        calls = {"count": 0}
+
+        def flaky_collect(cache_root, manifest):
+            result = original_collect(cache_root, manifest)
+            calls["count"] += 1
+            if calls["count"] >= 3:
+                result[0] = dict(result[0], state="CORRUPTED", detail="simulated verification failure")
+            return result
+
+        with mock.patch.object(module, "_collect_states", new=flaky_collect):
+            exit_code, report = self._acquire()
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        self.assertIn("final verification failed", report["detail"])
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+
+    def test_redirect_body_exceeding_allowance_is_budgeted(self):
+        self.fixture.server.files["one.bin"] = b"x"
+        manifest = {
+            "schema_version": 1,
+            "artifact_set": "redirect-set",
+            "revision": "v1-abcdef0123456789",
+            "namespace": "redirect-set/v1-abcdef0123456789",
+            "files": [
+                {
+                    "path": "one.bin",
+                    "url": f"http://127.0.0.1:{self.fixture.server.port}/one.bin",
+                    "size": 1,
+                    "sha256": hashlib.sha256(b"x").hexdigest(),
+                }
+            ],
+        }
+        self.fixture.write_manifest(manifest)
+        self.fixture.server.redirect_with_body_next(
+            "one.bin",
+            f"http://127.0.0.1:{self.fixture.server.port}/one.bin",
+            b"r" * 100000,
+        )
+        exit_code, report = self._acquire(max_bytes=1)
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        self.assertIn("redirect body", report["detail"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertEqual(1, report["network"]["bytes_received"])
+        final_path = self.fixture.cache / "redirect-set" / "v1-abcdef0123456789" / "one.bin"
+        self.assertFalse(final_path.exists())
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+
+    def test_redirect_body_within_allowance_is_counted(self):
+        self.fixture.server.files["one.bin"] = b"x"
+        manifest = {
+            "schema_version": 1,
+            "artifact_set": "redirect-set",
+            "revision": "v1-abcdef0123456789",
+            "namespace": "redirect-set/v1-abcdef0123456789",
+            "files": [
+                {
+                    "path": "one.bin",
+                    "url": f"http://127.0.0.1:{self.fixture.server.port}/one.bin",
+                    "size": 1,
+                    "sha256": hashlib.sha256(b"x").hexdigest(),
+                }
+            ],
+        }
+        self.fixture.write_manifest(manifest)
+        self.fixture.server.redirect_with_body_next(
+            "one.bin",
+            f"http://127.0.0.1:{self.fixture.server.port}/one.bin",
+            b"r" * 16,
+        )
+        exit_code, report = self._acquire(max_bytes=17)
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        self.assertEqual(17, report["network"]["bytes_received"])
+        self.assertEqual(1, report["bytes"]["downloaded"])
+        final_path = self.fixture.cache / "redirect-set" / "v1-abcdef0123456789" / "one.bin"
+        self.assertEqual(b"x", final_path.read_bytes())
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
 
     def test_interrupted_transfer_consumes_budget_and_does_not_retry(self):
         # Pre-verify b.bin so the preflight required total is exactly a.bin's
@@ -759,6 +893,19 @@ class RedirectPolicyTests(unittest.TestCase):
     def test_redirect_to_encoded_mutable_path_is_rejected(self):
         self.assertIsNone(self._redirect("https://example.invalid/a", "https://example.invalid/resolve/%6dain/b"))
         self.assertIsNone(self._redirect("http://127.0.0.1:8000/a", "http://127.0.0.1:8000/resolve/%6c%61%74%65%73%74/b"))
+
+    def test_redirect_to_double_encoded_mutable_path_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://example.invalid/resolve/%256dain/b"))
+
+    def test_redirect_to_mutable_query_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://example.invalid/download?revision=main"))
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://example.invalid/download?ref=latest"))
+
+    def test_redirect_with_legitimate_signed_query_is_allowed(self):
+        request = self._redirect(
+            "https://example.invalid/a", "https://cdn.example.invalid/b?X-Amz-Signature=deadbeef"
+        )
+        self.assertIsNotNone(request)
 
 
 if __name__ == "__main__":

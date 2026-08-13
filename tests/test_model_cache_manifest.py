@@ -158,6 +158,60 @@ class ManifestValidationTests(unittest.TestCase):
         data["files"][0]["url"] = "https://example.invalid/a%zz.bin"
         self._reject(data, "percent-encoding")
 
+    def test_double_encoded_mutable_paths_are_rejected(self):
+        for url in (
+            "https://example.invalid/resolve/%256dain/a.bin",
+            "https://example.invalid/resolve%252Fmain%252Fa.bin",
+            "https://example.invalid/resolve/%252Fresolve%252Fmain%252F/a.bin",
+        ):
+            data = valid_manifest()
+            data["files"][0]["url"] = url
+            self._reject(data, "mutable source reference")
+
+    def test_mutable_query_references_are_rejected(self):
+        for query in (
+            "?revision=main",
+            "?ref=latest",
+            "?branch=MAIN",
+            "?tag=%6d%61%69%6e",
+            "?rev=%256d%2561%2569%256e",
+        ):
+            data = valid_manifest()
+            data["files"][0]["url"] = f"https://example.invalid/download{query}"
+            self._reject(data, "mutable source reference")
+
+    def test_legitimate_signed_query_is_accepted(self):
+        data = valid_manifest()
+        data["files"][0]["url"] = (
+            "https://example.invalid/a.bin"
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Credential=AKIDEXAMPLE"
+            "&X-Amz-Signature=deadbeef"
+        )
+        manifest = self._parse(data)
+        self.assertIn("X-Amz-Signature", manifest["files"][0]["url"])
+
+    def test_immutable_revision_query_is_accepted(self):
+        data = valid_manifest()
+        data["files"][0]["url"] = "https://example.invalid/a.bin?revision=v1-abcdef0123456789"
+        manifest = self._parse(data)
+        self.assertEqual(
+            "https://example.invalid/a.bin?revision=v1-abcdef0123456789",
+            manifest["files"][0]["url"],
+        )
+
+    def test_case_ambiguous_destinations_are_rejected(self):
+        data = valid_manifest()
+        data["files"][0]["path"] = "A.bin"
+        data["files"].append(dict(data["files"][0], path="a.bin", role=None))
+        self._reject(data, "case-ambiguous")
+
+    def test_ancestor_destination_conflict_is_rejected(self):
+        data = valid_manifest()
+        data["files"][0]["path"] = "foo"
+        data["files"].append(dict(data["files"][0], path="foo/bar", role=None))
+        self._reject(data, "file ancestor")
+
     def test_url_with_embedded_credentials_is_rejected(self):
         data = valid_manifest()
         data["files"][0]["url"] = "https://user:pass@example.invalid/a.bin"

@@ -118,7 +118,7 @@ class OfflinePlanTests(unittest.TestCase):
         corrupted = self.fixture.target("b.bin")
         corrupted.parent.mkdir(parents=True, exist_ok=True)
         corrupted.write_bytes(b"wrong-content")
-        partial = self.fixture.target("a.bin").with_name("a.bin.part")
+        partial = self.fixture.target("a.bin").with_name("_acq-a1.part")
         partial.write_bytes(b"incomplete")
 
         exit_code, report = self._run("status")
@@ -131,7 +131,7 @@ class OfflinePlanTests(unittest.TestCase):
 
         # Remove the corrupted final to check the partial state of the second file.
         corrupted.unlink()
-        self.fixture.target("b.bin").with_name("b.bin.part").write_bytes(b"partial-b")
+        self.fixture.target("b.bin").with_name("_acq-b1.part").write_bytes(b"partial-b")
         exit_code, report = self._run("status")
         by_path = {entry["path"]: entry for entry in report["files"]}
         self.assertEqual("PARTIAL", by_path["data/b.bin"]["state"])
@@ -223,7 +223,10 @@ class OfflinePlanTests(unittest.TestCase):
     def test_status_reports_corrupted_for_broken_temporary_symlink(self):
         target = self.fixture.target("a.bin")
         target.parent.mkdir(parents=True)
-        part = Path(str(target) + ".part")
+        part = Path(str(target)).with_name("_acq-broken.part")
+        # A real file on disk so the glob scan finds it; the mocked
+        # is_symlink classifies it as an unsafe temporary path.
+        part.write_bytes(b"")
 
         def fake_is_symlink(path):
             return Path.__fspath__(path) == str(part)
@@ -233,8 +236,11 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         by_path = {entry["path"]: entry for entry in report["files"]}
         self.assertEqual("CORRUPTED", by_path["data/a.bin"]["state"])
-        self.assertIn("temporary path is a symlink", by_path["data/a.bin"]["detail"])
-        self.assertEqual("ABSENT", by_path["data/b.bin"]["state"])
+        self.assertIn("temporary path is unsafe", by_path["data/a.bin"]["detail"])
+        # The unsafe temporary file lives in the shared data/ directory, so
+        # both entries in that directory are conservatively classified.
+        self.assertEqual("CORRUPTED", by_path["data/b.bin"]["state"])
+        self.assertIn("temporary path is unsafe", by_path["data/b.bin"]["detail"])
 
 
 if __name__ == "__main__":
