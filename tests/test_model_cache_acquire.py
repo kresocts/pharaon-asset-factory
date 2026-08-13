@@ -472,6 +472,7 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual("TRANSPORT_FAILURE", report["classification"])
         self.assertEqual(1, report["network"]["requests_attempted"])
         self.assertEqual(0, report["network"]["retries"])
+        self.assertEqual(["/a.bin"], self.fixture.server.requests)
         self.assertFalse(self.fixture.target("a.bin").exists())
         self.assertFalse(any(self.fixture.cache.rglob("*.part")))
 
@@ -485,6 +486,7 @@ class AcquisitionTests(unittest.TestCase):
         for name, data in self.fixture.files.items():
             self.assertEqual(data, self.fixture.target(name).read_bytes())
         self.assertEqual(3, len(self.fixture.server.requests))
+        self.assertEqual(3, report["network"]["requests_attempted"])
         self.assertEqual(0, report["network"]["retries"])
         self.assertEqual(48, report["network"]["bytes_received"])
 
@@ -663,10 +665,131 @@ class AcquisitionTests(unittest.TestCase):
         exit_code, report = self._acquire(max_bytes=17)
         self.assertEqual(0, exit_code)
         self.assertTrue(report["success"])
+        self.assertEqual(2, report["network"]["requests_attempted"])
         self.assertEqual(17, report["network"]["bytes_received"])
         self.assertEqual(1, report["bytes"]["downloaded"])
         final_path = self.fixture.cache / "redirect-set" / "v1-abcdef0123456789" / "one.bin"
         self.assertEqual(b"x", final_path.read_bytes())
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+
+    def test_redirect_chain_counts_every_request(self):
+        port = self.fixture.server.port
+        self.fixture.server.files["one.bin"] = b"x"
+        manifest = {
+            "schema_version": 1,
+            "artifact_set": "chain-set",
+            "revision": "v1-abcdef0123456789",
+            "namespace": "chain-set/v1-abcdef0123456789",
+            "files": [
+                {
+                    "path": "one.bin",
+                    "url": f"http://127.0.0.1:{port}/a.bin",
+                    "size": 1,
+                    "sha256": hashlib.sha256(b"x").hexdigest(),
+                }
+            ],
+        }
+        self.fixture.write_manifest(manifest)
+        self.fixture.server.redirect_with_body_next(
+            "a.bin", f"http://127.0.0.1:{port}/mid.bin", b"r" * 8
+        )
+        self.fixture.server.redirect_with_body_next("mid.bin", f"http://127.0.0.1:{port}/one.bin", b"")
+        exit_code, report = self._acquire(max_bytes=9)
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        self.assertEqual(3, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertEqual(9, report["network"]["bytes_received"])
+        final_path = self.fixture.cache / "chain-set" / "v1-abcdef0123456789" / "one.bin"
+        self.assertEqual(b"x", final_path.read_bytes())
+        self.assertEqual(["/a.bin", "/mid.bin", "/one.bin"], self.fixture.server.requests)
+        self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
+
+    def test_redirect_then_retry_counts_every_request(self):
+        port = self.fixture.server.port
+        self.fixture.server.redirect_next("a.bin", f"http://127.0.0.1:{port}/a.bin")
+        self.fixture.server.fail_next("a.bin", 503)
+        exit_code, report = self._acquire()
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        # a.bin: initial redirect request + followed redirect + retry (3);
+        # b.bin: one final request. All count as actual HTTP exchanges.
+        self.assertEqual(4, report["network"]["requests_attempted"])
+        self.assertEqual(1, report["network"]["retries"])
+        self.assertEqual(
+            ["/a.bin", "/a.bin", "/a.bin", "/b.bin"], self.fixture.server.requests
+        )
+        self.assertEqual(48, report["network"]["bytes_received"])
+        self.assertEqual(self.fixture.files["a.bin"], self.fixture.target("a.bin").read_bytes())
+
+    def test_internal_ancestor_symlink_alias_is_refused(self):
+        real = self.fixture.cache / "B"
+        real.mkdir()
+        alias = self.fixture.cache / "A"
+        try:
+            alias.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        manifest = dict(self.fixture.manifest, namespace="A/v1-abcdef0123456789")
+        self.fixture.write_manifest(manifest)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            status_code = module.main(
+                ["status", "--manifest", str(self.fixture.manifest_path), "--json"],
+                {"MODEL_CACHE_DIR": str(self.fixture.cache)},
+            )
+        status_report = json.loads(output.getvalue())
+        self.assertEqual(0, status_code)
+        self.assertEqual("CORRUPTED", status_report["files"][0]["state"])
+        self.assertIn("symlink", status_report["files"][0]["detail"])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            verify_code = module.main(
+                ["verify", "--manifest", str(self.fixture.manifest_path), "--json"],
+                {"MODEL_CACHE_DIR": str(self.fixture.cache)},
+            )
+        verify_report = json.loads(output.getvalue())
+        self.assertEqual(4, verify_code)
+        self.assertEqual(0, verify_report["network"]["requests_attempted"])
+        exit_code, report = self._acquire()
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", report["classification"])
+        self.assertIn("symlink", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
+        self.assertFalse(any(real.rglob("*.bin")))
+        self.assertFalse(any(real.rglob("_acq-*")))
+        self.assertFalse((alias / "v1-abcdef0123456789").exists())
+
+    def test_internal_symlink_cannot_bypass_destination_locking(self):
+        real = self.fixture.cache / "B"
+        real.mkdir()
+        alias = self.fixture.cache / "A"
+        try:
+            alias.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        # Manifest A (aliased through the symlink): rejected before network.
+        manifest_a = dict(self.fixture.manifest, namespace="A/v1-abcdef0123456789")
+        self.fixture.write_manifest(manifest_a)
+        exit_code, report = self._acquire()
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", report["classification"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
+        # Manifest B (canonical namespace B/v1, different expected hashes):
+        # it must not report success for content matching B's wrong hashes.
+        manifest_b = dict(self.fixture.manifest, namespace="B/v1-abcdef0123456789")
+        manifest_b["files"] = [
+            dict(file, sha256=hashlib.sha256(b"other").hexdigest()) for file in manifest_b["files"]
+        ]
+        self.fixture.write_manifest(manifest_b)
+        exit_code, report = self._acquire()
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        # No acquisition ever succeeded for the aliased physical destination.
+        self.assertFalse(any(real.rglob("*.bin")))
+        self.assertFalse(any(real.rglob("_acq-*")))
         self.assertFalse(any(self.fixture.cache.rglob("_acq-*")))
 
     def test_interrupted_transfer_consumes_budget_and_does_not_retry(self):

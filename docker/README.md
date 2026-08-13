@@ -180,9 +180,12 @@ non-empty URL fragments are refused, and targeted revision-like query parameters
 values (`main`, `master`, `latest`, `head`), while other query strings (including
 signed HTTPS parameters) are preserved. Destinations are compared case-insensitively
 for cross-platform determinism (so `A.bin` and `a.bin` are rejected as ambiguous), a
-file destination cannot be an ancestor of another destination, and acquisition-owned
+file destination cannot be an ancestor of another destination, acquisition-owned
 temporary names use an underscore prefix that is not representable as a manifest
-destination. Redirects are followed only when the target still obeys the same
+destination, and every existing symlink in a destination ancestor below the cache
+root is rejected ? including symlinks that resolve to another location inside the
+same cache, because such internal aliases would let different namespace locks
+manipulate one physical destination. Redirects are followed only when the target still obeys the same
 policy: unsupported schemes, embedded credentials, and mutable source references are
 refused; HTTPS sources never downgrade to HTTP and never redirect into loopback or
 test hosts; loopback/test HTTP redirects are allowed only for already-allowed
@@ -236,7 +239,10 @@ fsync, promotion, and permission errors) are never retried as transport failures
 they are reported with the stable `LOCAL_IO_FAILURE` classification and exit code
 `70` after at most one network attempt. Retry attempts are visible in the
 machine-readable `network.retries`, `network.requests_attempted`, and
-`network.bytes_received` fields.
+`network.bytes_received` fields. `network.requests_attempted` counts every HTTP
+exchange actually attempted, including the initial artifact request, every
+followed redirect request, and every retry; refused redirects do not add a
+target request.
 
 ### Streaming, atomicity, and states
 

@@ -496,10 +496,14 @@ def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[
 
 
 def _symlink_escape_detail(cache_root: Path, target: Path) -> str | None:
-    """Return a description when *target* escapes *cache_root* via a symlink.
+    """Return a description when *target* uses an unsafe symlinked ancestor.
 
-    Only ancestor directories are inspected here; the final path itself is
-    handled by the caller so a final symlink can be reported distinctly.
+    Every existing symlink in the destination ancestor components below the
+    configured cache root is rejected, whether it resolves outside the cache
+    (escape) or to another location inside the cache (internal alias). The
+    cache root itself may be a mount point or symlink; only descendant
+    components are inspected. The final path itself is handled by the caller
+    so a final symlink can be reported distinctly.
     """
     root = _absolute(cache_root)
     try:
@@ -518,6 +522,10 @@ def _symlink_escape_detail(cache_root: Path, target: Path) -> str | None:
                     f"destination passes through a symlink that escapes the cache: "
                     f"{current} -> {real}"
                 )
+            return (
+                f"destination passes through an aliased symlink inside the cache: "
+                f"{current} -> {real}"
+            )
     return None
 
 
@@ -802,9 +810,14 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     the same shared transfer budget as final artifacts, attempts, and retries.
     """
 
-    def __init__(self, budget: _TransferBudget | None = None) -> None:
+    def __init__(
+        self,
+        budget: _TransferBudget | None = None,
+        stats: dict[str, int] | None = None,
+    ) -> None:
         super().__init__()
         self._budget = budget
+        self._stats = stats
 
     def redirect_request(self, request, fp, code, msg, headers, newurl):  # type: ignore[override]
         original = urllib.parse.urlparse(request.full_url)
@@ -856,6 +869,11 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
                 fp.read()
         finally:
             fp.close()
+        # Count the followed redirect as an actual HTTP request attempt. A
+        # refused redirect returns above without incrementing, so no
+        # nonexistent target request is ever counted.
+        if self._stats is not None:
+            self._stats["requests_attempted"] += 1
         return self.parent.open(new, timeout=req.timeout)
 
     def http_error_301(self, req, fp, code, msg, headers):  # type: ignore[override]
@@ -874,8 +892,11 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return self._redirect_with_budget(req, fp, code, msg, headers)
 
 
-def _opener(budget: _TransferBudget | None = None) -> urllib.request.OpenerDirector:
-    handlers: list[Any] = [urllib.request.ProxyHandler({}), _RestrictedRedirectHandler(budget)]
+def _opener(
+    budget: _TransferBudget | None = None,
+    stats: dict[str, int] | None = None,
+) -> urllib.request.OpenerDirector:
+    handlers: list[Any] = [urllib.request.ProxyHandler({}), _RestrictedRedirectHandler(budget, stats)]
     if getattr(ssl, "create_default_context", None) is not None:
         handlers.append(_TimedHTTPHandler())
         handlers.append(_TimedHTTPSHandler())
@@ -926,7 +947,7 @@ def _stream_once(
 ) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     stats["requests_attempted"] += 1
-    response = _opener(budget).open(request, timeout=CONNECT_TIMEOUT)
+    response = _opener(budget, stats).open(request, timeout=CONNECT_TIMEOUT)
     try:
         # Bounded acquisition requires an exact declared body size. Responses
         # without Content-Length or with chunked transfer encoding are refused

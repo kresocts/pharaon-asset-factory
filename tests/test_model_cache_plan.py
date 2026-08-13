@@ -242,6 +242,36 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertEqual("CORRUPTED", by_path["data/b.bin"]["state"])
         self.assertIn("temporary path is unsafe", by_path["data/b.bin"]["detail"])
 
+    def test_status_reports_corrupted_for_internal_ancestor_symlink(self):
+        root = Path(os.path.abspath(str(self.fixture.cache)))
+        target_parent = root / "fixture-set" / "v1-abcdef0123456789" / "data"
+        inside = root / "elsewhere"
+
+        def fake_is_symlink(path):
+            return Path.__fspath__(path) == str(target_parent)
+
+        def fake_realpath(value):
+            return str(inside) if str(value) == str(target_parent) else str(value)
+
+        with (
+            mock.patch.object(module.Path, "is_symlink", new=fake_is_symlink),
+            mock.patch.object(module.os.path, "realpath", new=fake_realpath),
+        ):
+            exit_code, report = self._run("status")
+        self.assertEqual(0, exit_code)
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual("CORRUPTED", by_path["data/a.bin"]["state"])
+        self.assertIn("symlink", by_path["data/a.bin"]["detail"])
+        self.assertEqual("CORRUPTED", by_path["data/b.bin"]["state"])
+        self.assertIn("symlink", by_path["data/b.bin"]["detail"])
+        with (
+            mock.patch.object(module.Path, "is_symlink", new=fake_is_symlink),
+            mock.patch.object(module.os.path, "realpath", new=fake_realpath),
+        ):
+            verify_code, verify_report = self._run("verify")
+        self.assertEqual(4, verify_code)
+        self.assertEqual(0, verify_report["network"]["requests_attempted"])
+
 
 if __name__ == "__main__":
     unittest.main()
