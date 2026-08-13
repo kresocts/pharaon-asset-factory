@@ -14,6 +14,10 @@ case "${1:-health}" in
         if [ "$#" -gt 0 ]; then shift; fi
         exec python /app/gpu_smoke.py "$@"
         ;;
+    native-smoke)
+        if [ "$#" -gt 0 ]; then shift; fi
+        exec python /app/native_smoke.py "$@"
+        ;;
     *)
         exec "$@"
         ;;

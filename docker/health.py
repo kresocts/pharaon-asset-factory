@@ -162,6 +162,13 @@ def _hunyuan_diagnostics(paths: dict[str, str], environment: dict[str, str]) -> 
     except (OSError, UnicodeError):
         revision = None
     custom_artifacts = _compiled_artifacts(source / "hy3dpaint" / "custom_rasterizer")
+    try:
+        custom_spec = importlib.util.find_spec("custom_rasterizer_kernel")
+    except (ImportError, ValueError):
+        custom_spec = None
+    if custom_spec is not None and custom_spec.origin and Path(custom_spec.origin).suffix == ".so":
+        custom_artifacts.append(str(Path(custom_spec.origin)))
+    custom_artifacts = sorted(set(custom_artifacts))
     renderer_artifacts = _compiled_artifacts(source / "hy3dpaint" / "DifferentiableRenderer")
     return {
         "source_path": str(source),
@@ -170,13 +177,47 @@ def _hunyuan_diagnostics(paths: dict[str, str], environment: dict[str, str]) -> 
         "revision": revision,
         "revision_matches": revision == expected_commit,
         "custom_rasterizer": {
-            "status": "CUSTOM_RASTERIZER_BUILT_UNEXPECTED" if custom_artifacts else "CUSTOM_RASTERIZER_NOT_BUILT_EXPECTED",
+            "status": "CUSTOM_RASTERIZER_BUILT" if custom_artifacts else "CUSTOM_RASTERIZER_NOT_BUILT",
             "compiled_artifacts": custom_artifacts,
         },
         "differentiable_renderer": {
-            "status": "DIFFERENTIABLE_RENDERER_BUILT_UNEXPECTED" if renderer_artifacts else "DIFFERENTIABLE_RENDERER_NOT_BUILT_EXPECTED",
+            "status": "DIFFERENTIABLE_RENDERER_BUILT" if renderer_artifacts else "DIFFERENTIABLE_RENDERER_NOT_BUILT",
             "compiled_artifacts": renderer_artifacts,
         },
+    }
+
+
+def _native_diagnostics(run_gpu_operation: bool = False) -> dict[str, Any]:
+    modules: dict[str, dict[str, Any]] = {}
+    ready = True
+    for name in (
+        "custom_rasterizer",
+        "custom_rasterizer_kernel",
+        "hy3dpaint.DifferentiableRenderer.mesh_inpaint_processor",
+    ):
+        try:
+            module = importlib.import_module(name)
+        except Exception as error:
+            modules[name] = {"status": "IMPORT_ERROR", "detail": str(error)}
+            ready = False
+        else:
+            modules[name] = {
+                "status": "IMPORT_OK",
+                "module_path": str(getattr(module, "__file__", "UNKNOWN")),
+            }
+    operation: dict[str, Any] = {"status": "NOT_ATTEMPTED"}
+    if run_gpu_operation and ready:
+        try:
+            import native_smoke
+
+            operation = native_smoke.collect_native_smoke(True)["custom_rasterizer_operation"]
+        except Exception as error:
+            operation = {"status": "CUSTOM_RASTERIZER_CUDA_OPERATION_FAILED", "detail": str(error)}
+    return {
+        "status": "NATIVE_IMPORTS_READY" if ready else "NATIVE_IMPORTS_FAILED",
+        "modules": modules,
+        "gpu_operation": operation,
+        "cuda_architectures": os.environ.get("TORCH_CUDA_ARCH_LIST", "UNKNOWN"),
     }
 
 
@@ -196,7 +237,7 @@ def _model_diagnostics(paths: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def collect_health(environment: dict[str, str] | None = None) -> dict[str, Any]:
+def collect_health(environment: dict[str, str] | None = None, run_native_gpu: bool = False) -> dict[str, Any]:
     """Collect JSON-serializable dependency health information."""
     env = dict(os.environ if environment is None else environment)
     for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "DIFFUSERS_OFFLINE"):
@@ -208,6 +249,7 @@ def collect_health(environment: dict[str, str] | None = None) -> dict[str, Any]:
     dependencies = _dependency_diagnostics()
     hunyuan = _hunyuan_diagnostics(paths, env)
     models = _model_diagnostics(paths)
+    native = _native_diagnostics(run_native_gpu)
     dependencies_ready = all(
         (
             platform.python_version().startswith(EXPECTED_PYTHON),
@@ -215,13 +257,14 @@ def collect_health(environment: dict[str, str] | None = None) -> dict[str, Any]:
             dependencies["status"] == "DEPENDENCY_IMPORTS_READY",
             hunyuan["source_present"],
             hunyuan["revision_matches"],
-            hunyuan["custom_rasterizer"]["status"] == "CUSTOM_RASTERIZER_NOT_BUILT_EXPECTED",
-            hunyuan["differentiable_renderer"]["status"] == "DIFFERENTIABLE_RENDERER_NOT_BUILT_EXPECTED",
+            hunyuan["custom_rasterizer"]["status"] == "CUSTOM_RASTERIZER_BUILT",
+            hunyuan["differentiable_renderer"]["status"] == "DIFFERENTIABLE_RENDERER_BUILT",
+            native["status"] == "NATIVE_IMPORTS_READY",
             models["status"] == "MODEL_WEIGHTS_NOT_PRESENT_EXPECTED",
         )
     )
     return {
-        "status": "HUNYUAN_DEPENDENCIES_READY" if dependencies_ready else "HUNYUAN_DEPENDENCIES_NOT_READY",
+        "status": "HUNYUAN_NATIVE_EXTENSIONS_READY" if dependencies_ready else "HUNYUAN_NATIVE_EXTENSIONS_NOT_READY",
         "full_hunyuan_ready": False,
         "gpu_status": nvidia["status"],
         "python": {"version": platform.python_version(), "expected": EXPECTED_PYTHON, "executable": sys.executable},
@@ -233,8 +276,8 @@ def collect_health(environment: dict[str, str] | None = None) -> dict[str, Any]:
         "dependencies": dependencies,
         "hunyuan": hunyuan,
         "models": models,
+        "native_extensions": native,
     }
-
 
 def _format_human(report: dict[str, Any]) -> str:
     paths, cuda, nvidia = report["paths"], report["cuda"], report["nvidia"]
@@ -261,6 +304,8 @@ def _format_human(report: dict[str, Any]) -> str:
         f"DIFFERENTIABLE_RENDERER_STATUS={hunyuan['differentiable_renderer']['status']}",
         f"MODEL_WEIGHTS_STATUS={report['models']['status']}",
         "FULL_HUNYUAN_READY=NO",
+        f"NATIVE_IMPORT_STATUS={report['native_extensions']['status']}",
+        f"CUDA_ARCHITECTURES={report['native_extensions']['cuda_architectures']}",
     ]
     if pytorch.get("device_name"):
         lines.append(f"PYTORCH_GPU_DEVICE={pytorch['device_name']}")
@@ -272,11 +317,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--require-gpu", action="store_true", help="require a successful PyTorch CUDA operation")
+    parser.add_argument("--require-native-gpu", action="store_true", help="require a custom-rasterizer CUDA operation")
     args = parser.parse_args(argv)
-    report = collect_health()
+    report = collect_health(run_native_gpu=args.require_native_gpu)
     print(json.dumps(report, indent=2, sort_keys=True) if args.json else _format_human(report))
     if args.require_gpu and report["pytorch"].get("cuda_operation") != "PYTORCH_CUDA_OPERATION_OK":
         return 2
+    if args.require_native_gpu and report["native_extensions"]["gpu_operation"].get("status") != "CUSTOM_RASTERIZER_CUDA_OPERATION_OK":
+        return 3
     return 0
 
 

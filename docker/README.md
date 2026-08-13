@@ -52,3 +52,27 @@ The GPU smoke test allocates a small CUDA tensor, performs an operation, synchro
 | `/data/input`, `/data/output`, `/workspace` | Job data and temporary workspace |
 
 Startup never downloads into `/models`. The process remains fixed unprivileged user/group `10001:10001`. T-0012 will compile the custom rasterizer and DifferentiableRenderer; later work will define licensed weight acquisition. Until then, do not claim that Hunyuan generation works.
+
+## T-0012 native extension layer
+
+The image now bakes both native components from Hunyuan commit `82920d643c0dc2f7bfd7255f45f62d386edfe60c` into a Docker build layer:
+
+- `custom_rasterizer` is built as a normal wheel with the pinned torch environment visible through `--no-build-isolation`; upstream `setup.py` imports torch as an undeclared build dependency, so isolated metadata/build cannot work.
+- The exact upstream `hy3dpaint/DifferentiableRenderer/compile_mesh_painter.sh` emits `/opt/hunyuan3d/hy3dpaint/DifferentiableRenderer/mesh_inpaint_processor.cpython-310-x86_64-linux-gnu.so`.
+- `/opt/hunyuan3d.native-artifacts.txt` records the rasterizer kernel and mesh-painter shared libraries.
+
+The single-stage CUDA development image is retained because the base was intentionally selected for native compilation and the toolchain is part of its diagnostic contract. CUDA compilation targets `8.6;8.9`: RTX 3090 and RTX 4060/4090-class architectures. Only the local RTX 4060 is empirically tested here.
+
+Build and run diagnostics with:
+
+```bash
+docker build --no-cache --tag pharaon-asset-factory-gpu:t0012 --file docker/Dockerfile .
+docker run --rm pharaon-asset-factory-gpu:t0012 health --json
+docker run --rm pharaon-asset-factory-gpu:t0012 native-smoke
+docker run --rm --gpus all pharaon-asset-factory-gpu:t0012 native-smoke --require-gpu-operation
+docker run --rm --gpus all pharaon-asset-factory-gpu:t0012 health --require-gpu --require-native-gpu --json
+```
+
+Without GPU passthrough, ordinary health and `native-smoke` load both extensions and run the renderer's safe CPU pybind11 operation; they do not invoke CUDA automatically. Health reports `HUNYUAN_NATIVE_EXTENSIONS_READY`, installed/importable artifacts, `GPU_NOT_AVAILABLE`, absent weights, and `full_hunyuan_ready: false`. The GPU smoke rasterizes one synthetic triangle through the actual custom CUDA kernel. No command downloads weights or accesses a model hub.
+
+Model snapshots, Hunyuan checkpoints, Real-ESRGAN, and other inference assets remain absent. Asset generation and full Hunyuan inference are still unavailable.
