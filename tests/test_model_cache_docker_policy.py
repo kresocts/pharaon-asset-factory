@@ -33,7 +33,7 @@ class ModelCacheDockerPolicyTests(unittest.TestCase):
 
     def test_entrypoint_does_not_run_models_automatically(self):
         self.assertIn("${1:-health}", self.entrypoint)
-        default_case = self.entrypoint[self.entrypoint.index("case ${1:-health}"):]
+        default_case = self.entrypoint[self.entrypoint.index('case "${1:-health}"'):]
         self.assertLess(default_case.index("health)"), default_case.index("models)"))
 
     def test_dockerfile_copies_model_cache_after_heavy_dependency_layers(self):

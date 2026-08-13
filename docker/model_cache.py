@@ -88,7 +88,6 @@ MUTABLE_URL_FRAGMENTS = (
     "/blob/latest/",
     "/archive/refs/heads/",
 )
-LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 TEST_HOSTS = {"host.docker.internal"}
 FILE_STATES = ("ABSENT", "PARTIAL", "CORRUPTED", "VERIFIED")
 USER_AGENT = "pharaon-model-cache/" + str(SCHEMA_VERSION)
@@ -174,7 +173,7 @@ def _is_loopback_host(host: str) -> bool:
     return normalized in {"localhost", "127.0.0.1", "::1"} or normalized.startswith("127.")
 
 
-def _validated_components(value: str, field: str, *, allow_single_dot: bool = False) -> list[str]:
+def _validated_components(value: str, field: str) -> list[str]:
     if not isinstance(value, str) or not value:
         raise ManifestValidationError(f"{field} must be a non-empty string")
     if value.startswith("/") or "\\" in value or value.startswith("~"):
@@ -388,11 +387,41 @@ def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[
     return {"state": "ABSENT", "detail": None}
 
 
+def _symlink_escape_detail(cache_root: Path, target: Path) -> str | None:
+    """Return a description when *target* escapes *cache_root* via a symlink.
+
+    Only ancestor directories are inspected here; the final path itself is
+    handled by the caller so a final symlink can be reported distinctly.
+    """
+    root = _absolute(cache_root)
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return f"destination escapes the model cache: {target} is outside {root}"
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            real = Path(os.path.realpath(current))
+            try:
+                real.relative_to(root)
+            except ValueError:
+                return (
+                    f"destination passes through a symlink that escapes the cache: "
+                    f"{current} -> {real}"
+                )
+    return None
+
+
 def _collect_states(cache_root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for file in manifest["files"]:
         target = _target_path(cache_root, manifest, file["path"])
-        state = _file_state(target, file["size"], file["sha256"])
+        issue = _symlink_escape_detail(cache_root, target)
+        if issue is not None:
+            state = {"state": "CORRUPTED", "detail": issue}
+        else:
+            state = _file_state(target, file["size"], file["sha256"])
         entries.append(
             {
                 "path": file["path"],
@@ -424,20 +453,45 @@ def _validate_destination(cache_root: Path, manifest: dict[str, Any], rel_path: 
         raise ManifestValidationError(
             f"destination escapes the model cache: {target} is outside {root}"
         ) from error
-    current = root
-    for part in target.relative_to(root).parts[:-1]:
-        current = current / part
-        if current.is_symlink():
-            real = Path(os.path.realpath(current))
-            try:
-                real.relative_to(root)
-            except ValueError as error:
-                raise ManifestValidationError(
-                    f"destination passes through a symlink that escapes the cache: {current} -> {real}"
-                ) from error
+    issue = _symlink_escape_detail(root, target)
+    if issue is not None:
+        raise ManifestValidationError(issue)
     if target.is_symlink():
         raise ManifestValidationError(f"destination is an existing symlink: {target}")
+    if target.exists() and not target.is_file():
+        raise ManifestValidationError(f"destination exists and is not a regular file: {target}")
     return target
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Conservative Windows liveness probe using only the standard library.
+
+    Opens the process with limited query rights and checks whether its exit
+    code is STILL_ACTIVE (259). A process that cannot be opened is treated as
+    dead; an unexpected query failure is treated conservatively as alive.
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 class _ArtifactLock:
@@ -462,6 +516,14 @@ class _ArtifactLock:
 
     @staticmethod
     def _owner_alive(pid: int) -> bool:
+        """Return whether *pid* is still running.
+
+        POSIX uses os.kill(pid, 0). On Windows os.kill does not act as a
+        liveness probe (signal 0 maps to a console Ctrl+C event), so a
+        conservative ctypes-based probe is used there instead.
+        """
+        if os.name == "nt":
+            return _windows_pid_alive(pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -571,8 +633,26 @@ class _TimedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_TimedHTTPSConnection, request)
 
 
+class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only when the target still obeys the manifest policy.
+
+    Redirects to non-http(s) schemes and http redirects to non-loopback,
+    non-test hosts are refused so a validated manifest cannot silently extend
+    the network boundary through a server-controlled redirect.
+    """
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):  # type: ignore[override]
+        parsed = urllib.parse.urlparse(newurl)
+        if parsed.scheme not in ("http", "https"):
+            return None
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "http" and not (_is_loopback_host(host) or host in TEST_HOSTS):
+            return None
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
 def _opener() -> urllib.request.OpenerDirector:
-    handlers: list[Any] = [urllib.request.ProxyHandler({})]
+    handlers: list[Any] = [urllib.request.ProxyHandler({}), _RestrictedRedirectHandler()]
     if getattr(ssl, "create_default_context", None) is not None:
         handlers.append(_TimedHTTPHandler())
         handlers.append(_TimedHTTPSHandler())
@@ -852,7 +932,6 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
     lock = _ArtifactLock(cache_root, plan_id)
     lock.acquire()
     stats = {"requests_attempted": 0, "retries": 0}
-    target_part: Path | None = None
     cumulative = 0
     try:
         # Re-inspect the cache after acquiring the lock so files verified by a
@@ -860,26 +939,26 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
         entries = _collect_states(cache_root, manifest)
         for entry in entries:
             entry["downloaded"] = False
+            target_part: Path | None = None
             if entry["state"] == "VERIFIED":
-                entry["downloaded"] = False
                 entry["action"] = "reused"
                 continue
-            target = _validate_destination(cache_root, manifest, entry["path"])
-            target_part = Path(str(target) + ".part")
-            if target_part.exists():
-                if not target_part.is_file():
+            try:
+                target = _validate_destination(cache_root, manifest, entry["path"])
+                target_part = Path(str(target) + ".part")
+                if target_part.exists():
+                    if not target_part.is_file():
+                        raise ManifestValidationError(
+                            f"partial path is not a regular file: {target_part}"
+                        )
+                    target_part.unlink()
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as error:
                     raise ManifestValidationError(
-                        f"partial path is not a regular file: {target_part}"
-                    )
-                target_part.unlink()
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                raise ManifestValidationError(
-                    f"cannot create destination directory {target.parent}: {error}"
-                ) from error
-            budget_remaining = args.max_bytes - cumulative
-            try:
+                        f"cannot create destination directory {target.parent}: {error}"
+                    ) from error
+                budget_remaining = args.max_bytes - cumulative
                 _download_file(
                     url=entry["url"],
                     expected_size=entry["expected_size"],
@@ -889,18 +968,23 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
                     lock=lock,
                     stats=stats,
                 )
+                try:
+                    os.replace(target_part, target)
+                except OSError as error:
+                    raise ManifestValidationError(
+                        f"cannot promote verified download to {target}: {error}"
+                    ) from error
+                cumulative += entry["expected_size"]
+                entry["downloaded"] = True
+                entry["action"] = "downloaded"
+                entry["state"] = "VERIFIED"
+                entry["detail"] = None
             except ModelCacheError as error:
                 error.entries = entries
                 error.stats = stats
                 error.manifest = manifest
                 _remove_part(target_part)
                 raise
-            os.replace(target_part, target)
-            cumulative += entry["expected_size"]
-            entry["downloaded"] = True
-            entry["action"] = "downloaded"
-            entry["state"] = "VERIFIED"
-            entry["detail"] = None
     finally:
         lock.release()
 

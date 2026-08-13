@@ -3,9 +3,11 @@ import http.server
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -345,6 +347,74 @@ class AcquisitionTests(unittest.TestCase):
         self.assertIn("symlink", report["detail"])
         self.assertEqual(0, report["network"]["requests_attempted"])
         self.assertEqual([], self.fixture.server.requests)
+
+    def test_directory_at_destination_is_a_path_security_failure(self):
+        target = self.fixture.target("a.bin")
+        target.mkdir(parents=True)
+        exit_code, report = self._acquire()
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", report["classification"])
+        self.assertIn("not a regular file", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_acquire_refuses_when_ancestor_symlink_escapes(self):
+        root = Path(os.path.abspath(str(self.fixture.cache)))
+        target_parent = root / "fixture-set" / "v1-abcdef0123456789" / "data"
+        outside = self.fixture.root / "outside"
+
+        def fake_is_symlink(path):
+            return Path.__fspath__(path) == str(target_parent)
+
+        def fake_realpath(value):
+            return str(outside) if str(value) == str(target_parent) else str(value)
+
+        with (
+            mock.patch.object(module.Path, "is_symlink", new=fake_is_symlink),
+            mock.patch.object(module.os.path, "realpath", new=fake_realpath),
+        ):
+            exit_code, report = self._acquire()
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", report["classification"])
+        self.assertIn("symlink", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
+
+
+class RedirectPolicyTests(unittest.TestCase):
+    """The network boundary must not expand through server-controlled redirects."""
+
+    def _handler(self):
+        return module._RestrictedRedirectHandler()
+
+    def _redirect(self, original, target):
+        request = urllib.request.Request(original)
+        return self._handler().redirect_request(request, None, 302, "Found", {}, target)
+
+    def test_redirect_to_non_http_scheme_is_refused(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "ftp://example.invalid/b"))
+
+    def test_https_to_http_redirect_is_refused(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "http://example.invalid/b"))
+
+    def test_http_to_remote_http_redirect_is_refused(self):
+        self.assertIsNone(self._redirect("http://127.0.0.1:8000/a", "http://example.invalid/b"))
+
+    def test_loopback_http_redirect_is_allowed(self):
+        request = self._redirect("http://127.0.0.1:8000/a", "http://127.0.0.1:9000/b")
+        self.assertIsNotNone(request)
+        self.assertEqual("http://127.0.0.1:9000/b", request.full_url)
+
+    def test_host_docker_internal_http_redirect_is_allowed(self):
+        request = self._redirect(
+            "http://host.docker.internal:18765/a", "http://host.docker.internal:18765/b"
+        )
+        self.assertIsNotNone(request)
+
+    def test_https_redirect_is_allowed(self):
+        request = self._redirect("https://example.invalid/a", "https://cdn.example.invalid/b")
+        self.assertIsNotNone(request)
 
 
 if __name__ == "__main__":

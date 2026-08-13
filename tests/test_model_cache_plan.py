@@ -197,6 +197,29 @@ class OfflinePlanTests(unittest.TestCase):
                 module._validate_destination(root, self.fixture.manifest, "data/a.bin")
         self.assertIn("symlink", str(raised.exception))
 
+    def test_status_reports_corrupted_when_ancestor_symlink_escapes(self):
+        root = Path(os.path.abspath(str(self.fixture.cache)))
+        target_parent = root / "fixture-set" / "v1-abcdef0123456789" / "data"
+        outside = self.fixture.root / "outside"
+
+        def fake_is_symlink(path):
+            return Path.__fspath__(path) == str(target_parent)
+
+        def fake_realpath(value):
+            return str(outside) if str(value) == str(target_parent) else str(value)
+
+        with (
+            mock.patch.object(module.Path, "is_symlink", new=fake_is_symlink),
+            mock.patch.object(module.os.path, "realpath", new=fake_realpath),
+        ):
+            exit_code, report = self._run("status")
+        self.assertEqual(0, exit_code)
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual("CORRUPTED", by_path["data/a.bin"]["state"])
+        self.assertIn("symlink", by_path["data/a.bin"]["detail"])
+        self.assertEqual("CORRUPTED", by_path["data/b.bin"]["state"])
+        self.assertIn("symlink", by_path["data/b.bin"]["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

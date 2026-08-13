@@ -172,8 +172,10 @@ lowercase `sha256`. Mutable references such as `main`, `latest`, `master`, `HEAD
 checksums, missing or non-positive sizes, absolute or `..` traversal paths, duplicate
 destinations, unsupported URL schemes, and URLs with embedded credentials. Production
 sources must use HTTPS; HTTP is accepted only for loopback and `host.docker.internal`
-test fixtures. The destination namespace and every file path are validated so nothing
-can be written outside the configured model-cache root.
+test fixtures. Redirects are followed only when the target still obeys the same
+policy: redirects to non-HTTP(S) schemes and HTTP redirects away from loopback or
+test hosts are refused. The destination namespace and every file path are validated
+so nothing can be written outside the configured model-cache root.
 
 ### Cache layout
 
@@ -223,6 +225,8 @@ non-zero until every file is `VERIFIED`. T-0014 uses a documented restart-from-z
 policy: a stale `.part` is removed and re-downloaded on the next authorized
 acquisition, and a corrupted final file is replaced only after a fully verified fresh
 download. Existing verified files are always reused without network access or rewrites.
+A destination that already exists as a directory or another non-regular file is refused
+as a path-policy failure before any network request.
 
 ### Locking
 

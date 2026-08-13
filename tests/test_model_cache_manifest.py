@@ -117,6 +117,12 @@ class ManifestValidationTests(unittest.TestCase):
         manifest = self._parse(data)
         self.assertEqual("http://127.0.0.1:8000/a.bin", manifest["files"][0]["url"])
 
+    def test_http_is_allowed_for_host_docker_internal_test_fixtures(self):
+        data = valid_manifest()
+        data["files"][0]["url"] = "http://host.docker.internal:18765/a.bin"
+        manifest = self._parse(data)
+        self.assertEqual("http://host.docker.internal:18765/a.bin", manifest["files"][0]["url"])
+
     def test_mutable_url_references_are_rejected(self):
         for fragment in ("/resolve/main/", "/blob/main/", "/resolve/latest/"):
             data = valid_manifest()
