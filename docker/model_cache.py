@@ -222,15 +222,28 @@ def _validated_url(url: str) -> str:
     if parsed.username is not None or parsed.password is not None:
         raise ManifestValidationError("file url must not contain embedded credentials")
     host = parsed.hostname.lower()
-    lowered = url.lower()
     if parsed.scheme == "http" and not (_is_loopback_host(host) or host in TEST_HOSTS):
         raise ManifestValidationError(
             "http URLs are allowed only for loopback or host.docker.internal test fixtures; production sources require https"
         )
-    if any(fragment in lowered for fragment in MUTABLE_URL_FRAGMENTS):
+    if parsed.fragment:
+        raise ManifestValidationError(
+            "file url must not contain a fragment; fragments are not sent in HTTP requests but would change plan identity"
+        )
+    # Mutable-reference checks run against the percent-decoded path so encoded
+    # forms such as /resolve/%6dain/ cannot bypass the policy. The query string
+    # is intentionally not inspected: legitimate signed HTTPS query parameters
+    # are not mutable source references.
+    path = parsed.path
+    if "%" in path:
+        if re.search(r"%(?![0-9A-Fa-f]{2})", path):
+            raise ManifestValidationError("file url contains malformed percent-encoding")
+        path = urllib.parse.unquote(path, errors="replace")
+    lowered_path = path.lower()
+    if any(mutable in lowered_path for mutable in MUTABLE_URL_FRAGMENTS):
         raise ManifestValidationError("mutable source reference in URL is not allowed")
     mutable_segments = [
-        segment for segment in parsed.path.split("/") if segment and segment.lower() in MUTABLE_REVISION_WORDS
+        segment for segment in path.split("/") if segment and segment.lower() in MUTABLE_REVISION_WORDS
     ]
     if mutable_segments:
         raise ManifestValidationError("mutable source reference in URL is not allowed")
@@ -369,6 +382,19 @@ def _canonical_plan_payload(manifest: dict[str, Any]) -> dict[str, Any]:
 def _plan_id(manifest: dict[str, Any]) -> str:
     canonical = json.dumps(_canonical_plan_payload(manifest), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _lock_key(manifest: dict[str, Any]) -> str:
+    """Return the destination-write lock key for a manifest.
+
+    All artifacts are written below `<cache>/<namespace>/<path>`, so manifests
+    that share the first namespace component can manipulate the same final or
+    temporary paths even when their URLs, hashes, roles, or plan digests
+    differ. Locking at that granularity serializes all acquisitions with
+    potentially overlapping destinations while keeping the key a validated,
+    safe filesystem component.
+    """
+    return manifest["namespace"].split("/", 1)[0]
 
 
 def _sha256_file(path: Path) -> str:
@@ -519,21 +545,25 @@ def _windows_pid_alive(pid: int) -> bool:
 
 
 class _ArtifactLock:
-    """Per-artifact-set lock stored under the external cache root.
+    """Per-destination lock stored under the external cache root.
 
-    Acquisition uses atomic directory creation. A bounded wait is attempted
-    before failing with a clean LOCK_CONFLICT. Stale locks are broken only
-    conservatively: the owner metadata must be older than a long grace period
-    AND the recorded owner process must no longer be alive. An active lock is
-    never broken.
+    The lock key is the first validated namespace component, so manifests that
+    can write overlapping destination paths serialize even when their URLs,
+    hashes, roles, or plan digests differ. Acquisition uses atomic directory
+    creation. A bounded wait is attempted before failing with a clean
+    LOCK_CONFLICT. Stale locks are broken only conservatively: the owner
+    metadata must be older than a long grace period AND the recorded owner
+    process must no longer be alive. An active lock is never broken.
     """
 
-    def __init__(self, cache_root: Path, plan_id: str) -> None:
+    def __init__(self, cache_root: Path, lock_key: str, plan_id: str) -> None:
         self.cache_root = _absolute(cache_root)
         self.lock_root = self.cache_root / ".locks"
-        self.lock_dir = self.lock_root / plan_id
+        self.lock_key = lock_key
+        self.lock_dir = self.lock_root / lock_key
         self.owner_path = self.lock_dir / "owner.json"
         self.owner = {
+            "lock_key": lock_key,
             "plan_id": plan_id,
             "pid": os.getpid(),
             "start_epoch": time.time(),
@@ -782,16 +812,29 @@ def _stream_once(
     stats["requests_attempted"] += 1
     response = _opener().open(request, timeout=CONNECT_TIMEOUT)
     try:
+        # Bounded acquisition requires an exact declared body size. Responses
+        # without Content-Length or with chunked transfer encoding are refused
+        # before any body byte is consumed so the shared transfer allowance can
+        # never be bypassed by an unbounded stream.
+        if response.headers.get("Transfer-Encoding") is not None:
+            raise IntegrityError(
+                f"response for {url} uses Transfer-Encoding; an exact Content-Length is required"
+            )
         content_length = response.headers.get("Content-Length")
-        if content_length is not None:
-            try:
-                declared = int(content_length)
-            except ValueError:
-                declared = None
-            if declared is not None and declared != expected_size:
-                raise IntegrityError(
-                    f"Content-Length {declared} does not match expected size {expected_size}"
-                )
+        if content_length is None:
+            raise IntegrityError(
+                f"response for {url} has no Content-Length; an exact declared size is required"
+            )
+        try:
+            declared = int(content_length)
+        except ValueError:
+            raise IntegrityError(
+                f"response for {url} has an invalid Content-Length {content_length!r}"
+            ) from None
+        if declared != expected_size:
+            raise IntegrityError(
+                f"Content-Length {declared} does not match expected size {expected_size}"
+            )
         # Create the temporary file with O_EXCL/O_NOFOLLOW before writing any
         # response bytes so a symlink planted at the temporary path is never
         # followed. The descriptor is owned by os.fdopen below, so it is
@@ -805,9 +848,10 @@ def _stream_once(
         written = 0
         try:
             with os.fdopen(fd, "wb") as handle:
-                while True:
+                while written < expected_size:
+                    read_size = min(CHUNK_SIZE, expected_size - written)
                     try:
-                        chunk = response.read(CHUNK_SIZE)
+                        chunk = response.read(read_size)
                     except http.client.IncompleteRead as error:
                         partial = getattr(error, "partial", None)
                         if partial:
@@ -1078,9 +1122,15 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
         raise error
 
     plan_id = _plan_id(manifest)
-    lock = _ArtifactLock(cache_root, plan_id)
-    lock.acquire()
-    stats = {"requests_attempted": 0, "retries": 0}
+    stats = {"requests_attempted": 0, "retries": 0, "bytes_received": 0}
+    lock = _ArtifactLock(cache_root, _lock_key(manifest), plan_id)
+    try:
+        lock.acquire()
+    except ModelCacheError as error:
+        error.entries = entries
+        error.stats = stats
+        error.manifest = manifest
+        raise
     cumulative = 0
     try:
         # Re-inspect the cache after acquiring the lock so files verified by a

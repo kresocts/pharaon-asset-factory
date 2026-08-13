@@ -129,6 +129,35 @@ class ManifestValidationTests(unittest.TestCase):
             data["files"][0]["url"] = f"https://example.invalid{fragment}a.bin"
             self._reject(data, "mutable source reference")
 
+    def test_percent_encoded_mutable_references_are_rejected(self):
+        for url in (
+            "https://example.invalid/resolve/%6dain/a.bin",
+            "https://example.invalid/resolve/%6c%61%74%65%73%74/a.bin",
+            "https://example.invalid/resolve/%4d%41%49%4e/a.bin",
+            "https://example.invalid/%6d%61%69%6e/a.bin",
+            "https://example.invalid/resolve%2Fmain%2Fa.bin",
+        ):
+            data = valid_manifest()
+            data["files"][0]["url"] = url
+            self._reject(data, "mutable source reference")
+
+    def test_percent_encoded_immutable_path_is_accepted(self):
+        data = valid_manifest()
+        data["files"][0]["url"] = "https://example.invalid/some%20file%2Bv1.bin"
+        manifest = self._parse(data)
+        self.assertEqual("https://example.invalid/some%20file%2Bv1.bin", manifest["files"][0]["url"])
+
+    def test_url_fragment_is_rejected(self):
+        for url in ("https://example.invalid/a.bin#main", "https://example.invalid/a.bin#anything"):
+            data = valid_manifest()
+            data["files"][0]["url"] = url
+            self._reject(data, "fragment")
+
+    def test_malformed_percent_encoding_is_rejected(self):
+        data = valid_manifest()
+        data["files"][0]["url"] = "https://example.invalid/a%zz.bin"
+        self._reject(data, "percent-encoding")
+
     def test_url_with_embedded_credentials_is_rejected(self):
         data = valid_manifest()
         data["files"][0]["url"] = "https://user:pass@example.invalid/a.bin"

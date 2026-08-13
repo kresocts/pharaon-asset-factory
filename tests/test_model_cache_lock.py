@@ -66,10 +66,10 @@ class LockTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _lock(self):
-        return module._ArtifactLock(self.cache, module._plan_id(self.manifest))
+        return module._ArtifactLock(self.cache, module._lock_key(self.manifest), module._plan_id(self.manifest))
 
     def _lock_dir(self):
-        return self.cache / ".locks" / module._plan_id(self.manifest)
+        return self.cache / ".locks" / module._lock_key(self.manifest)
 
     def test_lock_lives_under_cache_root_and_is_released(self):
         lock = self._lock()
@@ -161,7 +161,21 @@ class LockTests(unittest.TestCase):
             self.assertEqual("LOCK_CONFLICT", payload["classification"])
             self.assertFalse(payload["success"])
             self.assertEqual(0, payload["network"]["requests_attempted"])
+            self.assertEqual(0, payload["network"]["bytes_received"])
             self.assertIn("another process holds", payload["detail"])
+            self.assertEqual("fixture-set", payload["artifact_set"])
+            self.assertEqual("v1-abcdef0123456789", payload["revision"])
+            self.assertEqual("fixture-set/v1-abcdef0123456789", payload["namespace"])
+            self.assertEqual(module._plan_id(self.manifest), payload["plan_id"])
+            self.assertEqual(str(self.cache), payload["cache_root"])
+            self.assertEqual(2, payload["file_count"])
+            self.assertEqual(
+                {"ABSENT": 2, "PARTIAL": 0, "CORRUPTED": 0, "VERIFIED": 0},
+                payload["file_counts"],
+            )
+            self.assertEqual(48, payload["bytes"]["total_expected"])
+            self.assertEqual(48, payload["bytes"]["required"])
+            self.assertEqual(2, len(payload["files"]))
         finally:
             first.release()
 
@@ -244,6 +258,29 @@ class LockTests(unittest.TestCase):
         self.assertIn("not a directory", payload["detail"])
         self.assertEqual(0, payload["network"]["requests_attempted"])
         self.assertFalse(any(self.cache.rglob("*.bin")))
+
+    def test_different_manifests_same_destination_share_lock_key(self):
+        other = json.loads(json.dumps(self.manifest))
+        other["files"] = [
+            dict(other["files"][0], sha256=hashlib.sha256(b"other-a").hexdigest(), role="other-a"),
+            dict(other["files"][1], sha256=hashlib.sha256(b"other-b").hexdigest(), url="https://other.invalid/b.bin"),
+        ]
+        self.assertNotEqual(module._plan_id(self.manifest), module._plan_id(other))
+        self.assertEqual(module._lock_key(self.manifest), module._lock_key(other))
+
+    def test_namespace_prefix_manifests_share_lock_key(self):
+        first = dict(
+            self.manifest,
+            namespace="fixture-set",
+            files=[dict(self.manifest["files"][0], path="v1/x.bin")],
+        )
+        second = dict(
+            self.manifest,
+            namespace="fixture-set/v1",
+            files=[dict(self.manifest["files"][0], path="x.bin")],
+        )
+        self.assertEqual(module._lock_key(first), module._lock_key(second))
+        self.assertNotEqual(module._plan_id(first), module._plan_id(second))
 
 
 if __name__ == "__main__":

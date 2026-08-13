@@ -43,6 +43,8 @@ class _FixtureServer:
         self._failures = {}
         self._redirects = {}
         self._partials = {}
+        self._no_lengths = {}
+        self._chunked = {}
         handler = self._handler()
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -60,6 +62,29 @@ class _FixtureServer:
                     self.send_response(302)
                     self.send_header("Location", location)
                     self.end_headers()
+                    return
+                if name in server._no_lengths:
+                    server._no_lengths.pop(name)
+                    data = server.files.get(name)
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    self.close_connection = True
+                    return
+                if name in server._chunked:
+                    server._chunked.pop(name)
+                    data = server.files.get(name)
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n0\r\n\r\n")
                     return
                 if name in server._partials:
                     n = server._partials.pop(name)
@@ -104,6 +129,12 @@ class _FixtureServer:
 
     def fail_partial_next(self, name, bytes_to_send):
         self._partials[name] = bytes_to_send
+
+    def no_content_length_next(self, name):
+        self._no_lengths[name] = True
+
+    def chunked_next(self, name):
+        self._chunked[name] = True
 
     def start(self):
         self.thread.start()
@@ -590,6 +621,90 @@ class AcquisitionTests(unittest.TestCase):
         self.assertFalse(self.fixture.target("a.bin").exists())
         self.assertFalse(any(self.fixture.cache.rglob("*.part")))
 
+    def test_manifests_sharing_destination_are_serialized_by_lock(self):
+        # Manifest A (correct hashes) acquires successfully first.
+        first_exit, _first_report = self._acquire()
+        self.assertEqual(0, first_exit)
+        requests_after_first = list(self.fixture.server.requests)
+        # Manifest B: same artifact_set/revision/namespace/target paths, but
+        # different hashes, URLs, and roles -> different plan_id, same lock key.
+        other = dict(self.fixture.manifest)
+        other["files"] = [
+            dict(
+                other["files"][0],
+                sha256=hashlib.sha256(b"wrong-a").hexdigest(),
+                url=f"http://127.0.0.1:{self.fixture.server.port}/a.bin",
+                role="other-a",
+            ),
+            dict(
+                other["files"][1],
+                sha256=hashlib.sha256(b"wrong-b").hexdigest(),
+                url=f"http://127.0.0.1:{self.fixture.server.port}/b.bin",
+                role="other-b",
+            ),
+        ]
+        self.fixture.write_manifest(other)
+        self.assertNotEqual(module._plan_id(self.fixture.manifest), module._plan_id(other))
+        self.assertEqual(module._lock_key(self.fixture.manifest), module._lock_key(other))
+        # Hold the destination lock and prove B gets a clean LOCK_CONFLICT
+        # with zero requests and full context.
+        lock = module._ArtifactLock(
+            self.fixture.cache, module._lock_key(other), module._plan_id(other)
+        )
+        lock.acquire()
+        try:
+            with (
+                mock.patch.object(module, "LOCK_WAIT_SECONDS", 0.2),
+                mock.patch.object(module.time, "sleep", return_value=None),
+            ):
+                exit_code, report = self._acquire()
+            self.assertEqual(6, exit_code)
+            self.assertEqual("LOCK_CONFLICT", report["classification"])
+            self.assertEqual(0, report["network"]["requests_attempted"])
+            self.assertEqual(0, report["network"]["bytes_received"])
+            self.assertEqual(requests_after_first, self.fixture.server.requests)
+            self.assertEqual(other["artifact_set"], report["artifact_set"])
+            self.assertEqual(other["revision"], report["revision"])
+            self.assertEqual(other["namespace"], report["namespace"])
+            self.assertEqual(2, report["file_count"])
+            self.assertEqual(2, len(report["files"]))
+        finally:
+            lock.release()
+        # Without the held lock, B can never report success for content that
+        # matches B's wrong hashes; the final files remain A's verified bytes.
+        exit_code, report = self._acquire()
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        for name, data in self.fixture.files.items():
+            self.assertEqual(data, self.fixture.target(name).read_bytes())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_no_content_length_response_is_refused_before_body(self):
+        manifest = dict(self.fixture.manifest)
+        manifest["files"] = [
+            dict(manifest["files"][0], size=1, sha256=hashlib.sha256(b"x").hexdigest())
+        ]
+        self.fixture.write_manifest(manifest)
+        self.fixture.server.no_content_length_next("a.bin")
+        exit_code, report = self._acquire(max_bytes=1)
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        self.assertIn("Content-Length", report["detail"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["bytes_received"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_chunked_response_is_refused_before_body(self):
+        self.fixture.server.chunked_next("a.bin")
+        exit_code, report = self._acquire()
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        self.assertIn("Transfer-Encoding", report["detail"])
+        self.assertEqual(0, report["network"]["bytes_received"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
 
 class RedirectPolicyTests(unittest.TestCase):
     """The network boundary must not expand through server-controlled redirects."""
@@ -640,6 +755,10 @@ class RedirectPolicyTests(unittest.TestCase):
 
     def test_https_production_to_host_docker_internal_is_rejected(self):
         self.assertIsNone(self._redirect("https://example.invalid/a", "https://host.docker.internal:8443/b"))
+
+    def test_redirect_to_encoded_mutable_path_is_rejected(self):
+        self.assertIsNone(self._redirect("https://example.invalid/a", "https://example.invalid/resolve/%6dain/b"))
+        self.assertIsNone(self._redirect("http://127.0.0.1:8000/a", "http://127.0.0.1:8000/resolve/%6c%61%74%65%73%74/b"))
 
 
 if __name__ == "__main__":

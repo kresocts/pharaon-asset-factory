@@ -52,7 +52,13 @@ def _validated_manifest(manifest_path: str) -> dict[str, tuple[int, str]]:
 
 class _FixtureServer:
     def __init__(
-        self, manifest_path: str, bind: str, port: int, corrupt: str | None, partial: str | None = None
+        self,
+        manifest_path: str,
+        bind: str,
+        port: int,
+        corrupt: str | None,
+        partial: str | None = None,
+        no_length: str | None = None,
     ) -> None:
         _validated_manifest(manifest_path)
         self.corrupt = corrupt
@@ -60,6 +66,7 @@ class _FixtureServer:
         if partial:
             name, _, count = partial.partition(":")
             self.partial = (name, int(count))
+        self.no_length = no_length
         self.requests: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -67,6 +74,18 @@ class _FixtureServer:
                 server.requests.append(self.path)
                 print(f"REQUEST {self.path}", flush=True)
                 name = self.path.lstrip("/")
+                if server.no_length is not None and name == server.no_length:
+                    server.no_length = None  # one-shot
+                    data = server._bytes_for(name)
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    self.close_connection = True
+                    return
                 if server.partial is not None and name == server.partial[0]:
                     n = server.partial[1]
                     server.partial = None  # one-shot interrupted transfer
@@ -130,11 +149,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--partial",
         default=None,
-        help="serve a chunked response that closes after N bytes for one artifact path, e.g. data/a.bin:10",
+        help="serve a Content-Length body that closes after N bytes for one artifact path, e.g. data/a.bin:10",
+    )
+    parser.add_argument(
+        "--no-length",
+        default=None,
+        help="serve one artifact without a Content-Length header, e.g. data/a.bin",
     )
     args = parser.parse_args(argv)
     try:
-        server = _FixtureServer(args.manifest, args.bind, args.port, args.corrupt, args.partial)
+        server = _FixtureServer(args.manifest, args.bind, args.port, args.corrupt, args.partial, args.no_length)
     except (OSError, RuntimeError, json.JSONDecodeError) as error:
         print(f"FIXTURE_SERVER_ERROR {error}", file=sys.stderr)
         return 1

@@ -172,7 +172,10 @@ lowercase `sha256`. Mutable references such as `main`, `latest`, `master`, `HEAD
 checksums, missing or non-positive sizes, absolute or `..` traversal paths, duplicate
 destinations, unsupported URL schemes, and URLs with embedded credentials. Production
 sources must use HTTPS; HTTP is accepted only for loopback and `host.docker.internal`
-test fixtures. Redirects are followed only when the target still obeys the same
+test fixtures. Mutable-reference checks run against the percent-decoded URL path, so
+encoded forms such as `/resolve/%6dain/` are rejected too; malformed percent escapes
+are rejected, non-empty URL fragments are refused, and query strings are not treated
+as mutable source references. Redirects are followed only when the target still obeys the same
 policy: unsupported schemes, embedded credentials, and mutable source references are
 refused; HTTPS sources never downgrade to HTTP and never redirect into loopback or
 test hosts; loopback/test HTTP redirects are allowed only for already-allowed
@@ -206,7 +209,10 @@ exception. There is no environment-variable bypass and no unlimited-byte mode.
 all artifacts, all attempts, and all retries; bytes received during failed or
 interrupted attempts are never refunded, and the command never reports success after
 exceeding the cap. The cumulative received-body count is reported in
-`network.bytes_received`.
+`network.bytes_received`. Bounded acquisition requires an exact `Content-Length`
+matching the manifest size: responses without a `Content-Length` or with chunked
+`Transfer-Encoding` are refused before any body byte is consumed, every accepted read
+is bounded by the remaining expected size, and every consumed byte is accounted.
 
 ### Retries and timeouts
 
@@ -246,9 +252,14 @@ as a path-policy failure before any network request.
 
 ### Locking
 
-Acquisition is serialized per artifact-set plan with an atomic lock directory under
-`<cache root>/.locks/<plan-id>`. Lock acquisition waits at most 10 seconds and then
-fails cleanly with exit code `6` and `LOCK_CONFLICT` classification. Stale locks are
+Acquisition is serialized per destination namespace with an atomic lock directory
+under `<cache root>/.locks/<first namespace component>`. Any manifests that can write
+overlapping destination paths share the same lock even when their URLs, hashes, roles,
+or plan digests differ; the complete-manifest `plan_id` remains reported separately.
+Lock acquisition waits at most 10 seconds and then fails cleanly with exit code `6`
+and `LOCK_CONFLICT` classification, preserving the full manifest and cache context
+(artifact identity, plan id, per-file states, byte totals, and cache root) in the JSON
+response. Stale locks are
 handled conservatively: a lock is broken only when its owner metadata is older than 24
 hours AND the recorded owner process is no longer alive; an active lock is never broken.
 The lock holder refreshes the owner heartbeat during long downloads and removes the
