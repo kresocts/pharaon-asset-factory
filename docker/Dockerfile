@@ -117,6 +117,7 @@ COPY --chown=app:app docker/health.py /app/health.py
 COPY --chown=app:app docker/dependency_smoke.py /app/dependency_smoke.py
 COPY --chown=app:app docker/gpu_smoke.py /app/gpu_smoke.py
 COPY --chown=app:app docker/native_smoke.py /app/native_smoke.py
+COPY --chown=app:app docker/readiness.py /app/readiness.py
 COPY --chown=root:root docker/entrypoint.sh /usr/local/bin/pharaon-entrypoint
 RUN chmod 0755 /usr/local/bin/pharaon-entrypoint \
     && python /app/dependency_smoke.py \

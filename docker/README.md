@@ -76,3 +76,47 @@ docker run --rm --gpus all pharaon-asset-factory-gpu:t0012 health --require-gpu 
 Without GPU passthrough, ordinary health and `native-smoke` load both extensions and run the renderer's safe CPU pybind11 operation; they do not invoke CUDA automatically. Health reports `HUNYUAN_NATIVE_EXTENSIONS_READY`, installed/importable artifacts, `GPU_NOT_AVAILABLE`, absent weights, and `full_hunyuan_ready: false`. The GPU smoke rasterizes one synthetic triangle through the actual custom CUDA kernel. No command downloads weights or accesses a model hub.
 
 Model snapshots, Hunyuan checkpoints, Real-ESRGAN, and other inference assets remain absent. Asset generation and full Hunyuan inference are still unavailable.
+
+
+## T-0013 runtime readiness gate
+
+The `ready` command is the canonical machine-readable pass/fail gate for the next deployment stage. It answers whether the container runtime is technically ready before model weights are acquired. It never downloads weights, accesses a model hub, or executes inference.
+
+### Canonical commands
+
+```bash
+docker run --rm IMAGE ready --profile cpu --json
+docker run --rm --gpus all IMAGE ready --profile native-gpu --json
+```
+
+Run with `--network none` for validation; both profiles are network-independent.
+
+### Profiles
+
+- `cpu`: validates the container structure without GPU access. It checks the Python version, runtime configuration, pinned PyTorch import/version, Hunyuan source and revision, representative dependency imports, native extension artifacts and imports, the renderer CPU native operation, required path existence/writability, external model cache, and weight state. GPU absence is expected and does not fail this profile.
+- `native-gpu`: includes the CPU checks plus NVIDIA GPU visibility, `torch.cuda.is_available()`, a PyTorch CUDA tensor operation, custom rasterizer imports, DifferentiableRenderer imports, and the real custom rasterizer CUDA smoke operation. A missing GPU is a clean `NOT_READY`, not an internal crash.
+
+### JSON schema
+
+`schema_version` is `1`. The JSON report contains the requested profile, `status` (`READY`/`NOT_READY`), boolean `ready`, `classification`, `exit_code`, `checks`, `facts`, and `failure_summary`. Each check has a stable `id`, `status` (`PASS`/`FAIL`), and an actionable `message`. Check identifiers include `python.version`, `torch.import`, `torch.version`, `hunyuan.source`, `hunyuan.revision`, `dependencies.imports`, `native.artifacts`, `native.custom_rasterizer.import`, `native.renderer.import`, `native.renderer.operation`, `paths.models.exists`, `paths.models.writable`, `paths.input.writable`, `paths.output.writable`, `paths.workspace.writable`, `paths.hunyuan_source.exists`, `model.cache.external`, `weights.present`, `inference.full_ready`, `gpu.visible`, `torch.cuda.available`, `torch.cuda.operation`, and `native.custom_rasterizer.operation`. Timestamps are omitted for determinism.
+
+### Exit-code contract
+
+- `0`: requested profile is ready.
+- `2`: expected readiness requirements were not met.
+- `3`: diagnostic/internal execution error.
+- `64`: invalid command-line usage.
+
+### Expected pre-weights state
+
+For T-0013, model weights are normally `ABSENT`; this does not fail either profile. The report sets `facts.weights.state` to `ABSENT` (or `PRESENT_UNVERIFIED`) and `facts.inference.full_ready` to `false`. Full inference readiness remains false because weights and inference are intentionally absent.
+
+### Path checks
+
+The gate probes `/models`, `/data/input`, `/data/output`, `/workspace`, and the Hunyuan source path. Writable paths are probed with a temporary file that is removed afterward. The model cache must remain outside `/app` and the Hunyuan source.
+
+### Difference from health and inference
+
+- `health` is a diagnostic report, not a pass/fail gate.
+- `ready` is the authoritative runtime pass/fail gate for the pre-weights stage.
+- Full Hunyuan inference readiness is a later concern and is always reported false by this ticket.

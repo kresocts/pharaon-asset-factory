@@ -18,6 +18,10 @@ case "${1:-health}" in
         if [ "$#" -gt 0 ]; then shift; fi
         exec python /app/native_smoke.py "$@"
         ;;
+    ready)
+        if [ "$#" -gt 0 ]; then shift; fi
+        exec python /app/readiness.py "$@"
+        ;;
     *)
         exec "$@"
         ;;
