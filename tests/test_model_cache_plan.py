@@ -220,6 +220,22 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertEqual("CORRUPTED", by_path["data/b.bin"]["state"])
         self.assertIn("symlink", by_path["data/b.bin"]["detail"])
 
+    def test_status_reports_corrupted_for_broken_temporary_symlink(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True)
+        part = Path(str(target) + ".part")
+
+        def fake_is_symlink(path):
+            return Path.__fspath__(path) == str(part)
+
+        with mock.patch.object(module.Path, "is_symlink", new=fake_is_symlink):
+            exit_code, report = self._run("status")
+        self.assertEqual(0, exit_code)
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual("CORRUPTED", by_path["data/a.bin"]["state"])
+        self.assertIn("temporary path is a symlink", by_path["data/a.bin"]["detail"])
+        self.assertEqual("ABSENT", by_path["data/b.bin"]["state"])
+
 
 if __name__ == "__main__":
     unittest.main()

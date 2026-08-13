@@ -101,6 +101,7 @@ class ModelCacheError(Exception):
     manifest: Any = None
     entries: Any = None
     stats: dict[str, int] | None = None
+    budget: Any = None
 
 
 class ManifestValidationError(ModelCacheError):
@@ -143,6 +144,17 @@ class LockConflictError(ModelCacheError):
     exit_code = EXIT_LOCK_CONFLICT
 
 
+class LocalIOError(ModelCacheError):
+    """A local filesystem operation failed during acquisition.
+
+    Temporary-file creation, write, flush, fsync, promotion, and permission
+    failures are never retried as network/transport failures.
+    """
+
+    classification = "LOCAL_IO_FAILURE"
+    exit_code = EXIT_INTERNAL_ERROR
+
+
 class UsageError(ModelCacheError):
     """Invalid command-line usage."""
 
@@ -157,6 +169,14 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 class _NonRetryableHttpError(TransportError):
     """Permanent HTTP failure that must not be retried."""
+
+
+class _NetworkReadError(Exception):
+    """Wraps a transient failure while reading the HTTP response body.
+
+    Local file operations raise LocalIOError instead, so the retry boundary
+    stays limited to genuine network/HTTP/socket failures.
+    """
 
 
 def _absolute(path: Path) -> Path:
@@ -382,7 +402,11 @@ def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[
         if _sha256_file(target) != expected_sha256:
             return {"state": "CORRUPTED", "detail": "SHA-256 mismatch"}
         return {"state": "VERIFIED", "detail": None}
+    if part.is_symlink():
+        return {"state": "CORRUPTED", "detail": "temporary path is a symlink"}
     if part.exists():
+        if not part.is_file():
+            return {"state": "CORRUPTED", "detail": "temporary path is not a regular file"}
         return {"state": "PARTIAL", "detail": "incomplete download file present"}
     return {"state": "ABSENT", "detail": None}
 
@@ -720,16 +744,42 @@ def _is_retryable(error: BaseException) -> bool:
     return False
 
 
+class _TransferBudget:
+    """Shared hard cap on total response-body bytes received by an acquisition.
+
+    All artifacts, all attempts, and all retries consume one budget; bytes
+    received during failed or interrupted attempts are never refunded.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.received = 0
+
+    @property
+    def remaining(self) -> int:
+        return self.max_bytes - self.received
+
+    def record(self, count: int) -> None:
+        self.received += count
+        if self.received > self.max_bytes:
+            raise IntegrityError(
+                f"transfer exceeded the total byte allowance {self.max_bytes} "
+                f"(received at least {self.received})"
+            )
+
+
 def _stream_once(
     *,
     url: str,
     expected_size: int,
     expected_sha256: str,
-    budget_remaining: int,
+    budget: _TransferBudget,
     target_part: Path,
     lock: _ArtifactLock | None,
+    stats: dict[str, int],
 ) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    stats["requests_attempted"] += 1
     response = _opener().open(request, timeout=CONNECT_TIMEOUT)
     try:
         content_length = response.headers.get("Content-Length")
@@ -742,34 +792,74 @@ def _stream_once(
                 raise IntegrityError(
                     f"Content-Length {declared} does not match expected size {expected_size}"
                 )
+        # Create the temporary file with O_EXCL/O_NOFOLLOW before writing any
+        # response bytes so a symlink planted at the temporary path is never
+        # followed. The descriptor is owned by os.fdopen below, so it is
+        # closed on every path after creation.
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(str(target_part), flags, 0o600)
+        except OSError as error:
+            raise LocalIOError(f"cannot create temporary file {target_part}: {error}") from error
         digest = hashlib.sha256()
         written = 0
-        with open(target_part, "wb") as handle:
-            while True:
-                chunk = response.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > expected_size:
-                    raise IntegrityError(
-                        f"download exceeded expected size {expected_size} (received at least {written})"
-                    )
-                if written > budget_remaining:
-                    raise IntegrityError(
-                        f"download exceeded the remaining byte allowance {budget_remaining}"
-                    )
-                digest.update(chunk)
-                handle.write(chunk)
-                if lock is not None:
-                    lock.touch()
-            if written != expected_size:
-                raise IntegrityError(
-                    f"downloaded size {written} does not match expected size {expected_size}"
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                while True:
+                    try:
+                        chunk = response.read(CHUNK_SIZE)
+                    except http.client.IncompleteRead as error:
+                        partial = getattr(error, "partial", None)
+                        if partial:
+                            budget.record(len(partial))
+                        raise
+                    except (TimeoutError, http.client.HTTPException, OSError) as error:
+                        raise _NetworkReadError() from error
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > expected_size:
+                        raise IntegrityError(
+                            f"download exceeded expected size {expected_size} (received at least {written})"
+                        )
+                    budget.record(len(chunk))
+                    digest.update(chunk)
+                    try:
+                        handle.write(chunk)
+                    except OSError as error:
+                        raise LocalIOError(
+                            f"cannot write temporary file {target_part}: {error}"
+                        ) from error
+                    if lock is not None:
+                        lock.touch()
+                try:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                except OSError as error:
+                    raise LocalIOError(
+                        f"cannot flush temporary file {target_part}: {error}"
+                    ) from error
+        except LocalIOError:
+            raise
+        except OSError as error:
+            raise LocalIOError(
+                f"temporary file operation failed for {target_part}: {error}"
+            ) from error
+        if written != expected_size:
+            if written < expected_size:
+                # Premature EOF before the declared body was fully received is
+                # a transport-level interruption (the bytes already received
+                # are accounted against the shared budget) and follows the
+                # finite retry policy instead of being reported as an
+                # integrity failure.
+                raise _NetworkReadError() from ConnectionError(
+                    f"connection closed early after {written} of {expected_size} bytes"
                 )
-            if digest.hexdigest() != expected_sha256:
-                raise IntegrityError("SHA-256 mismatch after download")
-            handle.flush()
-            os.fsync(handle.fileno())
+            raise IntegrityError(
+                f"downloaded size {written} does not match expected size {expected_size}"
+            )
+        if digest.hexdigest() != expected_sha256:
+            raise IntegrityError("SHA-256 mismatch after download")
     finally:
         response.close()
 
@@ -779,7 +869,7 @@ def _download_file(
     url: str,
     expected_size: int,
     expected_sha256: str,
-    budget_remaining: int,
+    budget: _TransferBudget,
     target_part: Path,
     lock: _ArtifactLock | None,
     stats: dict[str, int],
@@ -789,15 +879,15 @@ def _download_file(
     last_error: BaseException | None = None
     while attempts <= MAX_RETRIES:
         attempts += 1
-        stats["requests_attempted"] += 1
         try:
             _stream_once(
                 url=url,
                 expected_size=expected_size,
                 expected_sha256=expected_sha256,
-                budget_remaining=budget_remaining,
+                budget=budget,
                 target_part=target_part,
                 lock=lock,
+                stats=stats,
             )
             return
         except urllib.error.HTTPError as error:
@@ -808,10 +898,16 @@ def _download_file(
                 ) from error
         except (urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError) as error:
             last_error = error
-        except IntegrityError:
-            raise
+        except _NetworkReadError as error:
+            last_error = error.__cause__ or error
         if attempts > MAX_RETRIES:
             break
+        if expected_size > budget.remaining:
+            raise IntegrityError(
+                f"cannot retry {url}: remaining allowance {budget.remaining} bytes "
+                f"is less than the expected size {expected_size}"
+            )
+        _remove_part(target_part)
         retries += 1
         stats["retries"] += 1
         time.sleep(RETRY_BACKOFF_SECONDS)
@@ -870,7 +966,7 @@ def _base_report(
         "acquirable": manifest is not None,
         "fully_cached": entries is not None and required == 0,
         "files": entries or [],
-        "network": dict(network),
+        "network": {"requests_attempted": 0, "retries": 0, "bytes_received": 0, **dict(network)},
         "detail": None,
     }
     return report
@@ -1004,6 +1100,7 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
             error.stats = stats
             error.manifest = manifest
             raise error
+        budget = _TransferBudget(args.max_bytes)
         for entry in entries:
             entry["downloaded"] = False
             target_part: Path | None = None
@@ -1013,24 +1110,32 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
             try:
                 target = _validate_destination(cache_root, manifest, entry["path"])
                 target_part = Path(str(target) + ".part")
+                if target_part.is_symlink():
+                    raise ManifestValidationError(
+                        f"temporary path is a symlink: {target_part}"
+                    )
+                if target_part.exists() and not target_part.is_file():
+                    raise ManifestValidationError(
+                        f"temporary path exists and is not a regular file: {target_part}"
+                    )
                 if target_part.exists():
-                    if not target_part.is_file():
-                        raise ManifestValidationError(
-                            f"partial path is not a regular file: {target_part}"
-                        )
-                    target_part.unlink()
+                    try:
+                        target_part.unlink()
+                    except OSError as error:
+                        raise LocalIOError(
+                            f"cannot remove stale temporary file {target_part}: {error}"
+                        ) from error
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                 except OSError as error:
-                    raise ManifestValidationError(
+                    raise LocalIOError(
                         f"cannot create destination directory {target.parent}: {error}"
                     ) from error
-                budget_remaining = args.max_bytes - cumulative
                 _download_file(
                     url=entry["url"],
                     expected_size=entry["expected_size"],
                     expected_sha256=entry["sha256"],
-                    budget_remaining=budget_remaining,
+                    budget=budget,
                     target_part=target_part,
                     lock=lock,
                     stats=stats,
@@ -1038,7 +1143,7 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
                 try:
                     os.replace(target_part, target)
                 except OSError as error:
-                    raise ManifestValidationError(
+                    raise LocalIOError(
                         f"cannot promote verified download to {target}: {error}"
                     ) from error
                 cumulative += entry["expected_size"]
@@ -1049,12 +1154,14 @@ def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[s
             except ModelCacheError as error:
                 error.entries = entries
                 error.stats = stats
+                error.budget = budget
                 error.manifest = manifest
                 _remove_part(target_part)
                 raise
     finally:
         lock.release()
 
+    stats["bytes_received"] = budget.received
     report = _base_report(
         command="acquire",
         manifest=manifest,
@@ -1105,7 +1212,7 @@ def _usage_report(message: str) -> dict[str, Any]:
         "acquirable": False,
         "fully_cached": False,
         "files": [],
-        "network": {"requests_attempted": 0, "retries": 0},
+        "network": {"requests_attempted": 0, "retries": 0, "bytes_received": 0},
         "detail": message,
     }
 
@@ -1128,7 +1235,7 @@ def _internal_error_report(command: str | None, detail: str) -> dict[str, Any]:
         "acquirable": False,
         "fully_cached": False,
         "files": [],
-        "network": {"requests_attempted": 0, "retries": 0},
+        "network": {"requests_attempted": 0, "retries": 0, "bytes_received": 0},
         "detail": detail,
     }
 
@@ -1151,6 +1258,7 @@ def _format_human(report: dict[str, Any]) -> str:
         f"FULLY_CACHED={'YES' if report['fully_cached'] else 'NO'}",
         f"REQUESTS_ATTEMPTED={report['network']['requests_attempted']}",
         f"RETRIES={report['network']['retries']}",
+        f"BYTES_RECEIVED={report['network'].get('bytes_received', 0)}",
     ]
     if report.get("detail"):
         lines.append(f"DETAIL={report['detail']}")
@@ -1190,7 +1298,10 @@ def main(
         else:  # pragma: no cover - argparse enforces the subcommand set
             raise UsageError(f"unknown subcommand {args.subcommand!r}")
     except ModelCacheError as error:
-        stats = error.stats or {"requests_attempted": 0, "retries": 0}
+        stats = dict(error.stats or {"requests_attempted": 0, "retries": 0})
+        budget = getattr(error, "budget", None)
+        if budget is not None:
+            stats["bytes_received"] = budget.received
         report = _failure_report(_base_report(
             command=args.subcommand,
             manifest=error.manifest,

@@ -51,9 +51,15 @@ def _validated_manifest(manifest_path: str) -> dict[str, tuple[int, str]]:
 
 
 class _FixtureServer:
-    def __init__(self, manifest_path: str, bind: str, port: int, corrupt: str | None) -> None:
+    def __init__(
+        self, manifest_path: str, bind: str, port: int, corrupt: str | None, partial: str | None = None
+    ) -> None:
         _validated_manifest(manifest_path)
         self.corrupt = corrupt
+        self.partial = None
+        if partial:
+            name, _, count = partial.partition(":")
+            self.partial = (name, int(count))
         self.requests: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -61,6 +67,24 @@ class _FixtureServer:
                 server.requests.append(self.path)
                 print(f"REQUEST {self.path}", flush=True)
                 name = self.path.lstrip("/")
+                if server.partial is not None and name == server.partial[0]:
+                    n = server.partial[1]
+                    server.partial = None  # one-shot interrupted transfer
+                    data = server._bytes_for(name)
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    # Send a Content-Length body of only the first n bytes,
+                    # then close cleanly so the client receives n bytes and
+                    # then a premature-EOF retryable transport error.
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data[:n])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    self.connection.close()
+                    return
                 data = server._bytes_for(name)
                 if data is None:
                     self.send_error(404)
@@ -103,9 +127,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--bind", default="127.0.0.1", help="bind address (loopback by default)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="bind port")
     parser.add_argument("--corrupt", default=None, help="serve altered bytes for this artifact path")
+    parser.add_argument(
+        "--partial",
+        default=None,
+        help="serve a chunked response that closes after N bytes for one artifact path, e.g. data/a.bin:10",
+    )
     args = parser.parse_args(argv)
     try:
-        server = _FixtureServer(args.manifest, args.bind, args.port, args.corrupt)
+        server = _FixtureServer(args.manifest, args.bind, args.port, args.corrupt, args.partial)
     except (OSError, RuntimeError, json.JSONDecodeError) as error:
         print(f"FIXTURE_SERVER_ERROR {error}", file=sys.stderr)
         return 1

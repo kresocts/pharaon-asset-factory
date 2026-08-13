@@ -42,6 +42,7 @@ class _FixtureServer:
         self.requests = []
         self._failures = {}
         self._redirects = {}
+        self._partials = {}
         handler = self._handler()
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -59,6 +60,23 @@ class _FixtureServer:
                     self.send_response(302)
                     self.send_header("Location", location)
                     self.end_headers()
+                    return
+                if name in server._partials:
+                    n = server._partials.pop(name)
+                    data = server.files.get(name)
+                    if data is None:
+                        self.send_error(404)
+                        return
+                    # Send a Content-Length body of only the first n bytes,
+                    # then close cleanly so the client receives n bytes and
+                    # then a premature-EOF retryable transport error.
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data[:n])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    self.connection.close()
                     return
                 if name in server._failures:
                     status = server._failures.pop(name)
@@ -83,6 +101,9 @@ class _FixtureServer:
 
     def redirect_next(self, name, location):
         self._redirects[name] = location
+
+    def fail_partial_next(self, name, bytes_to_send):
+        self._partials[name] = bytes_to_send
 
     def start(self):
         self.thread.start()
@@ -443,6 +464,131 @@ class AcquisitionTests(unittest.TestCase):
         self.assertIn("symlink", report["detail"])
         self.assertEqual(0, report["network"]["requests_attempted"])
         self.assertEqual([], self.fixture.server.requests)
+
+    def test_broken_temporary_symlink_is_refused_before_network(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True)
+        outside = self.fixture.root / "outside-target.bin"
+        part = Path(str(target) + ".part")
+        try:
+            part.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        exit_code, report = self._acquire()
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", report["classification"])
+        self.assertIn("temporary path is a symlink", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["bytes_received"])
+        self.assertEqual([], self.fixture.server.requests)
+        self.assertFalse(outside.exists())
+        self.assertFalse(target.exists())
+        self.assertFalse(target.is_symlink())
+
+    def test_temporary_symlink_is_refused_before_network(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True)
+        outside = self.fixture.root / "outside-target.bin"
+        outside.write_bytes(b"outside payload")
+        part = Path(str(target) + ".part")
+        try:
+            part.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        exit_code, report = self._acquire()
+        self.assertEqual(3, exit_code)
+        self.assertEqual("MANIFEST_INVALID", report["classification"])
+        self.assertIn("temporary path is a symlink", report["detail"])
+        self.assertEqual(0, report["network"]["requests_attempted"])
+        self.assertEqual([], self.fixture.server.requests)
+        self.assertEqual(b"outside payload", outside.read_bytes())
+        self.assertFalse(target.exists())
+
+    def test_interrupted_transfer_consumes_budget_and_does_not_retry(self):
+        # Pre-verify b.bin so the preflight required total is exactly a.bin's
+        # size and --max-bytes 16 is accepted.
+        b_target = self.fixture.target("b.bin")
+        b_target.parent.mkdir(parents=True, exist_ok=True)
+        b_target.write_bytes(self.fixture.files["b.bin"])
+        self.fixture.server.fail_partial_next("a.bin", 10)
+        exit_code, report = self._acquire(max_bytes=16)
+        self.assertEqual(4, exit_code)
+        self.assertEqual("INTEGRITY_FAILURE", report["classification"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertEqual(10, report["network"]["bytes_received"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+        self.assertEqual(self.fixture.files["b.bin"], b_target.read_bytes())
+
+    def test_interrupted_transfer_retries_within_larger_allowance(self):
+        self.fixture.server.fail_partial_next("a.bin", 10)
+        exit_code, report = self._acquire(max_bytes=58)
+        self.assertEqual(0, exit_code)
+        self.assertTrue(report["success"])
+        self.assertEqual(3, report["network"]["requests_attempted"])
+        self.assertEqual(1, report["network"]["retries"])
+        self.assertEqual(58, report["network"]["bytes_received"])
+        self.assertEqual(48, report["bytes"]["downloaded"])
+        for name, data in self.fixture.files.items():
+            self.assertEqual(data, self.fixture.target(name).read_bytes())
+
+    def test_temporary_file_creation_failure_is_local_io(self):
+        with mock.patch.object(module.os, "open", side_effect=OSError(28, "No space left on device")):
+            exit_code, report = self._acquire()
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_write_failure_is_local_io(self):
+        class _FullFile:
+            def __init__(self, fd):
+                self._fd = fd
+            def write(self, data):
+                raise OSError(28, "No space left on device")
+            def flush(self):
+                pass
+            def fileno(self):
+                return self._fd
+            def close(self):
+                os.close(self._fd)
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                self.close()
+                return False
+
+        with mock.patch.object(module.os, "fdopen", side_effect=lambda fd, mode: _FullFile(fd)):
+            exit_code, report = self._acquire()
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_fsync_failure_is_local_io(self):
+        with mock.patch.object(module.os, "fsync", side_effect=OSError(5, "Input/output error")):
+            exit_code, report = self._acquire()
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
+
+    def test_promotion_failure_is_local_io(self):
+        with mock.patch.object(module.os, "replace", side_effect=OSError(13, "Permission denied")):
+            exit_code, report = self._acquire()
+        self.assertEqual(70, exit_code)
+        self.assertEqual("LOCAL_IO_FAILURE", report["classification"])
+        self.assertEqual(1, report["network"]["requests_attempted"])
+        self.assertEqual(0, report["network"]["retries"])
+        self.assertFalse(self.fixture.target("a.bin").exists())
+        self.assertFalse(any(self.fixture.cache.rglob("*.part")))
 
 
 class RedirectPolicyTests(unittest.TestCase):

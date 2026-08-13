@@ -202,23 +202,37 @@ the current cache, computes the bytes still required, verifies that the required
 and file count fit the configured policy limits, and acquires the artifact-set lock. A
 missing confirmation or insufficient allowance is a policy refusal, never an internal
 exception. There is no environment-variable bypass and no unlimited-byte mode.
+`--max-bytes` is a hard cap on the total number of response-body bytes received across
+all artifacts, all attempts, and all retries; bytes received during failed or
+interrupted attempts are never refunded, and the command never reports success after
+exceeding the cap. The cumulative received-body count is reported in
+`network.bytes_received`.
 
 ### Retries and timeouts
 
 Transport behavior is finite and documented: connection establishment is bounded by a
 10-second connect timeout, each socket read by a 30-second read timeout, and at most 2
 retries (3 attempts total) are made for transient failures (connection errors,
-timeouts, HTTP 408/429, and HTTP 5xx). Permanent HTTP 4xx errors and integrity
-failures are never retried. Retry attempts are visible in the machine-readable
-`network.retries` and `network.requests_attempted` fields.
+timeouts, HTTP 408/429, and HTTP 5xx). A connection that closes before the declared
+body is fully received is treated as a transient transport interruption and follows
+the same bounded retry policy. Permanent HTTP 4xx errors and integrity failures are
+never retried. Local filesystem failures (temporary-file creation, write, flush,
+fsync, promotion, and permission errors) are never retried as transport failures;
+they are reported with the stable `LOCAL_IO_FAILURE` classification and exit code
+`70` after at most one network attempt. Retry attempts are visible in the
+machine-readable `network.retries`, `network.requests_attempted`, and
+`network.bytes_received` fields.
 
 ### Streaming, atomicity, and states
 
 Downloads stream in 64 KiB chunks into a temporary `<final>.part` file on the
-destination filesystem, never into memory. The temporary file is flushed and synced,
-then promoted to the final path with an atomic rename only after exact size and
-SHA-256 verification succeed. Corrupted, incomplete, oversized, or checksum-mismatched
-content is never reported as valid and never leaves a verified final file behind.
+destination filesystem, never into memory. The temporary file is created with
+exclusive, no-follow flags (`O_CREAT|O_EXCL|O_NOFOLLOW`), flushed and synced, then
+promoted to the final path with an atomic rename only after exact size and SHA-256
+verification succeed. A `.part` path that is a symlink (broken or not) or is not a
+regular file is refused before any network request and is reported `CORRUPTED` by
+status/verify. Corrupted, incomplete, oversized, or checksum-mismatched content is
+never reported as valid and never leaves a verified final file behind.
 
 Per-file states are `ABSENT`, `PARTIAL`, `CORRUPTED`, and `VERIFIED`. `PARTIAL` means an
 incomplete `.part` download file exists; `CORRUPTED` means the final file exists but
@@ -244,8 +258,8 @@ lock on completion.
 
 Every subcommand emits versioned JSON (`schema_version: 1`) with the command, artifact
 identity, plan digest, cache root, file counts, byte totals, per-file states, network
-request/retry counts, success flag, classification, exit code, and an actionable
-message. No credentials, tokens, or environment dumps are emitted.
+request/retry/received-byte counts, success flag, classification, exit code, and an
+actionable message. No credentials, tokens, or environment dumps are emitted.
 
 - `0` operation succeeded
 - `2` policy refusal (missing confirmation or insufficient byte allowance)
@@ -254,7 +268,7 @@ message. No credentials, tokens, or environment dumps are emitted.
 - `5` transport failure
 - `6` lock/concurrency conflict
 - `64` invalid CLI usage
-- `70` internal error
+- `70` internal error or local filesystem/IO failure (`LOCAL_IO_FAILURE`)
 
 ### Example with a local test manifest
 
