@@ -22,6 +22,10 @@ case "${1:-health}" in
         if [ "$#" -gt 0 ]; then shift; fi
         exec python /app/readiness.py "$@"
         ;;
+    models)
+        if [ "$#" -gt 0 ]; then shift; fi
+        exec python /app/model_cache.py "$@"
+        ;;
     *)
         exec "$@"
         ;;

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "artifact_set": "test-fixture-set",
+  "revision": "v1-20260813-fixture",
+  "namespace": "test-fixture-set/v1-20260813-fixture",
+  "description": "Deterministic tiny local fixture manifest for T-0014 validation only; contains no production model data",
+  "files": [
+    {
+      "path": "data/a.bin",
+      "url": "http://host.docker.internal:18765/data/a.bin",
+      "size": 29,
+      "sha256": "2824a757a947deef1b0d75cdd107d1f9590068c3db0ca4eca8ed37988897039e",
+      "role": "fixture-a"
+    },
+    {
+      "path": "data/b.bin",
+      "url": "http://host.docker.internal:18765/data/b.bin",
+      "size": 29,
+      "sha256": "395e7637af124b740d798c497f9d6d90e538c94088081a1e74bef4621a172ccf",
+      "role": "fixture-b"
+    },
+    {
+      "path": "data/c.bin",
+      "url": "http://host.docker.internal:18765/data/c.bin",
+      "size": 29,
+      "sha256": "81464e6f22299dcdd0bd78510337ed1472649d44fc764d9d0b64a6d2bcf37c6e",
+      "role": "fixture-c"
+    }
+  ]
+}

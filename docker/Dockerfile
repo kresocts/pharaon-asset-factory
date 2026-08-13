@@ -124,6 +124,11 @@ RUN chmod 0755 /usr/local/bin/pharaon-entrypoint \
     && python /app/health.py --json \
     && rm -rf /root/.cache/huggingface
 
+COPY --chown=app:app docker/model_cache.py /app/model_cache.py
+COPY --chown=app:app docker/model_fixture_server.py /app/model_fixture_server.py
+COPY --chown=app:app docker/model-manifests/test-fixture.json /app/model-manifests/test-fixture.json
+RUN python /app/model_cache.py plan --manifest /app/model-manifests/test-fixture.json --json
+
 WORKDIR /app
 VOLUME ["/models", "/data/input", "/data/output"]
 USER app:app

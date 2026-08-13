@@ -19,3 +19,4 @@ Keep ADRs concise and link the relevant ticket and pull request. Do not rewrite 
 - [0003: Pinned Hunyuan dependency layer and native-extension boundary](0003-pinned-hunyuan-dependency-layer.md)
 - [0004: Bake pinned Hunyuan native extensions into the image](0004-baked-hunyuan-native-extensions.md)
 - [0005: Runtime readiness gate](0005-runtime-readiness-gate.md)
+- [0006: External model cache and controlled acquisition](0006-external-model-cache-and-controlled-acquisition.md)

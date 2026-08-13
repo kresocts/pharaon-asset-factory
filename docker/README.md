@@ -120,3 +120,146 @@ The gate probes `/models`, `/data/input`, `/data/output`, `/workspace`, and the 
 - `health` is a diagnostic report, not a pass/fail gate.
 - `ready` is the authoritative runtime pass/fail gate for the pre-weights stage.
 - Full Hunyuan inference readiness is a later concern and is always reported false by this ticket.
+
+## T-0014 external model cache and controlled acquisition
+
+The `models` command is the canonical container interface for planning, inspecting,
+acquiring, and verifying future model artifacts in the external `/models` cache. It
+exists so that a later ticket can introduce the first verified production Hunyuan
+manifest and perform an explicitly approved, budgeted download. T-0014 itself contains
+no production model weights and all download validation uses deterministic tiny local
+fixtures.
+
+### Canonical commands
+
+```bash
+docker run --rm IMAGE models plan --manifest MANIFEST.json --json
+docker run --rm IMAGE models status --manifest MANIFEST.json --json
+docker run --rm IMAGE models acquire --manifest MANIFEST.json --confirm-download --max-bytes N --json
+docker run --rm IMAGE models verify --manifest MANIFEST.json --json
+```
+
+`plan`, `status`, and `verify` are fully offline and deterministic; they never open a
+network connection. Only `acquire` may access the network, and only when the operator
+passes both `--confirm-download` and `--max-bytes` and every preflight check passes.
+
+### Manifest format
+
+Manifests use schema version `1`:
+
+```json
+{
+  "schema_version": 1,
+  "artifact_set": "hunyuan3d-2-1",
+  "revision": "e6e8b8c8d8e8f8a8b8c8d8e8f8a8b8c8d8e8f8a8",
+  "namespace": "hunyuan3d-2-1/e6e8b8c8d8e8f8a8b8c8d8e8f8a8b8c8d8e8f8a8",
+  "description": "Example immutable placeholder manifest",
+  "files": [
+    {
+      "path": "data/placeholder-artifact.dat",
+      "url": "https://example.invalid/placeholder-artifact.dat",
+      "size": 123456789,
+      "sha256": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+      "role": "placeholder-artifact"
+    }
+  ]
+}
+```
+
+Every file requires an immutable `url`, an exact expected `size` in bytes, and an exact
+lowercase `sha256`. Mutable references such as `main`, `latest`, `master`, `HEAD`,
+`/resolve/main/`, or `/blob/main/` URLs are rejected, as are missing or invalid
+checksums, missing or non-positive sizes, absolute or `..` traversal paths, duplicate
+destinations, unsupported URL schemes, and URLs with embedded credentials. Production
+sources must use HTTPS; HTTP is accepted only for loopback and `host.docker.internal`
+test fixtures. The destination namespace and every file path are validated so nothing
+can be written outside the configured model-cache root.
+
+### Cache layout
+
+The cache root comes from `MODEL_CACHE_DIR` (default `/models`). Artifacts are stored
+under an immutable destination namespace:
+
+```text
+/models/<namespace>/<relative-file-path>
+```
+
+Namespaces should include the artifact set and immutable revision (for example
+`hunyuan3d-2-1/<revision>`). Model data never lands in `/app`, `/opt/hunyuan3d`, or the
+image layers. The bind-mounted `/models` volume remains writable by the fixed runtime
+user/group `10001:10001`.
+
+### Authorization and byte limits
+
+`models acquire` is refused with exit code `2` and zero network requests unless the
+operator provides both `--confirm-download` and a mandatory `--max-bytes` allowance.
+Before the first network request the command validates the complete manifest, inspects
+the current cache, computes the bytes still required, verifies that the required amount
+and file count fit the configured policy limits, and acquires the artifact-set lock. A
+missing confirmation or insufficient allowance is a policy refusal, never an internal
+exception. There is no environment-variable bypass and no unlimited-byte mode.
+
+### Retries and timeouts
+
+Transport behavior is finite and documented: connection establishment is bounded by a
+10-second connect timeout, each socket read by a 30-second read timeout, and at most 2
+retries (3 attempts total) are made for transient failures (connection errors,
+timeouts, HTTP 408/429, and HTTP 5xx). Permanent HTTP 4xx errors and integrity
+failures are never retried. Retry attempts are visible in the machine-readable
+`network.retries` and `network.requests_attempted` fields.
+
+### Streaming, atomicity, and states
+
+Downloads stream in 64 KiB chunks into a temporary `<final>.part` file on the
+destination filesystem, never into memory. The temporary file is flushed and synced,
+then promoted to the final path with an atomic rename only after exact size and
+SHA-256 verification succeed. Corrupted, incomplete, oversized, or checksum-mismatched
+content is never reported as valid and never leaves a verified final file behind.
+
+Per-file states are `ABSENT`, `PARTIAL`, `CORRUPTED`, and `VERIFIED`. `PARTIAL` means an
+incomplete `.part` download file exists; `CORRUPTED` means the final file exists but
+fails size or checksum verification. `models verify` performs no download and exits
+non-zero until every file is `VERIFIED`. T-0014 uses a documented restart-from-zero
+policy: a stale `.part` is removed and re-downloaded on the next authorized
+acquisition, and a corrupted final file is replaced only after a fully verified fresh
+download. Existing verified files are always reused without network access or rewrites.
+
+### Locking
+
+Acquisition is serialized per artifact-set plan with an atomic lock directory under
+`<cache root>/.locks/<plan-id>`. Lock acquisition waits at most 10 seconds and then
+fails cleanly with exit code `6` and `LOCK_CONFLICT` classification. Stale locks are
+handled conservatively: a lock is broken only when its owner metadata is older than 24
+hours AND the recorded owner process is no longer alive; an active lock is never broken.
+The lock holder refreshes the owner heartbeat during long downloads and removes the
+lock on completion.
+
+### JSON and exit-code contract
+
+Every subcommand emits versioned JSON (`schema_version: 1`) with the command, artifact
+identity, plan digest, cache root, file counts, byte totals, per-file states, network
+request/retry counts, success flag, classification, exit code, and an actionable
+message. No credentials, tokens, or environment dumps are emitted.
+
+- `0` operation succeeded
+- `2` policy refusal (missing confirmation or insufficient byte allowance)
+- `3` manifest validation or destination path-security failure
+- `4` integrity verification failure
+- `5` transport failure
+- `6` lock/concurrency conflict
+- `64` invalid CLI usage
+- `70` internal error
+
+### Example with a local test manifest
+
+```bash
+# Generate a tiny fixture manifest that points at a local HTTP fixture server, then:
+docker run --rm -v "$PWD/manifest.json:/manifests/fixture.json:ro" \
+  -v "$PWD/models:/models" pharaon-asset-factory-gpu:t0014 \
+  models acquire --manifest /manifests/fixture.json --confirm-download --max-bytes 1048576 --json
+```
+
+All T-0014 validation uses tiny deterministic fixtures served by a local HTTP server
+that counts requests; total fixture transfers stay below 5 MiB. No production Hunyuan
+manifests, model URLs, or checksums are included in T-0014, and no real weights or
+checkpoints are downloaded.
