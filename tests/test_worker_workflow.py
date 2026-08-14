@@ -106,6 +106,23 @@ class WorkerPreparationTests(unittest.TestCase):
         self.assertIsNone(result.context)
         self.assertEqual((self.fixture.root / "tickets" / "T-0003.md").read_text(encoding="utf-8"), original)
 
+    def test_superseded_ticket_is_not_runnable(self) -> None:
+        self.fixture.ticket("T-0003", "SUPERSEDED")
+        result = WorkerWorkflow(self.fixture.root).prepare("T-0003")
+        self.assertEqual(result.state, PreparationState.BLOCKED)
+        self.assertEqual(result.reasons, (
+            "T-0003 status is SUPERSEDED, not READY or IN_PROGRESS",
+        ))
+
+    def test_superseded_dependency_blocks_dependent_ticket(self) -> None:
+        self.fixture.ticket("T-0001", "SUPERSEDED")
+        self.fixture.ticket("T-0003", "READY", ("T-0001",))
+        result = WorkerWorkflow(self.fixture.root).prepare("T-0003")
+        self.assertEqual(result.state, PreparationState.BLOCKED)
+        self.assertEqual(result.reasons, (
+            "dependency T-0001 is SUPERSEDED, not DONE",
+        ))
+
     def test_malformed_and_unknown_tickets_are_validation_failures(self) -> None:
         self.assertIn("malformed ticket ID", WorkerWorkflow(self.fixture.root).prepare("3").reasons[0])
         self.assertEqual(

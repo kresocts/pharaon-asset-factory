@@ -50,6 +50,13 @@ class ParseTicketTests(unittest.TestCase):
         self.assertEqual(ticket.dependencies, ())
         self.assertEqual(ticket.priority, 1)
 
+    def test_parses_superseded_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ticket = parse_ticket(self.write_ticket(
+                Path(temporary), VALID_TICKET.replace("status: READY", "status: SUPERSEDED")
+            ))
+        self.assertEqual(ticket.status, "SUPERSEDED")
+
     def test_rejects_filename_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = self.write_ticket(Path(temporary), name="T-9999.md")
@@ -93,6 +100,7 @@ class RepositoryTests(unittest.TestCase):
                 "T-0017",
                 "T-0018",
                 "T-0019",
+                "T-0020",
             },
         )
 
