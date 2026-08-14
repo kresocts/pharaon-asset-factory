@@ -7,7 +7,9 @@ import json
 import sys
 from typing import Any, Optional, Sequence
 
+from .backends import BackendError, DEFAULT_REGISTRY
 from .contract import ContractError, read_job_document
+from .execution import build_preparation_envelope
 from .paths import (
     InputPolicyError,
     RuntimeRootError,
@@ -45,6 +47,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to the shape-job JSON document",
     )
     plan.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON (the authoritative output)",
+    )
+
+    prepare = shape_subparsers.add_parser(
+        "prepare",
+        help="validate a shape job, resolve a backend, and print an execution request",
+    )
+    prepare.add_argument(
+        "--job",
+        required=True,
+        help="path to the shape-job JSON document",
+    )
+    prepare.add_argument(
+        "--backend",
+        required=True,
+        help="explicit shape backend ID from the fixed local registry",
+    )
+    prepare.add_argument(
         "--json",
         action="store_true",
         help="emit machine-readable JSON (the authoritative output)",
@@ -101,32 +123,65 @@ def _print_human_plan(plan: dict[str, Any]) -> None:
     print(f"gpu: {requirements['gpu']}")
 
 
+def _print_human_prepare(envelope: dict[str, Any]) -> None:
+    job = envelope["job"]
+    paths = envelope["paths"]
+    backend = envelope["backend"]
+    request = envelope["execution_request"]
+    print("SHAPE_EXECUTION_REQUEST_READY")
+    print(f"job_id: {job['job_id']}")
+    print(f"reference_image: {job['reference_image']}")
+    print(f"seed: {job['seed']}")
+    print(f"remove_background: {job['remove_background']}")
+    print(f"backend_id: {backend['backend_id']}")
+    print(f"source_repository: {backend['source_repository']}")
+    print(f"source_revision: {backend['source_revision']}")
+    print(f"input_image: {paths['input_image']}")
+    print(f"output_directory: {paths['output_directory']}")
+    print(f"workspace_directory: {paths['workspace_directory']}")
+    print(f"execution_request.job_id: {request['job_id']}")
+    print("execution_supported: false")
+    for blocker in envelope["blockers"]:
+        print(f"blocker: {blocker['code']}")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     json_mode = bool(getattr(args, "json", False))
-    if args.command != "shape" or args.shape_command != "plan":
-        parser.error("expected 'shape plan --job JOB [--json]'")
+    if args.command != "shape" or args.shape_command not in {"plan", "prepare"}:
+        parser.error(
+            "expected 'shape plan --job JOB [--json]' or "
+            "'shape prepare --job JOB --backend BACKEND [--json]'"
+        )
 
     try:
         document = read_job_document(args.job)
         roots = load_runtime_roots()
         plan = build_plan(document, roots)
+        if args.shape_command == "prepare":
+            backend = DEFAULT_REGISTRY.resolve(args.backend)
+            result = build_preparation_envelope(document, plan, backend)
+        else:
+            result = plan
     except (
         ContractError,
         RuntimeRootError,
         InputPolicyError,
         SafePathError,
+        BackendError,
     ) as exc:
         return _emit_expected_error(exc, json_mode)
     except Exception as exc:  # pragma: no cover - defensive unexpected boundary
         return _emit_unexpected_error(exc, json_mode)
 
     if json_mode:
-        print(json.dumps(plan, indent=2))
+        print(json.dumps(result, indent=2))
+    elif args.shape_command == "prepare":
+        _print_human_prepare(result)
     else:
-        _print_human_plan(plan)
+        _print_human_plan(result)
     return 0
 
 
