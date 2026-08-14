@@ -15,7 +15,8 @@ dedicated runner labels `self-hosted`, `Windows`, `X64`, and `pharaon-publisher`
 Require exact `confirm_publish=PUBLISH` and an `expected_sha` equal to the full
 lowercase `github.sha`. Fail closed unless the repository and ref are exactly
 `kresocts/pharaon-asset-factory` and `refs/heads/main`. Pin every action to a verified
-full commit SHA. Limit permissions to `contents: read` and `packages: write`, use only
+full commit SHA with exact release comments (`actions/checkout` v7.0.1 and
+`actions/setup-python` v7.0.0). Limit permissions to `contents: read` and `packages: write`, use only
 `secrets.GITHUB_TOKEN` with `--password-stdin`, and keep credentials in a unique
 temporary Docker config under `RUNNER_TEMP` with an `if: always()` cleanup. Check
 Docker Linux-engine, Buildx, `D:\actions-runner`, and a conservative 150 GiB D-drive
@@ -25,8 +26,9 @@ immutable release tag, and never publish rolling tags. Use a 180-minute timeout 
 non-cancelling global publication concurrency group. Build with Buildx for
 `linux/amd64` only, direct registry push, provenance/SBOM disabled, no cache export, no
 build secrets, and no model credentials. Capture and verify the pushed digest, remote
-SHA/release tags, and Linux AMD64 platform, and record the digest-qualified reference
-in the job summary.
+SHA/release tags, and Linux AMD64 platform using the documented `buildx imagetools
+inspect --format "{{json .}}"` output parsed structurally with `ConvertFrom-Json`, and
+record the digest-qualified reference in the job summary.
 
 **Consequences:** The workflow has a narrow, reviewable manual publication boundary
 without automatic publication, PATs, paid runners, or mutable tags. Because it is

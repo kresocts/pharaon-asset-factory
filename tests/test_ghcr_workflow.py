@@ -1,19 +1,52 @@
 from __future__ import annotations
 
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
 PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish-container.yml"
 ALLOWED_ACTIONS = {"actions/checkout", "actions/setup-python"}
 ACTION_SHA = re.compile(r"^[0-9a-f]{40}$")
+PINNED_ACTIONS = {
+    ("actions/checkout", "3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1"),
+    ("actions/setup-python", "5fda3b95a4ea91299a34e894583c3862153e4b97", "v7.0.0"),
+}
+STRICT_RELEASE_TAG = re.compile(
+    r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(?:[0-9a-z]+(?:-[0-9a-z]+)*)(?:\.(?:[0-9a-z]+(?:-[0-9a-z]+)*))*)?$"
+)
+
+
+def discover_workflows(root: Path = ROOT) -> list[Path]:
+    workflow_dir = root / ".github" / "workflows"
+    paths = set(workflow_dir.glob("*.yml")) | set(workflow_dir.glob("*.yaml"))
+    return sorted(dict.fromkeys(paths))
+
+
+WORKFLOWS = discover_workflows()
 
 
 def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _release_tag_allowed(tag: str) -> bool:
+    if tag == "":
+        return True
+    if len(tag) > 128:
+        return False
+    if re.search(r"\s", tag):
+        return False
+    if "/" in tag:
+        return False
+    if tag.lower() != tag:
+        return False
+    if re.search(r"[&|;<>$]", tag):
+        return False
+    return bool(STRICT_RELEASE_TAG.fullmatch(tag))
 
 
 def _block_after(raw: str, marker: str) -> str:
@@ -43,6 +76,25 @@ def _list_after(raw: str, marker: str) -> list[str]:
 class GhcrWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.raw = _text(PUBLISH_WORKFLOW)
+
+    def _assert_action_policy(self, paths: list[Path]) -> None:
+        uses_pattern = re.compile(r"uses:\s*([^\s#]+)(?:\s*#\s*(.*?))?\s*$")
+        for path in paths:
+            text = _text(path)
+            for line in text.splitlines():
+                match = uses_pattern.search(line)
+                if not match:
+                    continue
+                ref = match.group(1)
+                action, _, suffix = ref.rpartition("@")
+                comment = (match.group(2) or "").strip()
+                self.assertIn(action, ALLOWED_ACTIONS, f"{path}: disallowed action {action}")
+                self.assertRegex(suffix, ACTION_SHA, f"{path}: {ref} is not a full SHA pin")
+                self.assertIn(
+                    (action, suffix, comment),
+                    PINNED_ACTIONS,
+                    f"{path}: unexpected action pin or release comment {ref} # {comment}",
+                )
 
     def test_single_publish_workflow_exists(self) -> None:
         publish_workflows = [path for path in WORKFLOWS if path.name == "publish-container.yml"]
@@ -106,35 +158,88 @@ class GhcrWorkflowTests(unittest.TestCase):
             "Publication is refused for repository",
             "Publication is refused for ref",
             "github.sha is not a full 40-character lowercase hex SHA",
-            'release_tag must be an immutable version such as v1.0.0 or v1.2.3-rc.1',
+            "release_tag must be an immutable version such as v1.0.0 or v1.2.3-rc.1",
         ]:
             self.assertIn(required_text, self.raw)
 
     def test_release_tag_policy(self) -> None:
-        for mutable in [
+        self.assertIn("$releaseTag -cmatch \"^v(0|[1-9][0-9]*)", self.raw)
+        self.assertNotRegex(self.raw, r"\+\[0-9a-z")
+        self.assertNotIn("$segments", self.raw)
+        self.assertNotIn("$mutable", self.raw)
+
+    def test_release_tag_grammar_adversarial(self) -> None:
+        valid = [
+            "v1.0.0",
+            "v1.2.3-rc.1",
+            "v2.0.0-beta.2",
+            "v10.20.30-alpha.1-beta.2",
+        ]
+        invalid = [
+            "v1.2.3+build.1",
+            "v1.2.3-rc.",
+            "v1.2.3-rc-",
+            "v1.2.3-rc..1",
+            "v1.2.3-.rc",
+            "V1.2.3",
+            "v01.2.3",
             "latest",
+            "main",
             "stable",
             "current",
-            "main",
             "master",
             "dev",
             "edge",
             "nightly",
             "rolling",
             "snapshot",
-        ]:
-            self.assertIn(mutable, self.raw)
-        self.assertIn('$releaseTag -cmatch "^v(0|[1-9][0-9]*)', self.raw)
+            "v1.2.3/rc",
+            "v1.2.3 rc",
+            "v1.2.3$",
+            "v1.0.0-" + "a" * 125,
+        ]
+        for tag in valid:
+            self.assertTrue(_release_tag_allowed(tag), f"expected valid release tag: {tag}")
+        for tag in invalid:
+            self.assertFalse(_release_tag_allowed(tag), f"expected invalid release tag: {tag}")
 
     def test_every_uses_reference_is_pinned_full_sha_and_allowlisted(self) -> None:
-        for path in WORKFLOWS:
-            text = _text(path)
-            for match in re.finditer(r"uses:\s*([^\s#]+)(?:\s*#\s*v?\S+)?", text):
-                ref = match.group(1)
-                action, _, suffix = ref.rpartition("@")
-                self.assertIn(action, ALLOWED_ACTIONS, f"{path}: disallowed action {action}")
-                self.assertRegex(suffix, ACTION_SHA, f"{path}: {ref} is not a full SHA pin")
-                self.assertIn("# v", match.group(0))
+        self._assert_action_policy(WORKFLOWS)
+
+    def test_workflow_discovery_covers_yml_and_yaml(self) -> None:
+        self.assertIn(PUBLISH_WORKFLOW, WORKFLOWS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow_dir = root / ".github" / "workflows"
+            workflow_dir.mkdir(parents=True)
+            (workflow_dir / "one.yml").write_text(
+                "name: one\non: workflow_dispatch\njobs: {}\n", encoding="utf-8"
+            )
+            (workflow_dir / "two.yaml").write_text(
+                "name: two\non: workflow_dispatch\njobs: {}\n", encoding="utf-8"
+            )
+            discovered = discover_workflows(root)
+            self.assertEqual([path.name for path in discovered], ["one.yml", "two.yaml"])
+
+    def test_yaml_policy_discovery_detects_unpinned_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow_dir = root / ".github" / "workflows"
+            workflow_dir.mkdir(parents=True)
+            bad = (
+                "name: bad\n"
+                "on: workflow_dispatch\n"
+                "jobs:\n"
+                "  x:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@main # v7.0.1\n"
+            )
+            (workflow_dir / "bad.yaml").write_text(bad, encoding="utf-8")
+            discovered = discover_workflows(root)
+            self.assertEqual([path.name for path in discovered], ["bad.yaml"])
+            with self.assertRaises(AssertionError):
+                self._assert_action_policy(discovered)
 
     def test_image_tag_and_digest_contract(self) -> None:
         self.assertIn("ghcr.io/kresocts/pharaon-asset-factory", self.raw)
@@ -147,6 +252,17 @@ class GhcrWorkflowTests(unittest.TestCase):
         self.assertIn("org.opencontainers.image.description", self.raw)
         self.assertIn("containerimage.digest", self.raw)
         self.assertIn("GITHUB_STEP_SUMMARY", self.raw)
+        self.assertNotIn("{{.Digest}}", self.raw)
+        self.assertNotIn("{{json .Platforms}}", self.raw)
+        self.assertIn('--format "{{json .}}"', self.raw)
+        self.assertIn("ConvertFrom-Json", self.raw)
+        self.assertIn(".manifest.digest", self.raw)
+        self.assertIn(".image.architecture", self.raw)
+        self.assertIn(".image.os", self.raw)
+        self.assertIn("platform.architecture", self.raw)
+        self.assertIn("platform.os", self.raw)
+        self.assertIn("$shaManifestDigest -ne $digest", self.raw)
+        self.assertIn("$releaseManifestDigest -ne $digest", self.raw)
 
     def test_existing_tag_refusal_and_fail_closed_registry_checks(self) -> None:
         self.assertIn("Refuse existing requested tags", self.raw)

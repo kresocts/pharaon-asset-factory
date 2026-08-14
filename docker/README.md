@@ -363,10 +363,12 @@ rejects non-Linux Docker servers before login or build.
 - `expected_sha` — required string. Must be exactly the current 40-character lowercase
   `github.sha`.
 - `release_tag` — optional string. Empty means SHA-tag-only publication. Accepted
-  examples include `v1.0.0` and `v1.2.3-rc.1`. Uppercase, whitespace, slashes, shell
-  metacharacters, excessively long values, and mutable names such as `latest`, `stable`,
+  examples include `v1.0.0`, `v1.2.3-rc.1`, and `v2.0.0-beta.2`. The value must match a
+  strict Docker-compatible immutable version grammar. Uppercase, whitespace, slashes,
+  shell metacharacters, build-metadata `+` suffixes, empty/trailing prerelease
+  separators, excessively long values, and mutable names such as `latest`, `stable`,
   `current`, `main`, `master`, `dev`, `edge`, `nightly`, `rolling`, and `snapshot` are
-  rejected.
+  rejected before authentication or build.
 
 ### Trusted-context policy
 
@@ -415,7 +417,9 @@ used.
 The job has a finite 180-minute timeout and a deterministic publication concurrency
 group with `cancel-in-progress: false`. Every `uses:` reference in every repository
 workflow is pinned to a verified full 40-character commit SHA; only allowlisted
-official `actions/*` actions are used.
+official `actions/*` actions are used. The recorded release comments are exact:
+`actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1` and
+`actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0`.
 
 ### Build and digest verification
 
@@ -424,8 +428,14 @@ The future Buildx command uses the repository root as context, `docker/Dockerfil
 build, no GHA persistent cache export, no build secrets, no model credentials, and no
 GH token as a build argument. OCI labels record source, revision, version, and
 description. Post-push steps capture the pushed `sha256` digest, inspect the SHA tag
-remotely, verify Linux AMD64, verify any optional release tag resolves to the same
-digest, and write the digest-qualified reference to the job summary.
+remotely with `buildx imagetools inspect --format "{{json .}}"`, and parse that
+documented JSON structurally with `ConvertFrom-Json`. The verifier compares
+`.manifest.digest` with the digest captured from `build-metadata.json`, requires the
+manifest platform and image config to be exactly Linux AMD64 when those documented
+fields are present, verifies any optional release tag resolves to the same digest, and
+writes the digest-qualified reference to the job summary. Because Buildx output can be
+version-sensitive, T-0016 must validate this command against the disposable local
+registry before the first GHCR publication.
 
 ### Package visibility and follow-up
 

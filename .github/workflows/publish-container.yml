@@ -82,10 +82,6 @@ jobs:
             throw "Publication requires a Windows self-hosted runner."
           }
 
-          $mutable = @(
-            "latest", "stable", "current", "main", "master",
-            "dev", "edge", "nightly", "rolling", "snapshot"
-          )
           $releaseTag = $env:RELEASE_TAG
           if ($releaseTag -ne "") {
             if ($releaseTag.Length -gt 128) {
@@ -103,15 +99,7 @@ jobs:
             if ($releaseTag -match '[&|;<>$]') {
               throw "release_tag contains shell metacharacters."
             }
-            if ($releaseTag -cmatch "^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9a-z][0-9a-z.-]*)?(\+[0-9a-z][0-9a-z.-]*)?$") {
-              $segments = $releaseTag.Substring(1) -split "[+.-]"
-              foreach ($segment in $segments) {
-                if ($mutable -contains $segment.ToLowerInvariant()) {
-                  throw "release_tag contains mutable segment $segment."
-                }
-              }
-            }
-            else {
+            if (-not ($releaseTag -cmatch "^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:[0-9a-z]+(?:-[0-9a-z]+)*)(?:\.(?:[0-9a-z]+(?:-[0-9a-z]+)*))*)?$")) {
               throw "release_tag must be an immutable version such as v1.0.0 or v1.2.3-rc.1."
             }
           }
@@ -119,7 +107,7 @@ jobs:
           Write-Host "Trusted-context preflight passed."
 
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -275,23 +263,80 @@ jobs:
             throw "Buildx metadata did not contain a valid sha256 digest."
           }
 
-          $shaRef = "$env:IMAGE`:sha-$env:GITHUB_SHA"
-          $shaDigest = (& docker --config $config buildx imagetools inspect $shaRef --format "{{.Digest}}" 2>$null | Select-Object -Last 1).Trim()
-          if ($LASTEXITCODE -ne 0 -or $shaDigest -ne $digest) {
-            throw "Pushed SHA tag does not resolve to the captured digest."
+          function Get-ImageInspection {
+            param(
+              [string]$Config,
+              [string]$Reference
+            )
+
+            $output = & docker --config $Config buildx imagetools inspect $Reference --format "{{json .}}" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Buildx imagetools inspect failed for $Reference."
+            }
+            $json = ($output -join "`n").Trim()
+            if (-not $json) {
+              throw "Buildx imagetools inspect returned no output for $Reference."
+            }
+            try {
+              return ($json | ConvertFrom-Json)
+            }
+            catch {
+              throw "Buildx imagetools inspect returned malformed JSON for $Reference."
+            }
           }
 
-          $platformJson = (& docker --config $config buildx imagetools inspect $shaRef --format "{{json .Platforms}}" 2>$null | Select-Object -Last 1)
-          if ($LASTEXITCODE -ne 0 -or $platformJson -notmatch "linux/amd64") {
-            throw "Pushed image is not verified as Linux AMD64."
+          function Assert-LinuxAmd64 {
+            param(
+              $Inspection,
+              [string]$Label
+            )
+
+            $verified = $false
+
+            if ($null -ne $Inspection.manifest -and $Inspection.manifest.PSObject.Properties.Name -contains "manifests") {
+              $platformManifests = @($Inspection.manifest.manifests)
+              if ($platformManifests.Count -ne 1) {
+                throw "$Label does not contain exactly one Linux AMD64 platform manifest."
+              }
+              $platform = $platformManifests[0].platform
+              if ($null -eq $platform -or $platform.os -ne "linux" -or $platform.architecture -ne "amd64") {
+                throw "$Label is not verified as Linux AMD64 from manifest platforms."
+              }
+              $verified = $true
+            }
+
+            if ($null -ne $Inspection.image) {
+              $imageOs = $Inspection.image.os
+              $imageArch = $Inspection.image.architecture
+              if ($null -ne $imageOs -and $null -ne $imageArch) {
+                if ($imageOs -ne "linux" -or $imageArch -ne "amd64") {
+                  throw "$Label is not verified as Linux AMD64 from image config."
+                }
+                $verified = $true
+              }
+            }
+
+            if (-not $verified) {
+              throw "$Label could not be verified as Linux AMD64 from supported inspection output."
+            }
           }
+
+          $shaRef = "$env:IMAGE`:sha-$env:GITHUB_SHA"
+          $shaInspection = Get-ImageInspection -Config $config -Reference $shaRef
+          $shaManifestDigest = $shaInspection.manifest.digest
+          if (-not $shaManifestDigest -or $shaManifestDigest -ne $digest) {
+            throw "Pushed SHA tag does not resolve to the captured digest."
+          }
+          Assert-LinuxAmd64 -Inspection $shaInspection -Label "SHA tag"
 
           if ($env:RELEASE_TAG) {
             $releaseRef = "$env:IMAGE`:$env:RELEASE_TAG"
-            $releaseDigest = (& docker --config $config buildx imagetools inspect $releaseRef --format "{{.Digest}}" 2>$null | Select-Object -Last 1).Trim()
-            if ($LASTEXITCODE -ne 0 -or $releaseDigest -ne $digest) {
+            $releaseInspection = Get-ImageInspection -Config $config -Reference $releaseRef
+            $releaseManifestDigest = $releaseInspection.manifest.digest
+            if (-not $releaseManifestDigest -or $releaseManifestDigest -ne $digest) {
               throw "Optional release tag does not resolve to the captured digest."
             }
+            Assert-LinuxAmd64 -Inspection $releaseInspection -Label "Release tag"
           }
 
           $digestQualified = "$env:IMAGE@$digest"
