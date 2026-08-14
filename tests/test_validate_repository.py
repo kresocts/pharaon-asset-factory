@@ -90,6 +90,7 @@ class RepositoryTests(unittest.TestCase):
                 "T-0014",
                 "T-0015",
                 "T-0016",
+                "T-0017",
             },
         )
 
