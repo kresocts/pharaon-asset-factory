@@ -4,7 +4,7 @@ Pharaon Asset Factory is the foundation for a future reproducible AI game-asset 
 
 ## Current status
 
-Phase 0 is complete. Phase 1 now includes the reproducible CUDA/Python base, pinned PyTorch and Hunyuan3D dependencies, and compiled Hunyuan native rasterizer/mesh-painter extensions for CUDA architectures 8.6 and 8.9. CPU-safe diagnostics distinguish native readiness from full inference readiness; model weights, inference, GPU provisioning, and a web interface remain intentionally absent. The container exposes a canonical `ready` command (docker run --rm IMAGE ready --profile cpu --json, or --profile native-gpu with GPU passthrough) that returns a versioned, machine-readable pre-weights runtime readiness decision. It also exposes a canonical external model-cache command (`models plan|status|acquire|verify`) with a versioned artifact-manifest schema, offline planning/status/verification, explicit download authorization, hard byte limits, streamed and integrity-verified acquisition, and concurrency locking; all T-0014 validation uses tiny local fixtures and downloads no real model weights. See [the GPU image guide](docker/README.md).
+Phase 0 is complete. Phase 1 is complete as the reproducible CUDA/Python base, pinned PyTorch and Hunyuan3D dependencies, and compiled Hunyuan native rasterizer/mesh-painter extensions for CUDA architectures 8.6 and 8.9. CPU-safe diagnostics distinguish native readiness from full inference readiness; model weights, inference, GPU provisioning, and a web interface remain intentionally absent. The container exposes a canonical `ready` command (docker run --rm IMAGE ready --profile cpu --json, or --profile native-gpu with GPU passthrough) that returns a versioned, machine-readable pre-weights runtime readiness decision. It also exposes a canonical external model-cache command (`models plan|status|acquire|verify`) with a versioned artifact-manifest schema, offline planning/status/verification, explicit download authorization, hard byte limits, streamed and integrity-verified acquisition, and concurrency locking; all T-0014 validation uses tiny local fixtures and downloads no real model weights. See [the GPU image guide](docker/README.md).
 
 ## Intended architecture
 
@@ -114,17 +114,17 @@ Secrets never belong in Git. Future cloud operations must use least-privilege cr
 
 ## GHCR publishing foundation
 
-T-0015 defines the secure, manually triggered `publish-container.yml` workflow
-foundation for `ghcr.io/kresocts/pharaon-asset-factory`. It is not executed by T-0015;
-T-0016 will integration-test the publishing logic locally and T-0017 will perform the
-first controlled GHCR publication. See [docker/README.md](docker/README.md).
+T-0015 defined the secure, manually triggered `publish-container.yml` workflow
+foundation for `ghcr.io/kresocts/pharaon-asset-factory`. T-0016 completed local
+publisher integration validation against a disposable `127.0.0.1` registry.
 
-T-0016 adds the local publisher integration validation. From a clean ticket branch, run
-`powershell -NoProfile -ExecutionPolicy Bypass -File validation/run_local_publisher_integration.ps1 -Confirmation "RUN LOCAL PUBLISHER TEST"`
-to validate the shared publisher logic against a disposable `127.0.0.1` registry
-without contacting GHCR or starting the self-hosted runner. See [docker/README.md](docker/README.md).
+T-0017 attempted the first controlled GHCR publication. That attempt failed at the
+existing-tag preflight in run 31800647785 and is recorded as `FAILED`; T-0017 is now
+`SUPERSEDED`, not `DONE`. T-0018 normalized handled PowerShell native exit state so an
+expected absent-tag result does not leave the process in failure. T-0019 then completed
+a separately approved successful controlled SHA-only publication to GHCR; see
+[docker/README.md](docker/README.md).
 
-T-0018 normalizes handled PowerShell native exit state so expected absent-tag results
-do not leave the existing-tag step in failure. The failed T-0017 run 31800647785
-remains recorded as failure; T-0019 will perform a separately approved second
-controlled publication only after T-0018 is merged and independently approved.
+The first failed attempt did not build or push an image and did not create a SHA,
+release, or `latest` tag. Its failed evidence remains authoritative. Model weights and
+inference remain unimplemented, and Phase 2 — Asset worker is the next roadmap phase.

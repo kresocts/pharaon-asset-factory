@@ -20,7 +20,7 @@ The repository validator supports scalar values and an inline dependency list; t
 
 - `id`: unique `T-` plus four digits; must match the filename.
 - `title`: concise, non-empty title.
-- `status`: one of `READY`, `IN_PROGRESS`, `REVIEW`, `BLOCKED`, or `DONE`.
+- `status`: one of `READY`, `IN_PROGRESS`, `REVIEW`, `BLOCKED`, `DONE`, or `SUPERSEDED`.
 - `dependencies`: existing ticket IDs; an empty list means no dependencies.
 - `priority`: positive integer where `1` is highest priority.
 
@@ -31,6 +31,12 @@ Status meanings:
 - `REVIEW` — implementation is awaiting or undergoing independent review.
 - `BLOCKED` — a recorded dependency or external condition prevents progress.
 - `DONE` — every acceptance criterion is satisfied and the required workflow is complete.
+- `SUPERSEDED` — terminal but not successful. The ticket requires no further
+  implementation or review work, but it did not satisfy all of its own acceptance
+  criteria. It is not runnable and does not satisfy dependencies; only `DONE`
+  satisfies dependencies. The ticket body must name the successor/remediation ticket
+  or tickets, explain why supersession is justified, and preserve the failed or
+  incomplete evidence.
 
 ## Required body
 

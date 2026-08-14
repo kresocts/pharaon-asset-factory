@@ -189,6 +189,16 @@ class SelectionAndStateTests(unittest.TestCase):
         self.assertEqual(select_ready_ticket(tickets).ticket_id, "T-0010")  # type: ignore[union-attr]
         self.assertIsNone(select_ready_ticket(tickets, frozenset({"T-0010"})))
 
+    def test_superseded_ticket_is_not_selected(self) -> None:
+        self.assertIsNone(select_ready_ticket((ticket("T-0010", "SUPERSEDED"),)))
+
+    def test_superseded_dependency_remains_unsatisfied(self) -> None:
+        tickets = (
+            ticket("T-0001", "SUPERSEDED"),
+            ticket("T-0010", "READY", ("T-0001",)),
+        )
+        self.assertIsNone(select_ready_ticket(tickets))
+
     def test_selection_is_priority_then_ticket_id_regardless_of_input_order(self) -> None:
         tickets = (ticket("T-0012", priority=2), ticket("T-0011", priority=1), ticket("T-0010", priority=1))
         self.assertEqual(select_ready_ticket(tickets).ticket_id, "T-0010")  # type: ignore[union-attr]

@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 TICKET_ID = re.compile(r"T-\d{4}")
-ALLOWED_STATUSES = {"READY", "IN_PROGRESS", "REVIEW", "BLOCKED", "DONE"}
+ALLOWED_STATUSES = {"READY", "IN_PROGRESS", "REVIEW", "BLOCKED", "DONE", "SUPERSEDED"}
 METADATA_FIELDS = {"id", "title", "status", "dependencies", "priority"}
 REQUIRED_SECTIONS = {
     "Goal",

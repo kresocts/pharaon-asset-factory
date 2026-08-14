@@ -335,10 +335,11 @@ foundation for publishing the reproducible GPU worker image to
 ### Purpose and boundary
 
 The workflow defines the publishing path for the image built by `docker/Dockerfile`.
-It does not start the self-hosted runner, perform Docker login, build or push an image,
-run a local registry, or contact GHCR during T-0015. T-0016 will integration-test the
-publishing logic locally, and T-0017 will perform the first controlled GHCR
-publication.
+It did not start the self-hosted runner, perform Docker login, build or push an image,
+run a local registry, or contact GHCR during T-0015. T-0016 completed local integration
+testing of the publishing logic; T-0017 attempted the first controlled GHCR publication
+and failed, and T-0019 completed the successful second controlled publication after
+T-0018 fixed the exit-state blocker.
 
 ### Runner and environment
 
@@ -447,9 +448,10 @@ registry before the first GHCR publication.
 ### Package visibility and follow-up
 
 Package visibility remains a manual GitHub Packages setting and is not changed by this
-workflow. T-0016 will perform local integration validation of the publishing logic.
-T-0017 will perform the first controlled GHCR publication. The implementation worker
-must not approve or merge its own pull request.
+workflow. T-0016 completed local integration validation of the publishing logic. T-0017
+attempted the first controlled GHCR publication and failed; T-0018 fixed the blocker
+and T-0019 completed the successful second controlled publication. The implementation
+worker must not approve or merge its own pull request.
 
 ## T-0016 local publisher integration validation
 
@@ -503,8 +505,9 @@ metadata, transcript, and the ticket-owned temporary directory. It does not prun
 remove shared Buildx cache, unrelated images/volumes, or the owner's normal Docker
 configuration.
 
-T-0017 remains the only ticket authorized to perform the first controlled GHCR
-publication.
+T-0017 attempted the first controlled GHCR publication and failed; it is now
+`SUPERSEDED`. T-0018 fixed the exit-state blocker and T-0019 completed the successful
+second controlled SHA-only publication.
 
 ## T-0018 handled PowerShell native exit-state normalization
 
@@ -522,6 +525,6 @@ registry errors return without this normalization and remain fail-closed.
 T-0018 adds deterministic separate-process regression tests for expected absence,
 existing-tag refusal, real-error fail-closed behavior, and state isolation, and it
 validated actual Docker CLI behavior against a disposable `127.0.0.1` registry. The
-failed T-0017 run remains recorded as failure. T-0019 will perform a separately
-approved second controlled publication only after T-0018 is merged and independently
+failed T-0017 run remains recorded as failure. T-0019 completed a separately
+approved second controlled publication after T-0018 was merged and independently
 approved.
