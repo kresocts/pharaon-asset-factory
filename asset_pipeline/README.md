@@ -110,8 +110,38 @@ verification, and GPU execution. Repeated runs with the same job and roots are
 byte-identical. The command performs no writes, downloads, model-cache access, heavy
 runtime imports, GPU initialization, or inference.
 
+## Shape model preflight and immutable binding
+
+T-0023 adds an explicit offline binding and cache-verification boundary. Run:
+
+```bash
+python -m asset_pipeline.cli shape preflight   --job path/to/job.json   --backend hunyuan3d-2.1-shape   --model-manifest path/to/model-manifest.json   --json
+```
+
+The command reuses `shape plan` validation and the T-0022 backend registry, parses the
+operator-supplied manifest with the existing T-0014 implementation, applies the strict
+Hunyuan shape-model binding policy, and verifies every required artifact already
+present under `MODEL_CACHE_DIR` by exact size and SHA-256. It emits a deterministic,
+sanitized, versioned envelope with `classification: SHAPE_MODEL_PREFLIGHT_READY`,
+`model_binding_supported: true`, `model_cache_verified: true`, and
+`execution_supported: false`. The only remaining blocker on success is
+`GPU_EXECUTION_NOT_IMPLEMENTED`.
+
+The model binding accepts only the canonical artifact set `hunyuan3d-2.1-shape`, a
+lowercase 40-hex immutable revision, the exact corresponding namespace, and immutable
+`https://huggingface.co` URLs with no credentials, query, or fragment. Accepted file
+roles are `shape-config`, `shape-weights`, and `shape-auxiliary`; at least one
+`shape-config` and one `shape-weights` file are required. Source URLs are not emitted
+in the binding or preflight envelope.
+
+Preflight is read-only and performs no writes, downloads, model-hub calls, heavy ML
+imports, GPU initialization, or inference. Cache verification never repairs or
+acquires missing files; acquisition remains the separately authorized `models acquire`
+command.
+
 ## Future work
 
-This ticket does not implement model manifests, weights, GPU execution, raw mesh
-generation, texture generation, post-processing, packaging, or API/server work. Real
-shape inference remains unimplemented.
+This ticket does not implement production weight manifests, real model hashes,
+licenses or acquisition, Hunyuan imports, GPU execution, raw mesh generation, texture
+generation, post-processing, packaging, or API/server work. Real shape inference
+remains unimplemented.
