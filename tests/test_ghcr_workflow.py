@@ -4,8 +4,6 @@ import re
 import unittest
 from pathlib import Path
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
@@ -14,46 +12,51 @@ ALLOWED_ACTIONS = {"actions/checkout", "actions/setup-python"}
 ACTION_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
-class OnKeyLoader(yaml.SafeLoader):
-    """Load YAML while preserving the top-level GitHub `on` key as a string."""
+def _text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
-def _construct_yaml_bool(loader: OnKeyLoader, node: yaml.ScalarNode) -> object:
-    value = node.value
-    if value == "on":
-        return "on"
-    lowered = value.lower()
-    if lowered in {"true", "yes", "on"}:
-        return True
-    if lowered in {"false", "no", "off"}:
-        return False
-    return value
+def _block_after(raw: str, marker: str) -> str:
+    match = re.search(rf"^\s*{re.escape(marker)}\s*$", raw, flags=re.MULTILINE)
+    if not match:
+        return ""
+    marker_indent = len(match.group(0)) - len(match.group(0).lstrip())
+    lines = raw[match.end() :].splitlines()
+    block: list[str] = []
+    for line in lines[1:]:
+        if line.strip() == "":
+            continue
+        line_indent = len(line) - len(line.lstrip(" \t"))
+        if line_indent <= marker_indent:
+            break
+        block.append(line)
+    return "\n".join(block)
 
 
-OnKeyLoader.add_constructor("tag:yaml.org,2002:bool", _construct_yaml_bool)
-
-
-def load_workflow(path: Path) -> dict:
-    return yaml.load(path.read_text(encoding="utf-8"), Loader=OnKeyLoader)
-
-
-def step_names(workflow: dict, job_id: str = "publish") -> list[str]:
-    return [step.get("name", "") for step in workflow["jobs"][job_id]["steps"]]
+def _list_after(raw: str, marker: str) -> list[str]:
+    match = re.search(rf"^\s*{re.escape(marker)}\s*\n((?:^\s*-\s+.*\n?)+)", raw, flags=re.MULTILINE)
+    if not match:
+        return []
+    return [line.strip() for line in re.findall(r"^\s*-\s+(.+)$", match.group(1), flags=re.MULTILINE)]
 
 
 class GhcrWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.workflow = load_workflow(PUBLISH_WORKFLOW)
-        self.raw = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+        self.raw = _text(PUBLISH_WORKFLOW)
 
     def test_single_publish_workflow_exists(self) -> None:
         publish_workflows = [path for path in WORKFLOWS if path.name == "publish-container.yml"]
         self.assertEqual(len(publish_workflows), 1)
 
     def test_only_trigger_is_workflow_dispatch(self) -> None:
-        on = self.workflow["on"]
-        self.assertEqual(set(on), {"workflow_dispatch"})
-        forbidden = {
+        on_block = _block_after(self.raw, "on:")
+        trigger_names = []
+        for line in on_block.splitlines():
+            stripped = line.strip()
+            if stripped.endswith(":") and line.startswith("  ") and not line.startswith("    "):
+                trigger_names.append(stripped[:-1])
+        self.assertEqual(trigger_names, ["workflow_dispatch"])
+        forbidden = [
             "pull_request",
             "pull_request_target",
             "push",
@@ -61,37 +64,41 @@ class GhcrWorkflowTests(unittest.TestCase):
             "workflow_call",
             "workflow_run",
             "repository_dispatch",
-        }
-        self.assertFalse(forbidden & set(on))
+        ]
+        for name in forbidden:
+            self.assertNotIn(f"{name}:", on_block)
 
     def test_runner_and_environment_contract(self) -> None:
-        job = self.workflow["jobs"]["publish"]
-        self.assertEqual(job["runs-on"], ["self-hosted", "Windows", "X64", "pharaon-publisher"])
-        self.assertEqual(job["environment"], "ghcr-publish")
-        self.assertNotIn("ubuntu-latest", self.raw)
-        self.assertNotIn("windows-latest", self.raw)
-        self.assertNotIn("macos-latest", self.raw)
+        labels = _list_after(self.raw, "runs-on:")
+        self.assertEqual(labels, ["self-hosted", "Windows", "X64", "pharaon-publisher"])
+        self.assertIn("environment: ghcr-publish", self.raw)
+        for hosted in ["ubuntu-latest", "windows-latest", "macos-latest"]:
+            self.assertNotIn(hosted, self.raw)
         self.assertNotIn("matrix", self.raw)
         self.assertNotIn("inputs.runner", self.raw)
 
     def test_permissions_are_least_privilege(self) -> None:
-        top = self.workflow["permissions"]
-        job = self.workflow["jobs"]["publish"]["permissions"]
-        self.assertEqual(top, {"contents": "read", "packages": "write"})
-        self.assertEqual(job, {"contents": "read", "packages": "write"})
+        pre_jobs = self.raw.split("jobs:")[0]
+        permissions = _block_after(pre_jobs, "permissions:")
+        self.assertIn("contents: read", permissions)
+        self.assertIn("packages: write", permissions)
         self.assertNotIn("id-token", self.raw)
         self.assertNotIn("write-all", self.raw)
         self.assertNotIn("PAT", self.raw)
 
     def test_inputs_and_preflight_requirements(self) -> None:
-        inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]
-        confirm = inputs["confirm_publish"]
-        self.assertTrue(confirm["required"])
-        self.assertNotIn("default", confirm)
-        self.assertEqual(confirm["type"], "string")
-        self.assertTrue(inputs["expected_sha"]["required"])
-        self.assertEqual(inputs["expected_sha"]["type"], "string")
-        self.assertEqual(inputs["release_tag"]["default"], "")
+        confirm = _block_after(self.raw, "confirm_publish:")
+        self.assertIn("required: true", confirm)
+        self.assertNotIn("default:", confirm)
+        self.assertIn("type: string", confirm)
+
+        expected = _block_after(self.raw, "expected_sha:")
+        self.assertIn("required: true", expected)
+        self.assertIn("type: string", expected)
+
+        release = _block_after(self.raw, "release_tag:")
+        self.assertIn('default: ""', release)
+        self.assertIn("required: false", release)
 
         for required_text in [
             "confirm_publish must be exactly PUBLISH",
@@ -121,13 +128,13 @@ class GhcrWorkflowTests(unittest.TestCase):
 
     def test_every_uses_reference_is_pinned_full_sha_and_allowlisted(self) -> None:
         for path in WORKFLOWS:
-            text = path.read_text(encoding="utf-8")
+            text = _text(path)
             for match in re.finditer(r"uses:\s*([^\s#]+)(?:\s*#\s*v?\S+)?", text):
                 ref = match.group(1)
                 action, _, suffix = ref.rpartition("@")
                 self.assertIn(action, ALLOWED_ACTIONS, f"{path}: disallowed action {action}")
                 self.assertRegex(suffix, ACTION_SHA, f"{path}: {ref} is not a full SHA pin")
-                self.assertIn("# v", text[match.start() : match.end()])
+                self.assertIn("# v", match.group(0))
 
     def test_image_tag_and_digest_contract(self) -> None:
         self.assertIn("ghcr.io/kresocts/pharaon-asset-factory", self.raw)
@@ -146,8 +153,10 @@ class GhcrWorkflowTests(unittest.TestCase):
         self.assertIn("docker --config $config manifest inspect", self.raw)
         self.assertIn("Requested tag already exists", self.raw)
         self.assertIn("Registry or authentication error", self.raw)
-        names = step_names(self.workflow)
-        self.assertLess(names.index("Refuse existing requested tags"), names.index("Build and push immutable container"))
+        self.assertLess(
+            self.raw.index("Refuse existing requested tags"),
+            self.raw.index("Build and push immutable container"),
+        )
 
     def test_docker_credential_isolation_and_cleanup(self) -> None:
         self.assertIn("RUNNER_TEMP", self.raw)
@@ -159,13 +168,17 @@ class GhcrWorkflowTests(unittest.TestCase):
         self.assertNotIn("$env:USERPROFILE\\.docker", self.raw)
 
     def test_timeout_concurrency_and_preflight_ordering(self) -> None:
-        job = self.workflow["jobs"]["publish"]
-        self.assertEqual(job["timeout-minutes"], 180)
-        self.assertEqual(job["concurrency"]["cancel-in-progress"], False)
+        self.assertRegex(self.raw, r"timeout-minutes:\s*180")
+        self.assertIn("cancel-in-progress: false", self.raw)
         self.assertIn("ghcr-publish-pharaon-asset-factory", self.raw)
-        names = step_names(self.workflow)
-        self.assertLess(names.index("Docker and D-drive preflight"), names.index("Authenticate to GHCR with temporary Docker config"))
-        self.assertLess(names.index("Docker and D-drive preflight"), names.index("Build and push immutable container"))
+        self.assertLess(
+            self.raw.index("Docker and D-drive preflight"),
+            self.raw.index("Authenticate to GHCR with temporary Docker config"),
+        )
+        self.assertLess(
+            self.raw.index("Docker and D-drive preflight"),
+            self.raw.index("Build and push immutable container"),
+        )
         self.assertIn("D:\\actions-runner", self.raw)
         self.assertIn("MIN_DISK_FREE_GIB", self.raw)
         self.assertNotIn("prune", self.raw.lower())
