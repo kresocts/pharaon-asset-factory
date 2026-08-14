@@ -42,6 +42,7 @@ jobs:
       DOCKERFILE: docker/Dockerfile
       BUILD_CONTEXT: .
       PLATFORM: linux/amd64
+      PUBLISHER_SCRIPT: scripts/publisher/publisher.ps1
       DOCKER_CONFIG_NAME: ghcr-docker-config-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
@@ -128,6 +129,20 @@ jobs:
           }
           Write-Host "Checkout verified."
 
+      - name: Load verified publisher script and revalidate tags
+        shell: pwsh
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publisherScript = Join-Path $env:GITHUB_WORKSPACE $env:PUBLISHER_SCRIPT
+          . $publisherScript
+
+          Assert-PublisherShaTag -Sha $env:GITHUB_SHA
+          Assert-PublisherReleaseTag -ReleaseTag $env:RELEASE_TAG
+          Write-Host "Shared publisher tag validation passed after checkout."
+
       - name: Docker and D-drive preflight
         shell: pwsh
         run: |
@@ -164,9 +179,10 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = "Stop"
-          $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
-          New-Item -ItemType Directory -Path $config | Out-Null
+          $publisherScript = Join-Path $env:GITHUB_WORKSPACE $env:PUBLISHER_SCRIPT
+          . $publisherScript
 
+          $config = New-PublisherTemporaryDockerConfig -BasePath $env:RUNNER_TEMP -Name $env:DOCKER_CONFIG_NAME
           $env:GHCR_TOKEN | docker --config $config login ghcr.io `
             --username $env:GHCR_USERNAME `
             --password-stdin
@@ -183,42 +199,16 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = "Stop"
+          $publisherScript = Join-Path $env:GITHUB_WORKSPACE $env:PUBLISHER_SCRIPT
+          . $publisherScript
           $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
-          $tags = @("sha-$env:GITHUB_SHA")
+
+          $tagNames = @("sha-$env:GITHUB_SHA")
           if ($env:RELEASE_TAG) {
-            $tags += $env:RELEASE_TAG
+            $tagNames += $env:RELEASE_TAG
           }
 
-          foreach ($tag in $tags) {
-            $ref = "$env:IMAGE`:$tag"
-            $inspectOutput = & docker --config $config manifest inspect $ref 2>&1
-            $exitCode = $LASTEXITCODE
-            $text = ($inspectOutput -join "`n")
-
-            if ($exitCode -eq 0) {
-              throw "Requested tag already exists and publication is refused: $tag"
-            }
-            $absenceSignals = @(
-              "MANIFEST_UNKNOWN",
-              "NAME_UNKNOWN",
-              "manifest unknown",
-              "no such manifest"
-            )
-
-            $isAbsent = $false
-            foreach ($signal in $absenceSignals) {
-              if ($text -match [regex]::Escape($signal)) {
-                $isAbsent = $true
-                break
-              }
-            }
-
-            if (-not $isAbsent) {
-              throw "Registry or authentication error while checking tag $tag. Refusing to continue."
-            }
-
-            Write-Host "Requested tag is not present: $tag"
-          }
+          Assert-PublisherTagsAbsent -DockerConfig $config -Image $env:IMAGE -Tags $tagNames
 
       - name: Build and push immutable container
         shell: pwsh
@@ -227,38 +217,30 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           $ErrorActionPreference = "Stop"
+          $publisherScript = Join-Path $env:GITHUB_WORKSPACE $env:PUBLISHER_SCRIPT
+          . $publisherScript
           $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
           $shaTag = "sha-$env:GITHUB_SHA"
           $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { $shaTag }
-          $tags = @("$env:IMAGE`:$shaTag")
-          if ($env:RELEASE_TAG) {
-            $tags += "$env:IMAGE`:$env:RELEASE_TAG"
-          }
-
-          $tagArgs = @()
-          foreach ($tag in $tags) {
-            $tagArgs += "--tag"
-            $tagArgs += $tag
-          }
-
           $metadataFile = Join-Path $env:RUNNER_TEMP "build-metadata.json"
 
-          docker --config $config buildx build `
-            --file $env:DOCKERFILE `
-            --platform $env:PLATFORM `
-            --provenance=false `
-            --sbom=false `
-            --label "org.opencontainers.image.source=https://github.com/kresocts/pharaon-asset-factory" `
-            --label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
-            --label "org.opencontainers.image.version=$version" `
-            --label "org.opencontainers.image.description=Pharaon Asset Factory reproducible GPU worker" `
-            --metadata-file $metadataFile `
-            --push `
-            @tagArgs `
-            $env:BUILD_CONTEXT
-          if ($LASTEXITCODE -ne 0) {
-            throw "Docker Buildx push failed."
+          $labels = @{
+            "org.opencontainers.image.source" = "https://github.com/kresocts/pharaon-asset-factory"
+            "org.opencontainers.image.revision" = $env:GITHUB_SHA
+            "org.opencontainers.image.version" = $version
+            "org.opencontainers.image.description" = "Pharaon Asset Factory reproducible GPU worker"
           }
+
+          Invoke-PublisherBuildxBuild `
+            -DockerConfig $config `
+            -Dockerfile $env:DOCKERFILE `
+            -Platform $env:PLATFORM `
+            -Context $env:BUILD_CONTEXT `
+            -Image $env:IMAGE `
+            -Sha $env:GITHUB_SHA `
+            -ReleaseTag $env:RELEASE_TAG `
+            -Labels $labels `
+            -MetadataFile $metadataFile
 
       - name: Verify pushed digest and requested tags
         shell: pwsh
@@ -267,95 +249,20 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           $ErrorActionPreference = "Stop"
+          $publisherScript = Join-Path $env:GITHUB_WORKSPACE $env:PUBLISHER_SCRIPT
+          . $publisherScript
           $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
           $metadataFile = Join-Path $env:RUNNER_TEMP "build-metadata.json"
-          if (-not (Test-Path -LiteralPath $metadataFile)) {
-            throw "Buildx metadata file was not produced."
-          }
 
-          $metadata = Get-Content -LiteralPath $metadataFile -Raw | ConvertFrom-Json
-          $digest = $metadata."containerimage.digest"
-          if (-not $digest -or $digest -notmatch "^sha256:[0-9a-f]{64}$") {
-            throw "Buildx metadata did not contain a valid sha256 digest."
-          }
+          $digest = Read-PublisherBuildMetadataDigest -MetadataFile $metadataFile
+          Assert-PublisherPushedDigest `
+            -DockerConfig $config `
+            -Image $env:IMAGE `
+            -Sha $env:GITHUB_SHA `
+            -ReleaseTag $env:RELEASE_TAG `
+            -Digest $digest
 
-          function Get-ImageInspection {
-            param(
-              [string]$Config,
-              [string]$Reference
-            )
-
-            $output = & docker --config $Config buildx imagetools inspect $Reference --format "{{json .}}" 2>$null
-            if ($LASTEXITCODE -ne 0) {
-              throw "Buildx imagetools inspect failed for $Reference."
-            }
-            $json = ($output -join "`n").Trim()
-            if (-not $json) {
-              throw "Buildx imagetools inspect returned no output for $Reference."
-            }
-            try {
-              return ($json | ConvertFrom-Json)
-            }
-            catch {
-              throw "Buildx imagetools inspect returned malformed JSON for $Reference."
-            }
-          }
-
-          function Assert-LinuxAmd64 {
-            param(
-              $Inspection,
-              [string]$Label
-            )
-
-            $verified = $false
-
-            if ($null -ne $Inspection.manifest -and $Inspection.manifest.PSObject.Properties.Name -contains "manifests") {
-              $platformManifests = @($Inspection.manifest.manifests)
-              if ($platformManifests.Count -ne 1) {
-                throw "$Label does not contain exactly one Linux AMD64 platform manifest."
-              }
-              $platform = $platformManifests[0].platform
-              if ($null -eq $platform -or $platform.os -ne "linux" -or $platform.architecture -ne "amd64") {
-                throw "$Label is not verified as Linux AMD64 from manifest platforms."
-              }
-              $verified = $true
-            }
-
-            if ($null -ne $Inspection.image) {
-              $imageOs = $Inspection.image.os
-              $imageArch = $Inspection.image.architecture
-              if ($null -ne $imageOs -and $null -ne $imageArch) {
-                if ($imageOs -ne "linux" -or $imageArch -ne "amd64") {
-                  throw "$Label is not verified as Linux AMD64 from image config."
-                }
-                $verified = $true
-              }
-            }
-
-            if (-not $verified) {
-              throw "$Label could not be verified as Linux AMD64 from supported inspection output."
-            }
-          }
-
-          $shaRef = "$env:IMAGE`:sha-$env:GITHUB_SHA"
-          $shaInspection = Get-ImageInspection -Config $config -Reference $shaRef
-          $shaManifestDigest = $shaInspection.manifest.digest
-          if (-not $shaManifestDigest -or $shaManifestDigest -ne $digest) {
-            throw "Pushed SHA tag does not resolve to the captured digest."
-          }
-          Assert-LinuxAmd64 -Inspection $shaInspection -Label "SHA tag"
-
-          if ($env:RELEASE_TAG) {
-            $releaseRef = "$env:IMAGE`:$env:RELEASE_TAG"
-            $releaseInspection = Get-ImageInspection -Config $config -Reference $releaseRef
-            $releaseManifestDigest = $releaseInspection.manifest.digest
-            if (-not $releaseManifestDigest -or $releaseManifestDigest -ne $digest) {
-              throw "Optional release tag does not resolve to the captured digest."
-            }
-            Assert-LinuxAmd64 -Inspection $releaseInspection -Label "Release tag"
-          }
-
-          $digestQualified = "$env:IMAGE@$digest"
+          $digestQualified = Get-PublisherDigestQualifiedReference -Image $env:IMAGE -Digest $digest
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Published image: $digestQualified"
           Write-Host "Digest verification passed: $digestQualified"
 
