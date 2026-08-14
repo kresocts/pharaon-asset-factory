@@ -16,7 +16,7 @@ dependencies: []
 priority: 1
 ---
 
-# T-0001 — Example ticket
+# T-0001 Ã¢â‚¬â€ Example ticket
 
 ## Goal
 Goal.
@@ -89,6 +89,7 @@ class RepositoryTests(unittest.TestCase):
                 "T-0013",
                 "T-0014",
                 "T-0015",
+                "T-0016",
             },
         )
 

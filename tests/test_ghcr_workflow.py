@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish-container.yml"
+PUBLISHER_SCRIPT = ROOT / "scripts" / "publisher" / "publisher.ps1"
 ALLOWED_ACTIONS = {"actions/checkout", "actions/setup-python"}
 ACTION_SHA = re.compile(r"^[0-9a-f]{40}$")
 PINNED_ACTIONS = {
@@ -36,7 +37,7 @@ WORKFLOWS = discover_workflows()
 
 
 def _text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8-sig")
 
 
 def _release_tag_allowed(tag: str) -> bool:
@@ -87,6 +88,7 @@ def _list_after(raw: str, marker: str) -> list[str]:
 class GhcrWorkflowTests(unittest.TestCase):
     def setUp(self) -> None:
         self.raw = _text(PUBLISH_WORKFLOW)
+        self.publisher = _text(PUBLISHER_SCRIPT)
 
     def _assert_action_policy(self, paths: list[Path]) -> None:
         uses_pattern = re.compile(r"uses:\s*([^\s#]+)(?:\s*#\s*(.*?))?\s*$")
@@ -169,15 +171,18 @@ class GhcrWorkflowTests(unittest.TestCase):
             "Publication is refused for repository",
             "Publication is refused for ref",
             "github.sha is not a full 40-character lowercase hex SHA",
-            "release_tag must be an immutable version such as v1.0.0 or v1.2.3-rc.1",
+            "Assert-PublisherShaTag",
+            "Assert-PublisherReleaseTag",
         ]:
             self.assertIn(required_text, self.raw)
 
     def test_release_tag_policy(self) -> None:
-        self.assertIn("$releaseTag -cmatch \"^v(0|[1-9][0-9]*)", self.raw)
-        self.assertNotRegex(self.raw, r"\+\[0-9a-z")
-        self.assertNotIn("$segments", self.raw)
-        self.assertNotIn("$mutable", self.raw)
+        self.assertIn("function Test-PublisherReleaseTag", self.publisher)
+        self.assertIn("$ReleaseTag -cmatch \"^v(0|[1-9][0-9]*)", self.publisher)
+        self.assertNotRegex(self.publisher, r"\+\[0-9a-z")
+        self.assertNotIn("$segments", self.publisher)
+        self.assertNotIn("$mutable", self.publisher)
+        self.assertIn("Assert-PublisherReleaseTag -ReleaseTag $releaseTag", self.raw)
 
     def test_release_tag_grammar_adversarial(self) -> None:
         valid = [
@@ -254,35 +259,41 @@ class GhcrWorkflowTests(unittest.TestCase):
 
     def test_image_tag_and_digest_contract(self) -> None:
         self.assertIn("ghcr.io/kresocts/pharaon-asset-factory", self.raw)
-        self.assertIn('"sha-$env:GITHUB_SHA"', self.raw)
-        self.assertIn('"$env:IMAGE`:sha-$env:GITHUB_SHA"', self.raw)
+        self.assertIn("PUBLISHER_SCRIPT: scripts/publisher/publisher.ps1", self.raw)
+        self.assertIn("Invoke-PublisherBuildxBuild", self.raw)
+        self.assertIn("Read-PublisherBuildMetadataDigest", self.raw)
+        self.assertIn("Assert-PublisherPushedDigest", self.raw)
+        self.assertIn("Get-PublisherDigestQualifiedReference", self.raw)
         self.assertNotIn(":latest", self.raw)
         self.assertIn("org.opencontainers.image.source", self.raw)
         self.assertIn("org.opencontainers.image.revision", self.raw)
         self.assertIn("org.opencontainers.image.version", self.raw)
         self.assertIn("org.opencontainers.image.description", self.raw)
-        self.assertIn("containerimage.digest", self.raw)
+        self.assertIn("containerimage.digest", self.publisher)
         self.assertIn("GITHUB_STEP_SUMMARY", self.raw)
         self.assertNotIn("{{.Digest}}", self.raw)
         self.assertNotIn("{{json .Platforms}}", self.raw)
-        self.assertIn('--format "{{json .}}"', self.raw)
-        self.assertIn("ConvertFrom-Json", self.raw)
-        self.assertIn(".manifest.digest", self.raw)
-        self.assertIn(".image.architecture", self.raw)
-        self.assertIn(".image.os", self.raw)
-        self.assertIn("platform.architecture", self.raw)
-        self.assertIn("platform.os", self.raw)
-        self.assertIn("$shaManifestDigest -ne $digest", self.raw)
-        self.assertIn("$releaseManifestDigest -ne $digest", self.raw)
+        self.assertIn('"--format"', self.publisher)
+        self.assertIn('"{{json .}}"', self.publisher)
+        self.assertIn("ConvertFrom-Json", self.publisher)
+        self.assertIn(".manifest.digest", self.publisher)
+        self.assertIn(".image.architecture", self.publisher)
+        self.assertIn(".image.os", self.publisher)
+        self.assertIn("platform.architecture", self.publisher)
+        self.assertIn("platform.os", self.publisher)
+        self.assertIn("$shaManifestDigest -ne $Digest", self.publisher)
+        self.assertIn("$releaseManifestDigest -ne $Digest", self.publisher)
+        self.assertIn('"${Image}:sha-${Sha}"', self.publisher)
 
     def test_existing_tag_refusal_and_fail_closed_registry_checks(self) -> None:
         self.assertIn("Refuse existing requested tags", self.raw)
-        self.assertIn("docker --config $config manifest inspect", self.raw)
-        self.assertIn("Requested tag already exists", self.raw)
-        self.assertIn("Registry or authentication error", self.raw)
-        self.assertIn("$absenceSignals = @(", self.raw)
-        self.assertIn("foreach ($signal in $absenceSignals)", self.raw)
-        self.assertNotIn('"not found"', self.raw)
+        self.assertIn("Assert-PublisherTagsAbsent", self.raw)
+        self.assertIn("function Test-PublisherRegistryTagState", self.publisher)
+        self.assertIn("Requested tag already exists", self.publisher)
+        self.assertIn("Registry or authentication error", self.publisher)
+        self.assertIn("$absenceSignals = @(", self.publisher)
+        self.assertIn("foreach ($signal in $absenceSignals)", self.publisher)
+        self.assertNotIn('"not found"', self.publisher)
         self.assertLess(
             self.raw.index("Refuse existing requested tags"),
             self.raw.index("Build and push immutable container"),
@@ -290,7 +301,7 @@ class GhcrWorkflowTests(unittest.TestCase):
 
     def test_registry_absence_classifier_is_strict(self) -> None:
         for signal in REGISTRY_ABSENCE_SIGNALS:
-            self.assertIn(signal, self.raw)
+            self.assertIn(signal, self.publisher)
 
         accepted = [
             "MANIFEST_UNKNOWN",
@@ -317,11 +328,13 @@ class GhcrWorkflowTests(unittest.TestCase):
     def test_docker_credential_isolation_and_cleanup(self) -> None:
         self.assertIn("RUNNER_TEMP", self.raw)
         self.assertIn("DOCKER_CONFIG_NAME", self.raw)
+        self.assertIn("New-PublisherTemporaryDockerConfig", self.raw)
         self.assertIn("--password-stdin", self.raw)
         self.assertIn("if: always()", self.raw)
         self.assertIn("docker --config $config logout ghcr.io", self.raw)
         self.assertIn("Remove-Item -LiteralPath $config -Recurse -Force", self.raw)
         self.assertNotIn("$env:USERPROFILE\\.docker", self.raw)
+        self.assertIn("New-Item -ItemType Directory -Path $configPath", self.publisher)
 
     def test_timeout_concurrency_and_preflight_ordering(self) -> None:
         self.assertRegex(self.raw, r"timeout-minutes:\s*180")

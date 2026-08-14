@@ -183,7 +183,7 @@ for cross-platform determinism (so `A.bin` and `a.bin` are rejected as ambiguous
 file destination cannot be an ancestor of another destination, acquisition-owned
 temporary names use an underscore prefix that is not representable as a manifest
 destination, and every existing symlink in a destination ancestor below the cache
-root is rejected — including symlinks that resolve to another location inside the
+root is rejected â€” including symlinks that resolve to another location inside the
 same cache, because such internal aliases would let different namespace locks
 manipulate one physical destination. Redirects are followed only when the target still obeys the same
 policy: unsupported schemes, embedded credentials, and mutable source references are
@@ -359,10 +359,10 @@ rejects non-Linux Docker servers before login or build.
 
 ### Manual inputs
 
-- `confirm_publish` — required string. No authorizing default. Must be exactly `PUBLISH`.
-- `expected_sha` — required string. Must be exactly the current 40-character lowercase
+- `confirm_publish` â€” required string. No authorizing default. Must be exactly `PUBLISH`.
+- `expected_sha` â€” required string. Must be exactly the current 40-character lowercase
   `github.sha`.
-- `release_tag` — optional string. Empty means SHA-tag-only publication. Accepted
+- `release_tag` â€” optional string. Empty means SHA-tag-only publication. Accepted
   examples include `v1.0.0`, `v1.2.3-rc.1`, and `v2.0.0-beta.2`. The value must match a
   strict Docker-compatible immutable version grammar. Uppercase, whitespace, slashes,
   shell metacharacters, build-metadata `+` suffixes, empty/trailing prerelease
@@ -450,3 +450,58 @@ Package visibility remains a manual GitHub Packages setting and is not changed b
 workflow. T-0016 will perform local integration validation of the publishing logic.
 T-0017 will perform the first controlled GHCR publication. The implementation worker
 must not approve or merge its own pull request.
+
+## T-0016 local publisher integration validation
+
+T-0016 validates the T-0015 publisher design against a disposable official Docker
+Distribution registry bound only to `127.0.0.1`. It does not contact GHCR, start the
+self-hosted runner, or trigger `publish-container.yml`.
+
+### Exact local integration command
+
+From the repository root on a clean `ticket/T-0016-*` branch with Docker Desktop in
+Linux mode and at least 150 GiB free on drive D:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File validation/run_local_publisher_integration.ps1 -Confirmation "RUN LOCAL PUBLISHER TEST"
+```
+
+Use `-PreflightOnly` for a non-destructive environment and plan check without starting
+the registry or building:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File validation/run_local_publisher_integration.ps1 -PreflightOnly
+```
+
+### Confirmation and policy
+
+The real integration run requires the exact confirmation phrase
+`RUN LOCAL PUBLISHER TEST`; the production GHCR workflow confirmation remains
+`PUBLISH`. The disposable registry is official Docker Distribution image
+`registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373`
+and is published only to a loopback address. No insecure-registry daemon modification,
+public/LAN binding, authentication service, or persistent registry volume is used.
+
+### What it validates
+
+- shared production publisher PowerShell logic and safe native argument splatting
+- temporary Docker config isolation and unchanged normal Docker config
+- SHA-like and `v0.0.0-rc.1` tag absence before build
+- one real Buildx `linux/amd64` direct push to `127.0.0.1:<port>/pharaon-asset-factory`
+- metadata digest extraction and both-tags-to-one-digest verification
+- Linux AMD64 manifest verification
+- pull by digest and offline health/readiness/model-plan/status checks
+- existing-tag refusal without a second build
+- deterministic cleanup of only ticket-owned resources
+
+The build uses the existing local Buildx builder/cache without pruning, uses
+`--provenance=false --sbom=false`, performs no hidden retry, and does not download
+model weights. D-drive space should remain comfortably above the existing 150 GiB
+threshold; exact build duration varies with cache state. Cleanup removes the registry
+container and anonymous volume, pulled-by-digest local image, temporary Docker config,
+metadata, transcript, and the ticket-owned temporary directory. It does not prune or
+remove shared Buildx cache, unrelated images/volumes, or the owner's normal Docker
+configuration.
+
+T-0017 remains the only ticket authorized to perform the first controlled GHCR
+publication.

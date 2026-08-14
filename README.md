@@ -11,8 +11,8 @@ Phase 0 is complete. Phase 1 now includes the reproducible CUDA/Python base, pin
 The long-term pipeline is:
 
 ```text
-prompt/reference → image stage → GPU 3D worker → shape → texture
-                 → post-processing → GLB → metadata/report → ZIP
+prompt/reference â†’ image stage â†’ GPU 3D worker â†’ shape â†’ texture
+                 â†’ post-processing â†’ GLB â†’ metadata/report â†’ ZIP
 ```
 
 Control-plane coordination will use repository and GitHub state so that workers and reviewers can be short-lived and reproducible. GPU execution will eventually run in a container on ephemeral local or rented NVIDIA hardware. See [the architecture overview](architecture/overview.md) and [roadmap](PLAN.md).
@@ -32,16 +32,16 @@ They should then verify dependencies, create `ticket/T-XXXX-short-description` f
 
 ## Repository structure
 
-- `AGENTS.md` — mandatory operating contract for workers and reviewers
-- `PLAN.md` — phased roadmap
-- `architecture/` — system, security, and decision documentation
-- `tickets/` — canonical specifications and machine-readable ticket state
-- `validation/` — dependency-free repository metadata validator
-- `tests/` — validator tests
-- `worker/` — provider-neutral worker context, evidence, and Git/GitHub boundaries
+- `AGENTS.md` â€” mandatory operating contract for workers and reviewers
+- `PLAN.md` â€” phased roadmap
+- `architecture/` â€” system, security, and decision documentation
+- `tickets/` â€” canonical specifications and machine-readable ticket state
+- `validation/` â€” dependency-free repository metadata validator
+- `tests/` â€” validator tests
+- `worker/` â€” provider-neutral worker context, evidence, and Git/GitHub boundaries
 - `reviewer/` - independent review context, decision, validation, and GitHub boundaries
 - `orchestrator/` - run-once selection, claims, persisted state, dispatch boundaries, and reconciliation
-- `.github/` — issue/PR templates and minimal CI
+- `.github/` â€” issue/PR templates and minimal CI
 
 Application, container, and provider-specific directories will be introduced only by tickets that need them.
 
@@ -118,3 +118,8 @@ T-0015 defines the secure, manually triggered `publish-container.yml` workflow
 foundation for `ghcr.io/kresocts/pharaon-asset-factory`. It is not executed by T-0015;
 T-0016 will integration-test the publishing logic locally and T-0017 will perform the
 first controlled GHCR publication. See [docker/README.md](docker/README.md).
+
+T-0016 adds the local publisher integration validation. From a clean ticket branch, run
+`powershell -NoProfile -ExecutionPolicy Bypass -File validation/run_local_publisher_integration.ps1 -Confirmation "RUN LOCAL PUBLISHER TEST"`
+to validate the shared publisher logic against a disposable `127.0.0.1` registry
+without contacting GHCR or starting the self-hosted runner. See [docker/README.md](docker/README.md).
