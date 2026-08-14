@@ -21,3 +21,4 @@ Keep ADRs concise and link the relevant ticket and pull request. Do not rewrite 
 - [0005: Runtime readiness gate](0005-runtime-readiness-gate.md)
 - [0006: External model cache and controlled acquisition](0006-external-model-cache-and-controlled-acquisition.md)
 - [0007: Secure Windows GHCR publishing workflow](0007-secure-ghcr-publishing-workflow.md)
+- [0008: Deterministic shape-job contract and offline preflight](0008-deterministic-shape-job-contract.md)
