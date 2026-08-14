@@ -139,6 +139,31 @@ imports, GPU initialization, or inference. Cache verification never repairs or
 acquires missing files; acquisition remains the separately authorized `models acquire`
 command.
 
+## Production Hunyuan shape inventory
+
+T-0024 commits the first official, immutable production shape-model manifest at:
+
+```text
+model-manifests/production/hunyuan3d-2.1-shape.json
+```
+
+The manifest pins Hugging Face revision `0b94677654c57bb9a6b6845cd7b704ccf551d327`
+and lists exactly `config.yaml` (`shape-config`) and `model.fp16.ckpt`
+(`shape-weights`). The small config identity is directly hashed; the large checkpoint
+identity comes only from official immutable Hugging Face LFS metadata. The manifest is
+explicit and operator-supplied, not a hidden runtime default. Run offline:
+
+```bash
+python docker/model_cache.py plan --manifest model-manifests/production/hunyuan3d-2.1-shape.json --json
+python docker/model_cache.py status --manifest model-manifests/production/hunyuan3d-2.1-shape.json --json
+python docker/model_cache.py verify --manifest model-manifests/production/hunyuan3d-2.1-shape.json --json
+python -m asset_pipeline.cli shape preflight --job JOB --backend hunyuan3d-2.1-shape --model-manifest model-manifests/production/hunyuan3d-2.1-shape.json --json
+```
+
+Against an empty cache, `verify` and `shape preflight` report
+`MODEL_CACHE_NOT_VERIFIED`, not execution readiness. Acquisition remains separately
+authorized and byte-bounded.
+
 ## Future work
 
 This ticket does not implement production weight manifests, real model hashes,

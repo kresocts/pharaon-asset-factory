@@ -47,6 +47,19 @@ success it reports `SHAPE_MODEL_PREFLIGHT_READY`, `model_binding_supported: true
 manifest/license/provenance and Hunyuan runtime/GPU execution remain future tickets;
 no weights or inference are implemented.
 
+T-0024 adds the first official, immutable production shape-model manifest and provenance:
+
+```text
+model-manifests/production/hunyuan3d-2.1-shape.json
+model-manifests/production/hunyuan3d-2.1-shape.provenance.json
+```
+
+The manifest pins Hugging Face revision `0b94677654c57bb9a6b6845cd7b704ccf551d327`
+and lists exactly `config.yaml` and `model.fp16.ckpt`. Its offline validator is
+`validation/validate_production_shape_manifest.py`. The inventory does not authorize
+acquisition; cache population, Docker/GHCR/runner work, GPU execution, and inference
+remain future tickets.
+
 Shape generation, texture generation, post-processing, packaging, and API/server work
 remain future tickets, and Phase 2 is not complete.
 

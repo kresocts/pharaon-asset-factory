@@ -528,3 +528,30 @@ validated actual Docker CLI behavior against a disposable `127.0.0.1` registry. 
 failed T-0017 run remains recorded as failure. T-0019 completed a separately
 approved second controlled publication after T-0018 was merged and independently
 approved.
+
+
+## T-0024 production shape inventory and provenance
+
+The committed production shape manifest is:
+
+```text
+model-manifests/production/hunyuan3d-2.1-shape.json
+```
+
+It pins the official Hunyuan3D 2.1 model repository to revision
+`0b94677654c57bb9a6b6845cd7b704ccf551d327` and contains exactly:
+
+```text
+config.yaml       -> shape-config
+model.fp16.ckpt   -> shape-weights
+```
+
+`config.yaml` is a small text file whose SHA-256 was computed after bounded immutable
+retrieval. `model.fp16.ckpt` is a large checkpoint whose exact size and SHA-256 come
+only from official immutable Hugging Face LFS/Xet metadata; the weight body was never
+requested. The paired provenance file records the official source revision
+`82920d643c0dc2f7bfd7255f45f62d386edfe60c`, loader references, license/model-card
+facts, and the mandatory human-review/acquisition flags. Acquisition remains a
+separately reviewed, explicitly authorized, byte-bounded operation. No Docker
+build/push, GHCR operation, runner startup, GPU execution, or inference is performed by
+T-0024.

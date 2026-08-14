@@ -1,0 +1,83 @@
+{
+  "acquisition_authorized": false,
+  "artifact_set": "hunyuan3d-2.1-shape",
+  "file_count": 2,
+  "files": [
+    {
+      "identity_method": "small-file-direct-sha256",
+      "metadata_field": "immutable-resolve-response-bytes",
+      "path": "config.yaml",
+      "role": "shape-config",
+      "sha256": "a9e9b66f0163a9b827d730633ac88f47fcc8e3071dcbb9ee12d88ef7537c5c6e",
+      "size": 2078,
+      "url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-dit-v2-1/config.yaml"
+    },
+    {
+      "identity_method": "official-lfs-metadata",
+      "metadata_field": "siblings[].lfs.sha256",
+      "path": "model.fp16.ckpt",
+      "role": "shape-weights",
+      "sha256": "6b519fc7242f78e9b5f47ea4d55668fe3d944a2d27332f4ca68d29a6ff603f5e",
+      "size": 7366389768,
+      "url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-dit-v2-1/model.fp16.ckpt"
+    }
+  ],
+  "legal_conclusion": false,
+  "license": {
+    "acquisition_authorized": false,
+    "disabled": false,
+    "extra_gated_eu_disallowed": true,
+    "gated": false,
+    "legal_conclusion": false,
+    "license_declared": "other",
+    "license_link": "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1/blob/main/LICENSE",
+    "license_name": "tencent-hunyuan-community",
+    "license_sha256": "5bd08f93b2d280bb26ff3eed5d3996fe47a9698b5f7785163928668d7fd578c6",
+    "license_size": 17915,
+    "license_url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/LICENSE",
+    "model_card_sha256": "2905a706952c6a7716599cc76de44de82c650fd787d664b9cc013da3ef422679",
+    "model_card_size": 3998,
+    "model_card_url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/README.md",
+    "notice_sha256": "ffccf6b539a82e6084d14ff064dadd22d33384d6164b07c0c5a3141810df0350",
+    "notice_size": 16644,
+    "notice_url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/Notice.txt",
+    "operator_review_required": true,
+    "private": false
+  },
+  "manifest_path": "model-manifests/production/hunyuan3d-2.1-shape.json",
+  "manifest_plan_id": "5b6005ace3fa63b9719da75d1fc10a0793c41718e4f15666c8e527e16ff41cd8",
+  "metadata_endpoint": "https://huggingface.co/api/models/tencent/Hunyuan3D-2.1",
+  "model_repo_id": "tencent/Hunyuan3D-2.1",
+  "model_revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327",
+  "observed_at_utc": "2026-08-14T18:40:39Z",
+  "operator_review_required": true,
+  "schema_version": 1,
+  "source_code_repository": "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git",
+  "source_code_revision": "82920d643c0dc2f7bfd7255f45f62d386edfe60c",
+  "source_references": [
+    {
+      "file": "model_worker.py",
+      "lines": [
+        61,
+        62,
+        99
+      ],
+      "note": "Constructor defaults to Hunyuan3D-2.1 and hunyuan3d-dit-v2-1; calls Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path).",
+      "url": "https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/82920d643c0dc2f7bfd7255f45f62d386edfe60c/model_worker.py"
+    },
+    {
+      "file": "hunyuan3d-dit-v2-1/config.yaml",
+      "note": "The single shape config declares model, VAE, conditioner, scheduler, image processor, and pipeline targets.",
+      "sections": [
+        "model",
+        "vae",
+        "conditioner",
+        "scheduler",
+        "image_processor",
+        "pipeline"
+      ],
+      "url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-dit-v2-1/config.yaml"
+    }
+  ],
+  "total_expected_bytes": 7366391846
+}
