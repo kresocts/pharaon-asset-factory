@@ -74,6 +74,7 @@ STALE_LOCK_GRACE_SECONDS = 24 * 60 * 60
 STALE_LOCK_NO_OWNER_GRACE_SECONDS = 60.0
 MAX_MANIFEST_FILES = 1000
 MAX_PATH_COMPONENT_LENGTH = 255
+MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 
 SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -193,9 +194,40 @@ def _cache_root(environment: dict[str, str] | None = None) -> Path:
     return _absolute(Path(env.get("MODEL_CACHE_DIR", DEFAULT_CACHE_DIR)))
 
 
+def cache_root_from_environment(
+    environment: dict[str, str] | None = None,
+) -> Path:
+    """Return the configured, absolute model-cache root.
+
+    This is a small public alias needed by the asset pipeline so it does not
+    have to depend on the private ``_cache_root`` helper or duplicate the
+    ``MODEL_CACHE_DIR`` default.
+    """
+    return _cache_root(environment)
+
+
 def _is_loopback_host(host: str) -> bool:
     normalized = host.strip().lower().strip("[]")
     return normalized in {"localhost", "127.0.0.1", "::1"} or normalized.startswith("127.")
+
+
+def _reject_constant(value: str) -> Any:
+    """Refuse non-JSON constants such as NaN, Infinity, and -Infinity."""
+
+    raise ManifestValidationError(
+        f"non-finite JSON constant is not allowed: {value}"
+    )
+
+
+def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while refusing duplicate object keys."""
+
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ManifestValidationError(f"duplicate manifest object key: {key}")
+        result[key] = value
+    return result
 
 
 def _validated_components(value: str, field: str) -> list[str]:
@@ -271,13 +303,33 @@ def _validated_url(url: str) -> str:
 
 
 def _parse_manifest_file(path: Path) -> dict[str, Any]:
+    path = Path(path)
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
+        with path.open("rb") as handle:
+            data = handle.read(MAX_MANIFEST_BYTES + 1)
+    except OSError as error:
         raise ManifestValidationError(f"cannot read manifest {path}: {error}") from error
+    if len(data) > MAX_MANIFEST_BYTES:
+        raise ManifestValidationError(
+            f"manifest file exceeds the {MAX_MANIFEST_BYTES} byte limit"
+        )
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ManifestValidationError("manifest file is not valid UTF-8") from error
+    try:
+        data = json.loads(
+            text,
+            object_pairs_hook=_object_without_duplicates,
+            parse_constant=_reject_constant,
+        )
+    except ManifestValidationError as error:
+        raise error
+    except RecursionError as error:
+        raise ManifestValidationError(
+            "manifest exceeds the supported JSON nesting depth"
+        ) from error
+    except (ValueError, json.JSONDecodeError) as error:
         raise ManifestValidationError(f"manifest is not valid JSON: {error}") from error
     if not isinstance(data, dict):
         raise ManifestValidationError("manifest root must be a JSON object")
@@ -427,6 +479,16 @@ def _canonical_plan_payload(manifest: dict[str, Any]) -> dict[str, Any]:
 def _plan_id(manifest: dict[str, Any]) -> str:
     canonical = json.dumps(_canonical_plan_payload(manifest), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def manifest_plan_id(manifest: dict[str, Any]) -> str:
+    """Return the canonical plan ID for an already-parsed manifest.
+
+    This is the public alias for the same deterministic plan ID used by all
+    ``models`` commands, so the asset-pipeline binding does not duplicate the
+    canonicalization or hashing policy.
+    """
+    return _plan_id(manifest)
 
 
 def _lock_key(manifest: dict[str, Any]) -> str:
@@ -1258,14 +1320,30 @@ def run_status(args: argparse.Namespace, environment: dict[str, str]) -> dict[st
     return _success_report(report)
 
 
-def run_verify(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:
-    manifest = _read_manifest(args.manifest)
-    cache_root = _cache_root(environment)
-    entries = _collect_states(cache_root, manifest)
+def verify_manifest_cache(
+    manifest_path: str | Path,
+    cache_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Offline, read-only verification API used by the asset pipeline.
+
+    This function is the public counterpart to ``models verify``. It accepts an
+    explicit manifest path and explicit cache root, parses the manifest with
+    the same validation path as the CLI, inspects every destination using the
+    existing symlink/path/state rules, hashes regular files with the existing
+    SHA-256 implementation, and returns a fresh dictionary containing the same
+    artifact identity, state counts, byte totals, file states, and
+    success/not-verified decision as ``models verify``. It never writes,
+    creates directories or locks, cleans stale files, downloads, or opens a
+    network connection.
+    """
+
+    manifest = parse_manifest(Path(manifest_path))
+    root = _absolute(Path(cache_root)) if cache_root is not None else _cache_root()
+    entries = _collect_states(root, manifest)
     report = _base_report(
         command="verify",
         manifest=manifest,
-        cache_root=cache_root,
+        cache_root=root,
         entries=entries,
         max_bytes=None,
         network={"requests_attempted": 0, "retries": 0},
@@ -1280,6 +1358,10 @@ def run_verify(args: argparse.Namespace, environment: dict[str, str]) -> dict[st
         detail="one or more artifacts are not verified (see per-file states)",
     )
     return report
+
+
+def run_verify(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:
+    return verify_manifest_cache(args.manifest, _cache_root(environment))
 
 
 def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:

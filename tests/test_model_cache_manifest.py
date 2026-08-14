@@ -271,6 +271,91 @@ class ManifestValidationTests(unittest.TestCase):
             with self.assertRaises(module.ManifestValidationError):
                 module.parse_manifest(path)
 
+    def test_manifest_exactly_at_byte_limit_is_accepted(self):
+        raw = json.dumps(valid_manifest()).encode("utf-8")
+        if len(raw) > module.MAX_MANIFEST_BYTES:
+            self.skipTest("fixture is larger than the configured manifest limit")
+        raw = raw + b" " * (module.MAX_MANIFEST_BYTES - len(raw))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_bytes(raw)
+            manifest = module.parse_manifest(path)
+        self.assertEqual(manifest["schema_version"], 1)
+
+    def test_manifest_above_byte_limit_is_refused_before_json_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_bytes(b" " * (module.MAX_MANIFEST_BYTES + 1))
+            with self.assertRaises(module.ManifestValidationError) as raised:
+                module.parse_manifest(path)
+        self.assertIn("byte limit", str(raised.exception))
+        self.assertNotIn("Traceback", str(raised.exception))
+
+    def test_invalid_utf8_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_bytes(bytes([0xff, 0xfe, 0x00]))
+            with self.assertRaises(module.ManifestValidationError) as raised:
+                module.parse_manifest(path)
+        self.assertIn("UTF-8", str(raised.exception))
+        self.assertNotIn("Traceback", str(raised.exception))
+
+    def test_duplicate_top_level_key_is_refused(self):
+        text = (
+            '{"schema_version": 1, "schema_version": 1, '
+            '"artifact_set": "fixture-set", "revision": "v1-abcdef0123456789", '
+            '"namespace": "fixture-set/v1-abcdef0123456789", "files": []}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(module.ManifestValidationError) as raised:
+                module.parse_manifest(path)
+        self.assertIn("duplicate manifest object key", str(raised.exception))
+        self.assertNotIn("Traceback", str(raised.exception))
+
+    def test_duplicate_nested_file_key_is_refused(self):
+        text = (
+            '{"schema_version": 1, "artifact_set": "fixture-set", '
+            '"revision": "v1-abcdef0123456789", '
+            '"namespace": "fixture-set/v1-abcdef0123456789", '
+            '"files": [{"path": "a.bin", "path": "b.bin", "url": '
+            '"https://example.invalid/a.bin", "size": 1, '
+            '"sha256": "'
+            + "0" * 64
+            + '"}]}'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(module.ManifestValidationError) as raised:
+                module.parse_manifest(path)
+        self.assertIn("duplicate manifest object key", str(raised.exception))
+        self.assertNotIn("Traceback", str(raised.exception))
+
+    def test_non_finite_json_constants_are_refused(self):
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            data = valid_manifest()
+            data["files"][0]["size"] = constant
+            text = json.dumps(data).replace(f'"{constant}"', constant)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "manifest.json"
+                path.write_text(text, encoding="utf-8")
+                with self.assertRaises(module.ManifestValidationError) as raised:
+                    module.parse_manifest(path)
+            self.assertIn("non-finite", str(raised.exception))
+            self.assertNotIn("Traceback", str(raised.exception))
+
+    def test_deeply_nested_but_size_compliant_manifest_is_refused(self):
+        text = "[" * 10000 + "0" + "]" * 10000
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(module.ManifestValidationError) as raised:
+                module.parse_manifest(path)
+        self.assertIn("nesting depth", str(raised.exception))
+        self.assertNotIn("Traceback", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
