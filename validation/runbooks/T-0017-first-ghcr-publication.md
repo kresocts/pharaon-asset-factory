@@ -16,6 +16,12 @@ this runbook does not weaken them.
 7. The Stage A preparation PR is merged and the owner sends:
    `T-0017 preparation PR is merged. Continue with Stage B.`
 
+## Stage A merge procedure warning
+
+- PR #14 must be merged without changing T-0017 to DONE.
+- Do not use an automation that merges the PR and automatically marks the ticket DONE.
+- T-0017 must remain REVIEW throughout Stage B and evidence review.
+
 ## Exact no-retry rule
 
 Only one production publication attempt is allowed. If any workflow step fails, stop the
@@ -35,6 +41,90 @@ After Stage A is merged and the owner authorizes Stage B:
 7. Record `git rev-parse HEAD`.
 8. Verify the SHA is exactly 40 lowercase hexadecimal characters.
 9. Verify `HEAD == origin/main`.
+
+## Mandatory Stage B pre-dispatch preflight
+
+Run every check in this order. Any failed preflight check stops Stage B before workflow
+dispatch.
+
+1. Fetch and update `main`:
+
+   ```powershell
+   git fetch origin
+   git switch main
+   git pull --ff-only origin main
+   ```
+
+2. Verify the working tree is clean:
+
+   ```powershell
+   git status --porcelain
+   ```
+
+   Any output is a blocker.
+
+3. Capture and compare commits:
+
+   ```powershell
+   git rev-parse HEAD
+   git rev-parse origin/main
+   ```
+
+   They must be identical full 40-character lowercase SHAs.
+
+4. Verify:
+
+   - PR #14 is merged
+   - T-0017 exists on `main`
+   - T-0017 status is still `REVIEW`
+   - T-0010 through T-0016 are `DONE`
+
+5. Re-run:
+
+   ```powershell
+   python -m unittest tests.test_publisher_logic -v
+   python -m unittest tests.test_ghcr_workflow -v
+   python -m unittest discover -s tests -v
+   python validation/run_ci.py
+   python validation/validate_repository.py
+   python validation/phase0_status.py
+   git diff --check
+   ```
+
+6. Verify PowerShell 7 because the production workflow uses `shell: pwsh`:
+
+   ```powershell
+   pwsh --version
+   ```
+
+   If `pwsh` is unavailable, stop. Do not dispatch the workflow and do not silently
+   substitute Windows PowerShell 5.1.
+
+7. Verify Docker Desktop:
+
+   ```powershell
+   docker version
+   docker info --format '{{.OSType}}'
+   docker buildx version
+   ```
+
+   `OSType` must be exactly `linux`.
+
+8. Verify D-drive capacity using PowerShell and record the result:
+
+   ```powershell
+   Get-PSDrive D
+   ```
+
+   At least 150 GiB free is required.
+
+9. Verify runner `pharaon` is Offline immediately before dispatch.
+10. Inspect GitHub Actions for unexpected queued or running jobs.
+
+    Stop if any PR, fork, or unrelated workflow job could target a self-hosted Windows
+    runner or the `pharaon-publisher` labels.
+
+11. Record the exact current `main` SHA that will be supplied as `expected_sha`.
 
 ## Exact workflow inputs
 
@@ -57,6 +147,27 @@ a second run.
 The first publication is SHA-only. `release_tag` must remain empty, and no `latest`,
 `main`, `stable`, `current`, `dev`, `edge`, `nightly`, `rolling`, or `snapshot` tag may
 be requested or created.
+
+## Runner gating order
+
+Preserve this exact required order:
+
+1. Runner confirmed Offline.
+2. Check there are no unexpected self-hosted jobs.
+3. Dispatch the SHA-only workflow once.
+4. Verify the expected job is waiting for `ghcr-publish`.
+5. Confirm the runner is still Offline.
+6. Owner manually approves the environment.
+7. Verify only the expected publication job is queued for:
+   - self-hosted
+   - Windows
+   - X64
+   - pharaon-publisher
+8. Reconfirm no unexpected self-hosted job is queued.
+9. Only then instruct the owner to start `D:\actions-runner\run.cmd`.
+
+If the runner is unexpectedly Online at any point before Gate C, do not approve the
+environment and do not continue.
 
 ## Environment approval checkpoint
 

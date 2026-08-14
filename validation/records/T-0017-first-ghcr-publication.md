@@ -27,6 +27,22 @@ values.
 - Paid/cloud resources absent: [PENDING]
 - Final result: [PENDING]
 
+## Stage B pre-dispatch preflight
+
+- Executed main SHA equals origin/main: [PENDING]
+- PowerShell/pwsh version: [PENDING]
+- Docker engine OSType: [PENDING]
+- Docker version: [PENDING]
+- Buildx version: [PENDING]
+- D-drive free space before dispatch: [PENDING]
+- Runner status before dispatch: [PENDING]
+- Unexpected queued self-hosted jobs absent: [PENDING]
+- Runner status before environment approval: [PENDING]
+- Runner status before manual startup: [PENDING]
+- Exact confirm_publish value: [PENDING]
+- Exact expected_sha value: [PENDING]
+- Release tag input empty: [PENDING]
+
 ## Verification notes
 
 - Workflow conclusion: [PENDING]
