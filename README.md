@@ -123,3 +123,8 @@ T-0016 adds the local publisher integration validation. From a clean ticket bran
 `powershell -NoProfile -ExecutionPolicy Bypass -File validation/run_local_publisher_integration.ps1 -Confirmation "RUN LOCAL PUBLISHER TEST"`
 to validate the shared publisher logic against a disposable `127.0.0.1` registry
 without contacting GHCR or starting the self-hosted runner. See [docker/README.md](docker/README.md).
+
+T-0018 normalizes handled PowerShell native exit state so expected absent-tag results
+do not leave the existing-tag step in failure. The failed T-0017 run 31800647785
+remains recorded as failure; T-0019 will perform a separately approved second
+controlled publication only after T-0018 is merged and independently approved.

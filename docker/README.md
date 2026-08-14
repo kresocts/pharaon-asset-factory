@@ -505,3 +505,23 @@ configuration.
 
 T-0017 remains the only ticket authorized to perform the first controlled GHCR
 publication.
+
+## T-0018 handled PowerShell native exit-state normalization
+
+T-0017 run 31800647785 failed at the existing-tag preflight because
+`docker manifest inspect` returned non-zero for an absent tag. The shared classifier
+correctly returned `Absent`, but `$LASTEXITCODE` remained non-zero and GitHub Actions
+used that stale native exit state as the step's final exit code.
+
+`Test-PublisherRegistryTagState` now captures the native Docker exit code immediately.
+Only when that non-zero result matches the existing narrow absence allowlist does the
+explicit `Reset-PublisherLastExitCodeAfterAbsence` helper assign
+`$global:LASTEXITCODE = 0` before returning `Absent`. Existing tags and all real
+registry errors return without this normalization and remain fail-closed.
+
+T-0018 adds deterministic separate-process regression tests for expected absence,
+existing-tag refusal, real-error fail-closed behavior, and state isolation, and it
+validated actual Docker CLI behavior against a disposable `127.0.0.1` registry. The
+failed T-0017 run remains recorded as failure. T-0019 will perform a separately
+approved second controlled publication only after T-0018 is merged and independently
+approved.
