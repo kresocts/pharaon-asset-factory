@@ -44,6 +44,23 @@ class DuplicateBackendRegistrationError(ValueError):
     """Raised when a registry is constructed with duplicate backend IDs."""
 
 
+def _normalize_string_sequence(value: object, field: str) -> tuple[str, ...]:
+    """Return a fresh tuple of non-empty strings, never a caller-owned sequence."""
+
+    if isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"{field} must be a sequence of strings, not a scalar value")
+    try:
+        entries = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(f"{field} must be a sequence of strings") from exc
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError(f"{field} entries must be strings")
+        if not entry:
+            raise ValueError(f"{field} entries must not be empty")
+    return entries
+
+
 @dataclass(frozen=True, slots=True)
 class ShapeBackendDescriptor:
     """Immutable metadata for one registered shape backend."""
@@ -56,6 +73,18 @@ class ShapeBackendDescriptor:
     source_revision: str
     capabilities: tuple[str, ...]
     prerequisites: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "capabilities",
+            _normalize_string_sequence(self.capabilities, "capabilities"),
+        )
+        object.__setattr__(
+            self,
+            "prerequisites",
+            _normalize_string_sequence(self.prerequisites, "prerequisites"),
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a new JSON-compatible dictionary without exposing internals."""

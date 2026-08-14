@@ -6,6 +6,8 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -387,6 +389,108 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Traceback", stdout)
         self.assertEqual(stderr, "")
 
+
+    def test_prepare_fresh_process_does_not_import_heavy_runtime_modules(self):
+        script = r"""
+import io
+import json
+import os
+import sys
+import tempfile
+from contextlib import redirect_stdout
+from pathlib import Path
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+
+with tempfile.TemporaryDirectory() as directory:
+    base = Path(directory)
+    input_dir = base / "input"
+    output_dir = base / "output"
+    workspace_dir = base / "workspace"
+    for item in (input_dir, output_dir, workspace_dir):
+        item.mkdir()
+    (input_dir / "references").mkdir(parents=True)
+    (input_dir / "references" / "pharaoh.png").write_bytes(PNG_BYTES)
+    job = base / "job.json"
+    job.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "job_id": "pharaoh-001",
+                "reference_image": "references/pharaoh.png",
+                "seed": 12345,
+                "remove_background": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.environ["INPUT_DIR"] = str(input_dir)
+    os.environ["OUTPUT_DIR"] = str(output_dir)
+    os.environ["WORKSPACE_DIR"] = str(workspace_dir)
+
+    from asset_pipeline.cli import main
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        exit_code = main(
+            [
+                "shape",
+                "prepare",
+                "--job",
+                str(job),
+                "--backend",
+                "hunyuan3d-2.1-shape",
+                "--json",
+            ]
+        )
+    payload = json.loads(stdout.getvalue())
+    forbidden_roots = (
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "diffusers",
+        "transformers",
+        "accelerate",
+        "hunyuan3d",
+        "hy3dgen",
+        "cuda",
+        "cupy",
+    )
+    forbidden_modules = [
+        name
+        for name in sys.modules
+        if any(name == root or name.startswith(root + ".") for root in forbidden_roots)
+    ]
+    print(
+        json.dumps(
+            {
+                "exit_code": exit_code,
+                "classification": payload.get("classification"),
+                "forbidden_modules": forbidden_modules,
+            }
+        )
+    )
+    if exit_code != 0 or forbidden_modules:
+        raise SystemExit(1)
+"""
+        repo_root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertEqual(
+            payload["classification"], "SHAPE_EXECUTION_REQUEST_READY"
+        )
+        self.assertEqual(payload["forbidden_modules"], [])
 
 if __name__ == "__main__":
     unittest.main()

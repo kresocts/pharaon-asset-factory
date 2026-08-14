@@ -68,6 +68,29 @@ class BackendDescriptorTests(unittest.TestCase):
         with self.assertRaises(dataclasses.FrozenInstanceError):
             descriptor.capabilities = descriptor.capabilities + ("other",)  # type: ignore[misc]
 
+    def test_descriptor_rejects_scalar_and_invalid_entries(self):
+        cases = [
+            ("capabilities", "image-to-shape-preparation"),
+            ("capabilities", b"image-to-shape-preparation"),
+            ("prerequisites", ["", "TEST_REQUIRED"]),
+            ("prerequisites", [1]),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                kwargs = {
+                    "schema_version": 1,
+                    "backend_id": "test-shape",
+                    "stage": "shape",
+                    "implementation": "test",
+                    "source_repository": "https://example.invalid/repo",
+                    "source_revision": "a" * 40,
+                    "capabilities": ("test",),
+                    "prerequisites": ("TEST_REQUIRED",),
+                }
+                kwargs[field] = value
+                with self.assertRaises(ValueError):
+                    backends.ShapeBackendDescriptor(**kwargs)
+
 
 class BackendRegistryTests(unittest.TestCase):
     def test_default_registry_has_deterministic_order(self):
@@ -139,8 +162,34 @@ class BackendRegistryTests(unittest.TestCase):
             ("image-to-shape-preparation",),
         )
 
+    def test_mutable_source_lists_are_normalized_and_not_retained(self):
+        capabilities = ["image-to-shape-preparation"]
+        prerequisites = ["TEST_REQUIRED"]
+        descriptor = backends.ShapeBackendDescriptor(
+            schema_version=1,
+            backend_id="test-shape",
+            stage="shape",
+            implementation="test",
+            source_repository="https://example.invalid/repo",
+            source_revision="a" * 40,
+            capabilities=capabilities,
+            prerequisites=prerequisites,
+        )
+        registry = backends.ShapeBackendRegistry((descriptor,))
+        capabilities.append("mutated")
+        prerequisites.append("mutated")
+
+        self.assertEqual(descriptor.capabilities, ("image-to-shape-preparation",))
+        self.assertEqual(descriptor.prerequisites, ("TEST_REQUIRED",))
+        self.assertEqual(
+            registry.resolve("test-shape").capabilities,
+            ("image-to-shape-preparation",),
+        )
+        self.assertEqual(
+            registry.resolve("test-shape").prerequisites,
+            ("TEST_REQUIRED",),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

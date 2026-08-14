@@ -51,4 +51,3 @@ Creating a production model manifest or fixture weights in application code woul
 blur preparation with acquisition and was rejected as out of scope.
 
 Related ticket: T-0022.
-
