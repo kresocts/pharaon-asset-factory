@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -281,6 +282,95 @@ class LockTests(unittest.TestCase):
         )
         self.assertEqual(module._lock_key(first), module._lock_key(second))
         self.assertNotEqual(module._plan_id(first), module._plan_id(second))
+
+    def _run_acquire_with_timeout(self, lock, timeout=5.0):
+        """Run acquire in a daemon thread so an infinite-loop regression fails."""
+        outcome = {}
+
+        def worker():
+            try:
+                lock.acquire()
+                outcome["result"] = "acquired"
+            except module.LockConflictError as error:
+                outcome["result"] = "conflict"
+                outcome["message"] = str(error)
+            except Exception as error:  # pragma: no cover - unexpected
+                outcome["result"] = type(error).__name__
+                outcome["message"] = str(error)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        start = time.perf_counter()
+        thread.start()
+        thread.join(timeout)
+        elapsed = time.perf_counter() - start
+        self.assertFalse(thread.is_alive(), "acquire must terminate within the bounded wait")
+        return outcome, elapsed
+
+    def test_unremovable_stale_owner_path_is_bounded(self):
+        lock_dir = self._lock_dir()
+        lock_dir.mkdir(parents=True)
+        owner = lock_dir / "owner.json"
+        owner.mkdir()  # owner.json as a directory is unremovable without recursion
+        old = time.time() - module.STALE_LOCK_GRACE_SECONDS - 60
+        os.utime(lock_dir, (old, old))
+        os.utime(owner, (old, old))
+        fake_time = {"now": 0.0}
+        sleep_calls = {"count": 0}
+
+        def fake_monotonic():
+            return fake_time["now"]
+
+        def fake_sleep(_):
+            sleep_calls["count"] += 1
+            fake_time["now"] += module.LOCK_POLL_INTERVAL
+
+        with (
+            mock.patch.object(module, "LOCK_WAIT_SECONDS", 0.3),
+            mock.patch.object(module.time, "monotonic", side_effect=fake_monotonic),
+            mock.patch.object(module.time, "sleep", side_effect=fake_sleep),
+        ):
+            outcome, elapsed = self._run_acquire_with_timeout(self._lock())
+        self.assertEqual("conflict", outcome["result"])
+        self.assertIn("another process holds", outcome["message"])
+        self.assertLess(elapsed, 2.0, "acquire must return within the bounded wait")
+        self.assertGreaterEqual(sleep_calls["count"], 1, "poll sleep must occur")
+        self.assertLessEqual(sleep_calls["count"], 10, "no busy loop without polling")
+        self.assertTrue(lock_dir.is_dir(), "unremovable lock remnants must stay untouched")
+        self.assertTrue(owner.is_dir(), "owner.json directory must stay untouched")
+
+    def test_mocked_stale_break_failure_is_bounded(self):
+        lock_dir = self._lock_dir()
+        lock_dir.mkdir(parents=True)
+        owner = lock_dir / "owner.json"
+        owner.write_text(
+            json.dumps({"plan_id": "x", "pid": 99999999, "start_epoch": 0.0}),
+            encoding="utf-8",
+        )
+        old = time.time() - module.STALE_LOCK_GRACE_SECONDS - 60
+        os.utime(owner, (old, old))
+        fake_time = {"now": 0.0}
+        sleep_calls = {"count": 0}
+
+        def fake_monotonic():
+            return fake_time["now"]
+
+        def fake_sleep(_):
+            sleep_calls["count"] += 1
+            fake_time["now"] += module.LOCK_POLL_INTERVAL
+
+        with (
+            mock.patch.object(module, "LOCK_WAIT_SECONDS", 0.3),
+            mock.patch.object(module._ArtifactLock, "_break_stale", return_value=False),
+            mock.patch.object(module.time, "monotonic", side_effect=fake_monotonic),
+            mock.patch.object(module.time, "sleep", side_effect=fake_sleep),
+        ):
+            outcome, elapsed = self._run_acquire_with_timeout(self._lock())
+        self.assertEqual("conflict", outcome["result"])
+        self.assertLess(elapsed, 2.0)
+        self.assertGreaterEqual(sleep_calls["count"], 1)
+        self.assertLessEqual(sleep_calls["count"], 10)
+        self.assertTrue(lock_dir.is_dir())
+        self.assertTrue(owner.is_file())
 
 
 if __name__ == "__main__":

@@ -290,8 +290,11 @@ and `LOCK_CONFLICT` classification, preserving the full manifest and cache conte
 response. Stale locks are
 handled conservatively: a lock is broken only when its owner metadata is older than 24
 hours AND the recorded owner process is no longer alive; an active lock is never broken.
-The lock holder refreshes the owner heartbeat during long downloads and removes the
-lock on completion.
+If a stale lock cannot actually be removed (for example an unremovable `owner.json`
+entry), acquisition keeps polling against the bounded wait and returns `LOCK_CONFLICT`
+when it expires; it never busy-loops, never follows owner-metadata symlinks, and never
+removes directories recursively. The lock holder refreshes the owner heartbeat during
+long downloads and removes the lock on completion.
 
 ### JSON and exit-code contract
 

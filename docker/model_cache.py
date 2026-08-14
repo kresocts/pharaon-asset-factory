@@ -709,15 +709,26 @@ class _ArtifactLock:
         except OSError:
             return False
 
-    def _break_stale(self) -> None:
+    def _break_stale(self) -> bool:
+        """Attempt to remove a stale lock; True only when removal succeeded.
+
+        Owner metadata is unlinked without following symlinks, and directories
+        are never removed recursively. Any failure leaves the lock remnants
+        intact and reports False so the caller can keep polling against the
+        bounded deadline instead of busy-looping.
+        """
         if not self.lock_dir.is_dir():
-            return
+            return False
         try:
-            if self.owner_path.exists():
+            if self.owner_path.is_symlink() or self.owner_path.is_file():
                 self.owner_path.unlink()
+        except OSError:
+            return False
+        try:
             self.lock_dir.rmdir()
         except OSError:
-            pass
+            return False
+        return not self.lock_dir.exists()
 
     def acquire(self) -> None:
         self._validate_lock_root()
@@ -729,8 +740,11 @@ class _ArtifactLock:
                 os.mkdir(self.lock_dir)
                 break
             except FileExistsError:
-                if self._stale(self.lock_dir):
-                    self._break_stale()
+                # Retry creation immediately only when the stale lock was
+                # actually removed. An unremovable stale lock (for example an
+                # owner.json directory) keeps polling against the bounded
+                # deadline and fails with LOCK_CONFLICT when it expires.
+                if self._stale(self.lock_dir) and self._break_stale():
                     continue
                 if time.monotonic() >= deadline:
                     raise LockConflictError(
