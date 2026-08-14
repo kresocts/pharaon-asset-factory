@@ -111,13 +111,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         document = read_job_document(args.job)
-    except ContractError as exc:
-        return _emit_expected_error(exc, json_mode)
-
-    try:
         roots = load_runtime_roots()
         plan = build_plan(document, roots)
-    except (RuntimeRootError, InputPolicyError, SafePathError) as exc:
+    except (
+        ContractError,
+        RuntimeRootError,
+        InputPolicyError,
+        SafePathError,
+    ) as exc:
         return _emit_expected_error(exc, json_mode)
     except Exception as exc:  # pragma: no cover - defensive unexpected boundary
         return _emit_unexpected_error(exc, json_mode)

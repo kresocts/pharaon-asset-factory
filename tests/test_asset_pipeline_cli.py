@@ -194,5 +194,32 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Traceback", stderr)
 
 
+    def test_deeply_nested_json_returns_invalid_document_without_traceback(self):
+        self._write_job("[" * 10000 + "0" + "]" * 10000)
+        code, stdout, stderr = self._run(
+            ["shape", "plan", "--job", str(self.job_path), "--json"]
+        )
+        self.assertEqual(code, 2)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["status"], "INVALID")
+        self.assertEqual(payload["classification"], "INVALID_JOB_DOCUMENT")
+        self.assertIn("nesting depth", payload["message"])
+        self.assertEqual(stderr, "")
+        self.assertNotIn("Traceback", stdout)
+
+    def test_unexpected_read_job_document_error_is_sanitized(self):
+        with mock.patch(
+            "asset_pipeline.cli.read_job_document",
+            side_effect=RuntimeError("secret read details"),
+        ):
+            code, stdout, stderr = self._run(
+                ["shape", "plan", "--job", str(self.job_path), "--json"]
+            )
+        self.assertEqual(code, 70)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["classification"], "INTERNAL_ERROR")
+        self.assertNotIn("secret read details", stdout)
+        self.assertNotIn("Traceback", stderr)
+
 if __name__ == "__main__":
     unittest.main()

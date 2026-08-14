@@ -192,5 +192,14 @@ class ContractTests(unittest.TestCase):
             contract.read_job_document("missing-job.json")
 
 
+    def test_deeply_nested_json_below_limit_raises_decode_error(self):
+        payload = "[" * 10000 + "0" + "]" * 10000
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "job.json"
+            path.write_text(payload, encoding="utf-8")
+            with self.assertRaises(contract.JobDocumentDecodeError) as caught:
+                contract.read_job_document(path)
+        self.assertIn("nesting depth", str(caught.exception))
+
 if __name__ == "__main__":
     unittest.main()

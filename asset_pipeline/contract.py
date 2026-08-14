@@ -217,6 +217,10 @@ def read_job_document(job_path: str | Path) -> Dict[str, Any]:
         )
     except (DuplicateKeyError,) as exc:
         raise exc
+    except RecursionError as exc:
+        raise JobDocumentDecodeError(
+            "job file exceeds the supported JSON nesting depth"
+        ) from exc
     except (ValueError, json.JSONDecodeError) as exc:
         raise JobDocumentDecodeError(f"job file is not valid JSON: {exc}") from exc
 
