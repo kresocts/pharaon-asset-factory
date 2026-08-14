@@ -6,6 +6,20 @@ Pharaon Asset Factory is the foundation for a future reproducible AI game-asset 
 
 Phase 0 is complete. Phase 1 is complete as the reproducible CUDA/Python base, pinned PyTorch and Hunyuan3D dependencies, and compiled Hunyuan native rasterizer/mesh-painter extensions for CUDA architectures 8.6 and 8.9. CPU-safe diagnostics distinguish native readiness from full inference readiness; model weights, inference, GPU provisioning, and a web interface remain intentionally absent. The container exposes a canonical `ready` command (docker run --rm IMAGE ready --profile cpu --json, or --profile native-gpu with GPU passthrough) that returns a versioned, machine-readable pre-weights runtime readiness decision. It also exposes a canonical external model-cache command (`models plan|status|acquire|verify`) with a versioned artifact-manifest schema, offline planning/status/verification, explicit download authorization, hard byte limits, streamed and integrity-verified acquisition, and concurrency locking; all T-0014 validation uses tiny local fixtures and downloads no real model weights. See [the GPU image guide](docker/README.md).
 
+## Phase 2 contract/preflight foundation
+
+T-0021 introduces the first Phase 2 asset-worker foundation: a deterministic, offline
+shape-job contract and preflight planner. Run:
+
+```bash
+python -m asset_pipeline.cli shape plan --job path/to/job.json --json
+```
+
+The command validates and normalizes one reference-image job and emits a
+machine-readable plan. It does not download model weights or run Hunyuan inference.
+Shape generation, texture generation, post-processing, packaging, and API/server work
+remain future tickets, and Phase 2 is not complete.
+
 ## Intended architecture
 
 The long-term pipeline is:
