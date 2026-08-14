@@ -111,3 +111,10 @@ endless loop. See [the orchestrator contract](orchestrator/README.md).
 ## Security and cost control
 
 Secrets never belong in Git. Future cloud operations must use least-privilege credentials, explicit user approval, bounded retries, price/runtime/job limits, secure artifact retrieval, and automatic teardown. No paid resource is created by the current repository. See `architecture/security.md`.
+
+## GHCR publishing foundation
+
+T-0015 defines the secure, manually triggered `publish-container.yml` workflow
+foundation for `ghcr.io/kresocts/pharaon-asset-factory`. It is not executed by T-0015;
+T-0016 will integration-test the publishing logic locally and T-0017 will perform the
+first controlled GHCR publication. See [docker/README.md](docker/README.md).

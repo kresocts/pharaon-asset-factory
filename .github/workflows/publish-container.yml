@@ -1,0 +1,315 @@
+name: Publish container to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_publish:
+        description: "Type PUBLISH exactly to authorize publication."
+        required: true
+        type: string
+      expected_sha:
+        description: "Exact 40-character lowercase git SHA that is expected to be published."
+        required: true
+        type: string
+      release_tag:
+        description: "Optional immutable release tag, for example v1.0.0 or v1.2.3-rc.1. Empty publishes only the SHA tag."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Publish immutable container
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+      - pharaon-publisher
+    environment: ghcr-publish
+    timeout-minutes: 180
+    concurrency:
+      group: ghcr-publish-pharaon-asset-factory
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/kresocts/pharaon-asset-factory
+      DOCKERFILE: docker/Dockerfile
+      BUILD_CONTEXT: .
+      PLATFORM: linux/amd64
+      MIN_DISK_FREE_GIB: 150
+      DOCKER_CONFIG_NAME: ghcr-docker-config-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Trusted-context preflight
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          CONFIRM_PUBLISH: ${{ inputs.confirm_publish }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:EVENT_NAME -ne "workflow_dispatch") {
+            throw "Publication is only allowed from workflow_dispatch."
+          }
+          if ($env:REPOSITORY -ne "kresocts/pharaon-asset-factory") {
+            throw "Publication is refused for repository $env:REPOSITORY."
+          }
+          if ($env:REF -ne "refs/heads/main") {
+            throw "Publication is refused for ref $env:REF."
+          }
+          if ($env:SHA -notmatch "^[0-9a-f]{40}$") {
+            throw "github.sha is not a full 40-character lowercase hex SHA."
+          }
+          if ($env:EXPECTED_SHA -ne $env:SHA) {
+            throw "expected_sha does not exactly match github.sha."
+          }
+          if ($env:CONFIRM_PUBLISH -ne "PUBLISH") {
+            throw "confirm_publish must be exactly PUBLISH."
+          }
+          if ($env:RUNNER_OS -ne "Windows") {
+            throw "Publication requires a Windows self-hosted runner."
+          }
+
+          $mutable = @(
+            "latest", "stable", "current", "main", "master",
+            "dev", "edge", "nightly", "rolling", "snapshot"
+          )
+          $releaseTag = $env:RELEASE_TAG
+          if ($releaseTag -ne "") {
+            if ($releaseTag.Length -gt 128) {
+              throw "release_tag is excessively long."
+            }
+            if ($releaseTag -match "\s") {
+              throw "release_tag contains whitespace."
+            }
+            if ($releaseTag.Contains("/")) {
+              throw "release_tag contains a slash."
+            }
+            if ($releaseTag.ToLowerInvariant() -cne $releaseTag) {
+              throw "release_tag contains uppercase characters."
+            }
+            if ($releaseTag -match '[&|;<>$]') {
+              throw "release_tag contains shell metacharacters."
+            }
+            if ($releaseTag -cmatch "^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9a-z][0-9a-z.-]*)?(\+[0-9a-z][0-9a-z.-]*)?$") {
+              $segments = $releaseTag.Substring(1) -split "[+.-]"
+              foreach ($segment in $segments) {
+                if ($mutable -contains $segment.ToLowerInvariant()) {
+                  throw "release_tag contains mutable segment $segment."
+                }
+              }
+            }
+            else {
+              throw "release_tag must be an immutable version such as v1.0.0 or v1.2.3-rc.1."
+            }
+          }
+
+          Write-Host "Trusted-context preflight passed."
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+
+      - name: Verify checked-out commit and clean tree
+        shell: pwsh
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:EXPECTED_SHA) {
+            throw "Checkout HEAD $head does not match expected SHA $env:EXPECTED_SHA."
+          }
+          $dirty = git status --porcelain
+          if ($dirty) {
+            throw "Working tree is not clean after checkout."
+          }
+          Write-Host "Checkout verified."
+
+      - name: Docker and D-drive preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dockerOsLines = & docker info --format "{{.OSType}}" 2>$null
+          $dockerOs = ($dockerOsLines -join "").Trim()
+          if ($LASTEXITCODE -ne 0 -or $dockerOs -ne "linux") {
+            throw "Docker server is unreachable or OSType is not linux."
+          }
+
+          & docker buildx version | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker Buildx is not available."
+          }
+
+          if (-not (Test-Path -LiteralPath "D:\actions-runner")) {
+            throw "D:\actions-runner does not exist."
+          }
+
+          $drive = Get-PSDrive -Name D
+          if (-not $drive -or $drive.Free -lt ($env:MIN_DISK_FREE_GIB * 1GB)) {
+            throw "D drive does not have at least $env:MIN_DISK_FREE_GIB GiB free."
+          }
+
+          Write-Host "Docker Linux engine and D-drive preflight passed."
+
+      - name: Authenticate to GHCR with temporary Docker config
+        shell: pwsh
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
+          New-Item -ItemType Directory -Path $config | Out-Null
+
+          $env:GHCR_TOKEN | docker --config $config login ghcr.io `
+            --username $env:GHCR_USERNAME `
+            --password-stdin
+          if ($LASTEXITCODE -ne 0) {
+            throw "GHCR login failed."
+          }
+
+          Write-Host "GHCR login completed using temporary Docker config."
+
+      - name: Refuse existing requested tags
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
+          $tags = @("sha-$env:GITHUB_SHA")
+          if ($env:RELEASE_TAG) {
+            $tags += $env:RELEASE_TAG
+          }
+
+          foreach ($tag in $tags) {
+            $ref = "$env:IMAGE`:$tag"
+            $inspectOutput = & docker --config $config manifest inspect $ref 2>&1
+            $exitCode = $LASTEXITCODE
+            $text = ($inspectOutput -join "`n")
+
+            if ($exitCode -eq 0) {
+              throw "Requested tag already exists and publication is refused: $tag"
+            }
+            if ($text -notmatch "no such manifest|manifest unknown|not found|NAME_UNKNOWN|MANIFEST_UNKNOWN") {
+              throw "Registry or authentication error while checking tag $tag. Refusing to continue."
+            }
+
+            Write-Host "Requested tag is not present: $tag"
+          }
+
+      - name: Build and push immutable container
+        shell: pwsh
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
+          $shaTag = "sha-$env:GITHUB_SHA"
+          $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { $shaTag }
+          $tags = @("$env:IMAGE`:$shaTag")
+          if ($env:RELEASE_TAG) {
+            $tags += "$env:IMAGE`:$env:RELEASE_TAG"
+          }
+
+          $tagArgs = @()
+          foreach ($tag in $tags) {
+            $tagArgs += "--tag"
+            $tagArgs += $tag
+          }
+
+          $metadataFile = Join-Path $env:RUNNER_TEMP "build-metadata.json"
+
+          docker --config $config buildx build `
+            --file $env:DOCKERFILE `
+            --platform $env:PLATFORM `
+            --provenance=false `
+            --sbom=false `
+            --label "org.opencontainers.image.source=https://github.com/kresocts/pharaon-asset-factory" `
+            --label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
+            --label "org.opencontainers.image.version=$version" `
+            --label "org.opencontainers.image.description=Pharaon Asset Factory reproducible GPU worker" `
+            --metadata-file $metadataFile `
+            --push `
+            @tagArgs `
+            $env:BUILD_CONTEXT
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker Buildx push failed."
+          }
+
+      - name: Verify pushed digest and requested tags
+        shell: pwsh
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
+          $metadataFile = Join-Path $env:RUNNER_TEMP "build-metadata.json"
+          if (-not (Test-Path -LiteralPath $metadataFile)) {
+            throw "Buildx metadata file was not produced."
+          }
+
+          $metadata = Get-Content -LiteralPath $metadataFile -Raw | ConvertFrom-Json
+          $digest = $metadata."containerimage.digest"
+          if (-not $digest -or $digest -notmatch "^sha256:[0-9a-f]{64}$") {
+            throw "Buildx metadata did not contain a valid sha256 digest."
+          }
+
+          $shaRef = "$env:IMAGE`:sha-$env:GITHUB_SHA"
+          $shaDigest = (& docker --config $config buildx imagetools inspect $shaRef --format "{{.Digest}}" 2>$null | Select-Object -Last 1).Trim()
+          if ($LASTEXITCODE -ne 0 -or $shaDigest -ne $digest) {
+            throw "Pushed SHA tag does not resolve to the captured digest."
+          }
+
+          $platformJson = (& docker --config $config buildx imagetools inspect $shaRef --format "{{json .Platforms}}" 2>$null | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0 -or $platformJson -notmatch "linux/amd64") {
+            throw "Pushed image is not verified as Linux AMD64."
+          }
+
+          if ($env:RELEASE_TAG) {
+            $releaseRef = "$env:IMAGE`:$env:RELEASE_TAG"
+            $releaseDigest = (& docker --config $config buildx imagetools inspect $releaseRef --format "{{.Digest}}" 2>$null | Select-Object -Last 1).Trim()
+            if ($LASTEXITCODE -ne 0 -or $releaseDigest -ne $digest) {
+              throw "Optional release tag does not resolve to the captured digest."
+            }
+          }
+
+          $digestQualified = "$env:IMAGE@$digest"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "Published image: $digestQualified"
+          Write-Host "Digest verification passed: $digestQualified"
+
+      - name: Cleanup temporary Docker credentials and metadata
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+          $config = Join-Path $env:RUNNER_TEMP $env:DOCKER_CONFIG_NAME
+          if (Test-Path -LiteralPath $config) {
+            docker --config $config logout ghcr.io
+            Remove-Item -LiteralPath $config -Recurse -Force
+          }
+
+          $metadataFile = Join-Path $env:RUNNER_TEMP "build-metadata.json"
+          if (Test-Path -LiteralPath $metadataFile) {
+            Remove-Item -LiteralPath $metadataFile -Force
+          }

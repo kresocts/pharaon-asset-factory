@@ -325,3 +325,111 @@ All T-0014 validation uses tiny deterministic fixtures served by a local HTTP se
 that counts requests; total fixture transfers stay below 5 MiB. No production Hunyuan
 manifests, model URLs, or checksums are included in T-0014, and no real weights or
 checkpoints are downloaded.
+
+## T-0015 GHCR publishing workflow foundation
+
+T-0015 adds `.github/workflows/publish-container.yml`, a secure, manually triggered
+foundation for publishing the reproducible GPU worker image to
+`ghcr.io/kresocts/pharaon-asset-factory`. The workflow is not executed by T-0015.
+
+### Purpose and boundary
+
+The workflow defines the publishing path for the image built by `docker/Dockerfile`.
+It does not start the self-hosted runner, perform Docker login, build or push an image,
+run a local registry, or contact GHCR during T-0015. T-0016 will integration-test the
+publishing logic locally, and T-0017 will perform the first controlled GHCR
+publication.
+
+### Runner and environment
+
+The job runs only on the dedicated self-hosted runner with labels:
+
+- `self-hosted`
+- `Windows`
+- `X64`
+- `pharaon-publisher`
+
+The runner is installed at `D:\actions-runner`, is not a service, and is offline by
+default. Do not start `run.cmd` as part of T-0015. The workflow uses the protected
+`ghcr-publish` environment, which is restricted to `main` with a required reviewer and
+no administrator bypass.
+
+The Windows host must expose Docker Desktop with the Linux engine; the publishing job
+rejects non-Linux Docker servers before login or build.
+
+### Manual inputs
+
+- `confirm_publish` — required string. No authorizing default. Must be exactly `PUBLISH`.
+- `expected_sha` — required string. Must be exactly the current 40-character lowercase
+  `github.sha`.
+- `release_tag` — optional string. Empty means SHA-tag-only publication. Accepted
+  examples include `v1.0.0` and `v1.2.3-rc.1`. Uppercase, whitespace, slashes, shell
+  metacharacters, excessively long values, and mutable names such as `latest`, `stable`,
+  `current`, `main`, `master`, `dev`, `edge`, `nightly`, `rolling`, and `snapshot` are
+  rejected.
+
+### Trusted-context policy
+
+The first PowerShell step fails closed unless the event is `workflow_dispatch`, the
+repository is exactly `kresocts/pharaon-asset-factory`, the ref is exactly
+`refs/heads/main`, `github.sha` is a 40-character lowercase hex value,
+`expected_sha` equals `github.sha`, `confirm_publish` equals `PUBLISH`, the optional
+release tag is valid, and the runner OS is Windows. Inputs are passed through
+environment variables rather than embedded directly into PowerShell source.
+
+### Image and tag policy
+
+The image is fixed to `ghcr.io/kresocts/pharaon-asset-factory`. Every publication
+generates the immutable tag `sha-<full-github-sha>`. An optional validated release tag
+points to the same future digest. `latest`, `main`, `stable`, `dev`, and other rolling
+tags are never published. The workflow inputs cannot change the registry, owner, image
+name, Dockerfile, build context, platform, or runner.
+
+### Existing-tag refusal
+
+Before Buildx starts, the workflow inspects the required SHA tag and any optional
+release tag through the temporary Docker config. If either tag already exists, the job
+fails and reports the conflicting tag. Registry or authentication errors also fail
+closed. There is no force/overwrite input. Registry preflight plus the non-cancelling
+concurrency group reduce but cannot make registry tag creation fully atomic.
+
+### Permissions and credentials
+
+The workflow permissions are limited to `contents: read` and `packages: write`. Docker
+authentication uses only `secrets.GITHUB_TOKEN` and `--password-stdin`. A unique
+temporary Docker config directory is created under `RUNNER_TEMP`; the default user
+Docker config is never used. The token is never echoed. An `if: always()` cleanup step
+logs out through the temporary config and removes only that config and job metadata; it
+does not delete images, caches, or unrelated files.
+
+### Docker and disk preflight
+
+Before login or build, the workflow checks that Docker is reachable, `docker info`
+reports `OSType=linux`, Buildx is available, `D:\actions-runner` exists, and the D
+drive has at least 150 GiB free. On insufficient capacity it fails clearly without
+logging in, building, pruning, or selecting another runner. No Docker prune command is
+used.
+
+### Timeout, concurrency, and action pinning
+
+The job has a finite 180-minute timeout and a deterministic publication concurrency
+group with `cancel-in-progress: false`. Every `uses:` reference in every repository
+workflow is pinned to a verified full 40-character commit SHA; only allowlisted
+official `actions/*` actions are used.
+
+### Build and digest verification
+
+The future Buildx command uses the repository root as context, `docker/Dockerfile`,
+`linux/amd64`, direct registry push, `provenance=false`, `sbom=false`, no multi-platform
+build, no GHA persistent cache export, no build secrets, no model credentials, and no
+GH token as a build argument. OCI labels record source, revision, version, and
+description. Post-push steps capture the pushed `sha256` digest, inspect the SHA tag
+remotely, verify Linux AMD64, verify any optional release tag resolves to the same
+digest, and write the digest-qualified reference to the job summary.
+
+### Package visibility and follow-up
+
+Package visibility remains a manual GitHub Packages setting and is not changed by this
+workflow. T-0016 will perform local integration validation of the publishing logic.
+T-0017 will perform the first controlled GHCR publication. The implementation worker
+must not approve or merge its own pull request.
