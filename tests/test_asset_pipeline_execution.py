@@ -212,6 +212,16 @@ class PreflightEnvelopeTests(unittest.TestCase):
         self.assertTrue(first["cache_verification"]["fully_cached"])
         self.assertNotIn("url", json.dumps(first["model_binding"]))
 
+    def test_preflight_refuses_mismatched_binding_and_verification(self):
+        binding = self._binding()
+        verification = self._verification()
+        verification["plan_id"] = "9" * 64
+        with self.assertRaises(models.ModelCacheVerificationError) as raised:
+            execution.build_preflight_envelope(
+                self.document, self.plan, self.backend, binding, verification
+            )
+        self.assertIn("plan_id", str(raised.exception))
+
     def test_preflight_emitted_dictionaries_are_defensive(self):
         binding = self._binding()
         envelope = execution.build_preflight_envelope(

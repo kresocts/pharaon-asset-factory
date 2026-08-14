@@ -15,7 +15,7 @@ from .models import (
     ModelBindingError,
     ModelCacheVerificationError,
     ModelManifestError,
-    bind_model_manifest,
+    bind_parsed_model_manifest,
 )
 from docker import model_cache
 from .paths import (
@@ -223,13 +223,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.shape_command == "preflight":
             backend = DEFAULT_REGISTRY.resolve(args.backend)
             cache_root = model_cache.cache_root_from_environment()
-            binding = bind_model_manifest(
-                args.model_manifest,
+            try:
+                manifest = model_cache.parse_manifest(args.model_manifest)
+            except model_cache.ManifestValidationError as error:
+                raise ModelManifestError(str(error)) from error
+            binding = bind_parsed_model_manifest(
+                manifest,
                 backend_id=backend.backend_id,
                 cache_root=cache_root,
             )
-            verification = model_cache.verify_manifest_cache(
-                args.model_manifest, cache_root
+            verification = model_cache.verify_parsed_manifest_cache(
+                manifest, cache_root
             )
             if not verification["fully_cached"]:
                 raise ModelCacheVerificationError(

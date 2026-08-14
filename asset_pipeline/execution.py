@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .backends import ShapeBackendDescriptor
-from .models import ModelBinding, verification_summary
+from .models import (
+    ModelBinding,
+    assert_binding_matches_verification,
+    verification_summary,
+)
 
 
 EXECUTION_REQUEST_SCHEMA_VERSION = 1
@@ -122,6 +126,7 @@ def build_preflight_envelope(
     model manifest is bound and the external cache is fully verified.
     """
 
+    assert_binding_matches_verification(binding, verification)
     execution_request = build_execution_request(document, plan, backend)
     return {
         "schema_version": 1,

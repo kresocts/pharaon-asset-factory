@@ -182,25 +182,21 @@ class ModelBinding:
         }
 
 
-def bind_model_manifest(
-    manifest_path: str | Path,
+def bind_parsed_model_manifest(
+    manifest: Mapping[str, Any],
     *,
     backend_id: str,
     cache_root: str | Path,
 ) -> ModelBinding:
-    """Parse and bind one operator-supplied immutable Hunyuan shape manifest.
+    """Bind an already-parsed, already-validated model manifest.
 
-    The T-0014 parser is reused for the existing schema, URL, path, revision,
-    checksum, size, file-count, duplicate-destination, and ancestor-conflict
-    rules. The binding policy then applies the additional Hunyuan-specific
-    identity and URL rules. The function reads and validates only; it never
-    writes, downloads, or opens a network connection.
+    This is the canonical binding path used by ``shape preflight`` so the
+    operator-supplied manifest is parsed and validated exactly once before both
+    binding and cache verification consume the same parsed object.
     """
 
-    try:
-        manifest = model_cache.parse_manifest(Path(manifest_path))
-    except model_cache.ManifestValidationError as error:
-        raise ModelManifestError(str(error)) from error
+    if not isinstance(manifest, dict):
+        raise ModelManifestError("parsed model manifest must be a JSON object")
 
     artifact_set = manifest["artifact_set"]
     if artifact_set != CANONICAL_ARTIFACT_SET:
@@ -253,6 +249,78 @@ def bind_model_manifest(
     )
 
 
+def bind_model_manifest(
+    manifest_path: str | Path,
+    *,
+    backend_id: str,
+    cache_root: str | Path,
+) -> ModelBinding:
+    """Parse and bind one operator-supplied immutable Hunyuan shape manifest.
+
+    This path-based convenience wrapper parses and validates *manifest_path*
+    once and then delegates to :func:`bind_parsed_model_manifest`. Canonical
+    CLI preflight should call the parsed-manifest form directly after loading
+    the manifest once.
+    """
+
+    try:
+        manifest = model_cache.parse_manifest(Path(manifest_path))
+    except model_cache.ManifestValidationError as error:
+        raise ModelManifestError(str(error)) from error
+    return bind_parsed_model_manifest(
+        manifest,
+        backend_id=backend_id,
+        cache_root=cache_root,
+    )
+
+
+def assert_binding_matches_verification(
+    binding: ModelBinding,
+    verification: Mapping[str, Any],
+) -> None:
+    """Refuse success when binding and verification describe different models.
+
+    The fields checked here are the minimum canonical identity required by the
+    preflight contract. A mismatch is an internal consistency failure and must
+    never produce ``SHAPE_MODEL_PREFLIGHT_READY``.
+    """
+
+    binding_identity = {
+        "plan_id": binding.plan_id,
+        "artifact_set": binding.artifact_set,
+        "revision": binding.revision,
+        "namespace": binding.namespace,
+        "file_count": binding.file_count,
+        "total_expected_bytes": binding.total_expected_bytes,
+    }
+    verification_bytes = verification.get("bytes", {}) if isinstance(verification, dict) else {}
+    verification_identity = {
+        "plan_id": verification.get("plan_id"),
+        "artifact_set": verification.get("artifact_set"),
+        "revision": verification.get("revision"),
+        "namespace": verification.get("namespace"),
+        "file_count": verification.get("file_count"),
+        "total_expected_bytes": verification_bytes.get("total_expected"),
+    }
+    mismatches = [
+        field
+        for field in (
+            "plan_id",
+            "artifact_set",
+            "revision",
+            "namespace",
+            "file_count",
+            "total_expected_bytes",
+        )
+        if binding_identity[field] != verification_identity[field]
+    ]
+    if mismatches:
+        raise ModelCacheVerificationError(
+            "model binding identity does not match cache verification: "
+            + ", ".join(mismatches)
+        )
+
+
 def verification_summary(
     verification: Mapping[str, Any],
 ) -> dict[str, object]:
@@ -267,6 +335,9 @@ def verification_summary(
     state_counts = {str(state): int(count) for state, count in counts.items()}
     return {
         "cache_root": str(verification.get("cache_root", "")),
+        "artifact_set": str(verification.get("artifact_set", "")),
+        "revision": str(verification.get("revision", "")),
+        "namespace": str(verification.get("namespace", "")),
         "plan_id": str(verification.get("plan_id", "")),
         "file_count": int(verification.get("file_count", 0)),
         "state_counts": state_counts,

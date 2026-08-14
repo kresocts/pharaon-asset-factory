@@ -303,6 +303,16 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertEqual(api_report["bytes"], cli_report["bytes"])
         self.assertEqual(api_report["fully_cached"], False)
 
+    def test_parsed_verify_api_matches_path_based_api(self):
+        parsed = module.parse_manifest(self.fixture.manifest_path)
+        path_report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        parsed_report = module.verify_parsed_manifest_cache(
+            parsed, self.fixture.cache
+        )
+        self.assertEqual(parsed_report, path_report)
+
     def test_public_verify_api_fully_verified_cache(self):
         for name, data in self.fixture.files.items():
             target = self.fixture.target(name)

@@ -1320,24 +1320,21 @@ def run_status(args: argparse.Namespace, environment: dict[str, str]) -> dict[st
     return _success_report(report)
 
 
-def verify_manifest_cache(
-    manifest_path: str | Path,
+def verify_parsed_manifest_cache(
+    manifest: dict[str, Any],
     cache_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Offline, read-only verification API used by the asset pipeline.
+    """Offline verification for an already-parsed, already-validated manifest.
 
-    This function is the public counterpart to ``models verify``. It accepts an
-    explicit manifest path and explicit cache root, parses the manifest with
-    the same validation path as the CLI, inspects every destination using the
-    existing symlink/path/state rules, hashes regular files with the existing
-    SHA-256 implementation, and returns a fresh dictionary containing the same
-    artifact identity, state counts, byte totals, file states, and
-    success/not-verified decision as ``models verify``. It never writes,
-    creates directories or locks, cleans stale files, downloads, or opens a
-    network connection.
+    This is the low-level public read-only API used by callers that must parse
+    and validate a manifest exactly once. It inspects every destination using
+    the existing symlink/path/state rules, hashes regular files with the
+    existing SHA-256 implementation, and returns the same artifact identity,
+    state counts, byte totals, file states, and success/not-verified decision
+    as ``models verify``. It never writes, creates directories or locks, cleans
+    stale files, downloads, or opens a network connection.
     """
 
-    manifest = parse_manifest(Path(manifest_path))
     root = _absolute(Path(cache_root)) if cache_root is not None else _cache_root()
     entries = _collect_states(root, manifest)
     report = _base_report(
@@ -1358,6 +1355,21 @@ def verify_manifest_cache(
         detail="one or more artifacts are not verified (see per-file states)",
     )
     return report
+
+
+def verify_manifest_cache(
+    manifest_path: str | Path,
+    cache_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Path-based offline verification API.
+
+    This convenience wrapper parses and validates *manifest_path* once and then
+    delegates to :func:`verify_parsed_manifest_cache`. It remains compatible
+    with the existing ``models verify`` command and public API tests.
+    """
+
+    manifest = parse_manifest(Path(manifest_path))
+    return verify_parsed_manifest_cache(manifest, cache_root)
 
 
 def run_verify(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:

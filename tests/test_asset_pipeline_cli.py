@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from asset_pipeline import cli
+from docker import model_cache as model_cache_module
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
@@ -726,8 +727,8 @@ with tempfile.TemporaryDirectory() as directory:
             ("asset_pipeline.cli.load_runtime_roots", RuntimeError("root secret")),
             ("asset_pipeline.cli.build_plan", RuntimeError("plan secret")),
             ("asset_pipeline.backends.ShapeBackendRegistry.resolve", RuntimeError("backend secret")),
-            ("asset_pipeline.cli.bind_model_manifest", RuntimeError("binding secret")),
-            ("asset_pipeline.cli.model_cache.verify_manifest_cache", RuntimeError("cache secret")),
+            ("asset_pipeline.cli.bind_parsed_model_manifest", RuntimeError("binding secret")),
+            ("asset_pipeline.cli.model_cache.verify_parsed_manifest_cache", RuntimeError("cache secret")),
         ]
         for target, error in boundaries:
             with self.subTest(target=target):
@@ -940,6 +941,68 @@ if first.returncode != 0 or second.returncode != 0 or first.stdout != second.std
         self.assertEqual(payload["first_code"], 0)
         self.assertEqual(payload["second_code"], 0)
         self.assertTrue(payload["identical"])
+
+
+    def test_successful_preflight_identity_fields_agree(self):
+        self._write_model_manifest()
+        self._write_model_cache()
+        code, stdout, stderr = self._run(self._preflight_args())
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout)
+        binding = payload["model_binding"]
+        cache = payload["cache_verification"]
+        self.assertEqual(binding["plan_id"], cache["plan_id"])
+        self.assertEqual(binding["artifact_set"], cache["artifact_set"])
+        self.assertEqual(binding["revision"], cache["revision"])
+        self.assertEqual(binding["namespace"], cache["namespace"])
+        self.assertEqual(binding["file_count"], cache["file_count"])
+        self.assertEqual(
+            binding["total_expected_bytes"], cache["total_expected_bytes"]
+        )
+
+    def test_preflight_parses_manifest_exactly_once_and_uses_parsed_identity(self):
+        self._write_model_manifest()
+        self._write_model_cache()
+        data_a = self._model_manifest_data()
+        data_b = self._model_manifest_data()
+        revision_b = "b" * 40
+        data_b["revision"] = revision_b
+        data_b["namespace"] = f"hunyuan3d-2.1-shape/{revision_b}"
+        prefix_b = (
+            f"https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/{revision_b}/"
+            "hunyuan3d-dit-v2-1/"
+        )
+        for file in data_b["files"]:
+            file["url"] = prefix_b + file["path"]
+
+        plan_id_a = model_cache_module.manifest_plan_id(data_a)
+        plan_id_b = model_cache_module.manifest_plan_id(data_b)
+        original_parse = cli.model_cache.parse_manifest
+        calls = []
+
+        def parse_once(path):
+            calls.append(str(path))
+            parsed = original_parse(path)
+            Path(path).write_text(json.dumps(data_b), encoding="utf-8")
+            return parsed
+
+        with mock.patch.object(
+            cli.model_cache, "parse_manifest", side_effect=parse_once
+        ) as parse_mock:
+            code, stdout, stderr = self._run(self._preflight_args())
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(parse_mock.call_count, 1)
+        self.assertEqual(len(calls), 1)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["model_binding"]["plan_id"], plan_id_a)
+        self.assertEqual(payload["cache_verification"]["plan_id"], plan_id_a)
+        self.assertNotEqual(payload["model_binding"]["plan_id"], plan_id_b)
+        self.assertEqual(
+            payload["model_binding"]["revision"], "a" * 40
+        )
+        self.assertEqual(
+            payload["cache_verification"]["revision"], "a" * 40
+        )
 
 
 if __name__ == "__main__":
