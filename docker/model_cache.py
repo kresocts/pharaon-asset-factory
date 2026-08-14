@@ -1,0 +1,1603 @@
+#!/usr/bin/env python3
+"""Canonical external model-cache CLI for the Pharaon Asset Factory container.
+
+Subcommands (all offline except explicitly confirmed acquisition):
+
+    models plan    --manifest MANIFEST [--json]
+    models status  --manifest MANIFEST [--json]
+    models acquire --manifest MANIFEST --confirm-download --max-bytes N [--json]
+    models verify  --manifest MANIFEST [--json]
+
+The cache root is read from MODEL_CACHE_DIR and defaults to /models. Artifacts
+are written below the cache root under the manifest's validated destination
+namespace. Acquisition requires both --confirm-download and --max-bytes, never
+opens a network connection before the complete manifest is validated, the cache
+is inspected, and the byte allowance and policy limits are satisfied, streams
+each artifact into a temporary .part file on the destination filesystem, and
+promotes it to the final path only after exact size and SHA-256 verification.
+
+Exit codes:
+    0   operation succeeded
+    2   policy refusal (missing confirmation or insufficient byte allowance)
+    3   manifest validation or destination path-security failure
+    4   integrity verification failure
+    5   transport failure
+    6   lock/concurrency conflict
+    64  invalid CLI usage
+    70  internal error
+
+This module is standard-library only and performs no automatic or background
+network access.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.client
+import json
+import os
+import re
+import secrets
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+
+SCHEMA_VERSION = 1
+JSON_SCHEMA_VERSION = 1
+
+EXIT_OK = 0
+EXIT_POLICY_REFUSAL = 2
+EXIT_MANIFEST_INVALID = 3
+EXIT_INTEGRITY_FAILURE = 4
+EXIT_TRANSPORT_FAILURE = 5
+EXIT_LOCK_CONFLICT = 6
+EXIT_INVALID_USAGE = 64
+EXIT_INTERNAL_ERROR = 70
+
+DEFAULT_CACHE_DIR = "/models"
+CHUNK_SIZE = 64 * 1024
+CONNECT_TIMEOUT = 10.0
+READ_TIMEOUT = 30.0
+MAX_RETRIES = 2
+RETRY_BACKOFF_SECONDS = 1.0
+LOCK_WAIT_SECONDS = 10.0
+LOCK_POLL_INTERVAL = 0.25
+LOCK_HEARTBEAT_SECONDS = 30.0
+STALE_LOCK_GRACE_SECONDS = 24 * 60 * 60
+STALE_LOCK_NO_OWNER_GRACE_SECONDS = 60.0
+MAX_MANIFEST_FILES = 1000
+MAX_PATH_COMPONENT_LENGTH = 255
+
+SAFE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+MUTABLE_REVISION_WORDS = {"main", "latest", "master", "head"}
+MUTABLE_URL_FRAGMENTS = (
+    "/resolve/main/",
+    "/resolve/master/",
+    "/resolve/head/",
+    "/resolve/latest/",
+    "/blob/main/",
+    "/blob/master/",
+    "/blob/head/",
+    "/blob/latest/",
+    "/archive/refs/heads/",
+)
+TEST_HOSTS = {"host.docker.internal"}
+FILE_STATES = ("ABSENT", "PARTIAL", "CORRUPTED", "VERIFIED")
+USER_AGENT = "pharaon-model-cache/" + str(SCHEMA_VERSION)
+TEMP_PREFIX = "_acq-"
+TEMP_SUFFIX = ".part"
+MAX_URL_DECODE_DEPTH = 3
+REVISION_QUERY_KEYS = {"revision", "rev", "ref", "branch", "tag"}
+
+
+class ModelCacheError(Exception):
+    """Base class for expected, machine-classifiable model-cache failures."""
+
+    classification = "ERROR"
+    exit_code = EXIT_INTERNAL_ERROR
+    manifest: Any = None
+    entries: Any = None
+    stats: dict[str, int] | None = None
+    budget: Any = None
+
+
+class ManifestValidationError(ModelCacheError):
+    """Manifest is malformed or a destination violates path policy."""
+
+    classification = "MANIFEST_INVALID"
+    exit_code = EXIT_MANIFEST_INVALID
+
+
+class PolicyRefusalError(ModelCacheError):
+    """Acquisition was refused before any network or final-file activity."""
+
+    classification = "POLICY_REFUSAL"
+    exit_code = EXIT_POLICY_REFUSAL
+
+
+class IntegrityError(ModelCacheError):
+    """Downloaded or cached content failed size or SHA-256 verification."""
+
+    classification = "INTEGRITY_FAILURE"
+    exit_code = EXIT_INTEGRITY_FAILURE
+
+
+class TransportError(ModelCacheError):
+    """A network transport failure occurred after an authorized request."""
+
+    classification = "TRANSPORT_FAILURE"
+    exit_code = EXIT_TRANSPORT_FAILURE
+
+    def __init__(self, message: str, *, attempts: int = 0, retries: int = 0) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.retries = retries
+
+
+class LockConflictError(ModelCacheError):
+    """Another process holds the artifact-set lock and the wait is bounded."""
+
+    classification = "LOCK_CONFLICT"
+    exit_code = EXIT_LOCK_CONFLICT
+
+
+class LocalIOError(ModelCacheError):
+    """A local filesystem operation failed during acquisition.
+
+    Temporary-file creation, write, flush, fsync, promotion, and permission
+    failures are never retried as network/transport failures.
+    """
+
+    classification = "LOCAL_IO_FAILURE"
+    exit_code = EXIT_INTERNAL_ERROR
+
+
+class UsageError(ModelCacheError):
+    """Invalid command-line usage."""
+
+    classification = "INVALID_REQUEST"
+    exit_code = EXIT_INVALID_USAGE
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise UsageError(message)
+
+
+class _NonRetryableHttpError(TransportError):
+    """Permanent HTTP failure that must not be retried."""
+
+
+class _NetworkReadError(Exception):
+    """Wraps a transient failure while reading the HTTP response body.
+
+    Local file operations raise LocalIOError instead, so the retry boundary
+    stays limited to genuine network/HTTP/socket failures.
+    """
+
+
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _cache_root(environment: dict[str, str] | None = None) -> Path:
+    env = dict(os.environ if environment is None else environment)
+    return _absolute(Path(env.get("MODEL_CACHE_DIR", DEFAULT_CACHE_DIR)))
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower().strip("[]")
+    return normalized in {"localhost", "127.0.0.1", "::1"} or normalized.startswith("127.")
+
+
+def _validated_components(value: str, field: str) -> list[str]:
+    if not isinstance(value, str) or not value:
+        raise ManifestValidationError(f"{field} must be a non-empty string")
+    if value.startswith("/") or "\\" in value or value.startswith("~"):
+        raise ManifestValidationError(f"{field} must be a relative path: {value!r}")
+    components = value.split("/")
+    for component in components:
+        if component in ("", ".", ".."):
+            raise ManifestValidationError(f"{field} contains an invalid component: {value!r}")
+        if not SAFE_COMPONENT_RE.fullmatch(component):
+            raise ManifestValidationError(f"{field} contains an unsafe component {component!r}")
+        if len(component) > MAX_PATH_COMPONENT_LENGTH:
+            raise ManifestValidationError(f"{field} component exceeds {MAX_PATH_COMPONENT_LENGTH} characters")
+    return components
+
+
+def _recursively_decoded(value: str, subject: str) -> str:
+    """Percent-decode *value* repeatedly (bounded) with strict escapes."""
+    for _ in range(MAX_URL_DECODE_DEPTH):
+        if "%" not in value:
+            return value
+        if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+            raise ManifestValidationError(f"{subject} contains malformed percent-encoding")
+        value = urllib.parse.unquote(value, errors="replace")
+    raise ManifestValidationError(f"{subject} contains excessive percent-encoding nesting")
+
+
+def _validated_url(url: str) -> str:
+    if not isinstance(url, str) or not url:
+        raise ManifestValidationError("file url must be a non-empty string")
+    if len(url) > 2048:
+        raise ManifestValidationError("file url exceeds 2048 characters")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ManifestValidationError(f"unsupported URL scheme {parsed.scheme!r}; expected http or https")
+    if not parsed.hostname:
+        raise ManifestValidationError("file url is missing a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ManifestValidationError("file url must not contain embedded credentials")
+    host = parsed.hostname.lower()
+    if parsed.scheme == "http" and not (_is_loopback_host(host) or host in TEST_HOSTS):
+        raise ManifestValidationError(
+            "http URLs are allowed only for loopback or host.docker.internal test fixtures; production sources require https"
+        )
+    if parsed.fragment:
+        raise ManifestValidationError(
+            "file url must not contain a fragment; fragments are not sent in HTTP requests but would change plan identity"
+        )
+    # Mutable-reference checks run against the recursively percent-decoded
+    # path so single- and double-encoded forms such as /resolve/%6dain/ or
+    # /resolve/%256dain/ cannot bypass the policy.
+    path = _recursively_decoded(parsed.path, "file url path")
+    lowered_path = path.lower()
+    if any(mutable in lowered_path for mutable in MUTABLE_URL_FRAGMENTS):
+        raise ManifestValidationError("mutable source reference in URL is not allowed")
+    mutable_segments = [
+        segment for segment in path.split("/") if segment and segment.lower() in MUTABLE_REVISION_WORDS
+    ]
+    if mutable_segments:
+        raise ManifestValidationError("mutable source reference in URL is not allowed")
+    # Targeted revision-like query parameters are inspected (recursively
+    # decoded) for mutable values; other query parameters, including signed
+    # HTTPS credentials, are preserved.
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        decoded_key = _recursively_decoded(key, "file url query").lower()
+        if decoded_key in REVISION_QUERY_KEYS:
+            decoded_value = _recursively_decoded(value, "file url query")
+            if decoded_value.lower() in MUTABLE_REVISION_WORDS:
+                raise ManifestValidationError("mutable source reference in URL query is not allowed")
+    return url
+
+
+def _parse_manifest_file(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ManifestValidationError(f"cannot read manifest {path}: {error}") from error
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ManifestValidationError(f"manifest is not valid JSON: {error}") from error
+    if not isinstance(data, dict):
+        raise ManifestValidationError("manifest root must be a JSON object")
+
+    schema_version = data.get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
+        raise ManifestValidationError(
+            f"unsupported or missing schema_version; expected {SCHEMA_VERSION}"
+        )
+
+    artifact_set = data.get("artifact_set")
+    if not isinstance(artifact_set, str) or not SAFE_COMPONENT_RE.fullmatch(artifact_set):
+        raise ManifestValidationError(
+            "artifact_set must be a non-empty identifier using letters, digits, '.', '_', or '-'"
+        )
+
+    revision = data.get("revision")
+    if not isinstance(revision, str) or not revision:
+        raise ManifestValidationError("revision must be a non-empty string")
+    if revision.lower() in MUTABLE_REVISION_WORDS:
+        raise ManifestValidationError(
+            f"mutable revision {revision!r} is not allowed; use an immutable revision"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9._-]{4,128}", revision):
+        raise ManifestValidationError(
+            "revision must be an immutable identifier of 4-128 characters using letters, digits, '.', '_', or '-'"
+        )
+
+    namespace = data.get("namespace")
+    if not isinstance(namespace, str):
+        raise ManifestValidationError("namespace must be a non-empty string")
+    _validated_components(namespace, "namespace")
+
+    description = data.get("description")
+    if description is not None and (not isinstance(description, str) or len(description) > 512):
+        raise ManifestValidationError("description must be a string of at most 512 characters")
+
+    raw_files = data.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ManifestValidationError("files must be a non-empty list")
+    if len(raw_files) > MAX_MANIFEST_FILES:
+        raise ManifestValidationError(f"files exceeds the policy limit of {MAX_MANIFEST_FILES}")
+
+    files: list[dict[str, Any]] = []
+    seen_targets: set[str] = set()
+    for index, raw_file in enumerate(raw_files):
+        if not isinstance(raw_file, dict):
+            raise ManifestValidationError(f"files[{index}] must be a JSON object")
+        missing = {"path", "url", "size", "sha256"} - raw_file.keys()
+        if missing:
+            raise ManifestValidationError(f"files[{index}] is missing required fields: {', '.join(sorted(missing))}")
+        rel_path = raw_file.get("path")
+        if not isinstance(rel_path, str) or not rel_path:
+            raise ManifestValidationError(f"files[{index}].path must be a non-empty string")
+        _validated_components(rel_path, f"files[{index}].path")
+        url = _validated_url(raw_file.get("url"))
+        size = raw_file.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ManifestValidationError(f"files[{index}].size must be a positive integer")
+        sha256 = raw_file.get("sha256")
+        if not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256):
+            raise ManifestValidationError(
+                f"files[{index}].sha256 must be a 64-character lowercase hexadecimal SHA-256"
+            )
+        role = raw_file.get("role")
+        if role is not None and (not isinstance(role, str) or not role or len(role) > 128):
+            raise ManifestValidationError(f"files[{index}].role must be a non-empty string of at most 128 characters")
+        target = namespace + "/" + rel_path
+        if target in seen_targets:
+            raise ManifestValidationError(f"duplicate destination path: {target}")
+        seen_targets.add(target)
+        files.append(
+            {
+                "path": rel_path,
+                "url": url,
+                "size": size,
+                "sha256": sha256,
+                "role": role,
+            }
+        )
+
+    # Destination graph validation. Destinations are compared
+    # case-insensitively for cross-platform determinism (Windows and Linux
+    # filesystems differ), a file destination cannot be an ancestor of another
+    # destination, and acquisition-owned temporary names use a prefix that is
+    # not representable as a manifest destination so a final artifact can
+    # never be mistaken for another artifact's temporary file.
+    normalized_destinations: dict[str, str] = {}
+    for file in files:
+        target = namespace + "/" + file["path"]
+        normalized = target.lower()
+        if normalized in normalized_destinations:
+            raise ManifestValidationError(
+                f"duplicate or case-ambiguous destination path: {target!r} conflicts with "
+                f"{normalized_destinations[normalized]!r}"
+            )
+        normalized_destinations[normalized] = target
+    for normalized in sorted(normalized_destinations):
+        prefix = normalized + "/"
+        for other in sorted(normalized_destinations):
+            if other.startswith(prefix):
+                raise ManifestValidationError(
+                    f"destination {normalized_destinations[normalized]!r} is a file ancestor of "
+                    f"{normalized_destinations[other]!r}"
+                )
+
+    total_size = sum(file["size"] for file in files)
+    return {
+        "schema_version": schema_version,
+        "artifact_set": artifact_set,
+        "revision": revision,
+        "namespace": namespace,
+        "description": description,
+        "files": files,
+        "total_size": total_size,
+    }
+
+
+def parse_manifest(path: Path) -> dict[str, Any]:
+    """Parse and fully validate a model artifact manifest."""
+    return _parse_manifest_file(Path(path))
+
+
+def _canonical_plan_payload(manifest: dict[str, Any]) -> dict[str, Any]:
+    files = sorted(
+        (
+            {
+                "path": file["path"],
+                "url": file["url"],
+                "size": file["size"],
+                "sha256": file["sha256"],
+                "role": file.get("role"),
+            }
+            for file in manifest["files"]
+        ),
+        key=lambda file: file["path"],
+    )
+    return {
+        "schema_version": manifest["schema_version"],
+        "artifact_set": manifest["artifact_set"],
+        "revision": manifest["revision"],
+        "namespace": manifest["namespace"],
+        "files": files,
+    }
+
+
+def _plan_id(manifest: dict[str, Any]) -> str:
+    canonical = json.dumps(_canonical_plan_payload(manifest), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _lock_key(manifest: dict[str, Any]) -> str:
+    """Return the destination-write lock key for a manifest.
+
+    All artifacts are written below `<cache>/<namespace>/<path>`, so manifests
+    that share the first namespace component can manipulate the same final or
+    temporary paths even when their URLs, hashes, roles, or plan digests
+    differ. Locking at that granularity serializes all acquisitions with
+    potentially overlapping destinations while keeping the key a validated,
+    safe filesystem component.
+    """
+    return manifest["namespace"].split("/", 1)[0]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _target_path(cache_root: Path, manifest: dict[str, Any], rel_path: str) -> Path:
+    return _absolute(cache_root) / manifest["namespace"] / rel_path
+
+
+def _temp_path(target: Path, token: str) -> Path:
+    """Return the acquisition-owned temporary path for *target*.
+
+    The name uses a leading underscore, which is not representable as a valid
+    manifest destination component, so a final artifact can never collide with
+    or be mistaken for another artifact's temporary file. The file is created
+    with O_EXCL/O_NOFOLLOW on the same filesystem as the final destination.
+    """
+    return target.parent / f"{TEMP_PREFIX}{token}{TEMP_SUFFIX}"
+
+
+def _file_state(target: Path, expected_size: int, expected_sha256: str) -> dict[str, Any]:
+    if target.is_symlink():
+        return {"state": "CORRUPTED", "detail": "final path is a symlink"}
+    if target.exists():
+        if not target.is_file():
+            return {"state": "CORRUPTED", "detail": "final path is not a regular file"}
+        actual_size = target.stat().st_size
+        if actual_size != expected_size:
+            return {
+                "state": "CORRUPTED",
+                "detail": f"size mismatch: expected {expected_size} bytes, found {actual_size}",
+            }
+        if _sha256_file(target) != expected_sha256:
+            return {"state": "CORRUPTED", "detail": "SHA-256 mismatch"}
+        if target.parent.is_dir():
+            unsafe_reserved = [
+                path
+                for path in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}")
+                if path.is_symlink() or not path.is_file()
+            ]
+            if unsafe_reserved:
+                return {"state": "CORRUPTED", "detail": "reserved temporary path is unsafe"}
+        return {"state": "VERIFIED", "detail": None}
+    if target.parent.is_dir():
+        temps = list(target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"))
+        if temps:
+            unsafe = [path for path in temps if path.is_symlink() or not path.is_file()]
+            if unsafe:
+                return {
+                    "state": "CORRUPTED",
+                    "detail": "reserved temporary path is unsafe",
+                }
+            return {"state": "PARTIAL", "detail": "incomplete acquisition temporary file present"}
+    return {"state": "ABSENT", "detail": None}
+
+
+def _symlink_escape_detail(cache_root: Path, target: Path) -> str | None:
+    """Return a description when *target* uses an unsafe symlinked ancestor.
+
+    Every existing symlink in the destination ancestor components below the
+    configured cache root is rejected, whether it resolves outside the cache
+    (escape) or to another location inside the cache (internal alias). The
+    cache root itself may be a mount point or symlink; only descendant
+    components are inspected. The final path itself is handled by the caller
+    so a final symlink can be reported distinctly.
+    """
+    root = _absolute(cache_root)
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return f"destination escapes the model cache: {target} is outside {root}"
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            real = Path(os.path.realpath(current))
+            try:
+                real.relative_to(root)
+            except ValueError:
+                return (
+                    f"destination passes through a symlink that escapes the cache: "
+                    f"{current} -> {real}"
+                )
+            return (
+                f"destination passes through an aliased symlink inside the cache: "
+                f"{current} -> {real}"
+            )
+    return None
+
+
+def _collect_states(cache_root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for file in manifest["files"]:
+        target = _target_path(cache_root, manifest, file["path"])
+        issue = _symlink_escape_detail(cache_root, target)
+        if issue is not None:
+            state = {"state": "CORRUPTED", "detail": issue}
+        else:
+            state = _file_state(target, file["size"], file["sha256"])
+        entries.append(
+            {
+                "path": file["path"],
+                "url": file["url"],
+                "expected_size": file["size"],
+                "sha256": file["sha256"],
+                "role": file.get("role"),
+                "target": str(target),
+                "state": state["state"],
+                "detail": state["detail"],
+            }
+        )
+    return entries
+
+
+def _count_states(entries: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {state: 0 for state in FILE_STATES}
+    for entry in entries:
+        counts[entry["state"]] += 1
+    return counts
+
+
+def _validate_destination(cache_root: Path, manifest: dict[str, Any], rel_path: str) -> Path:
+    root = _absolute(cache_root)
+    target = root / manifest["namespace"] / rel_path
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise ManifestValidationError(
+            f"destination escapes the model cache: {target} is outside {root}"
+        ) from error
+    issue = _symlink_escape_detail(root, target)
+    if issue is not None:
+        raise ManifestValidationError(issue)
+    if target.is_symlink():
+        raise ManifestValidationError(f"destination is an existing symlink: {target}")
+    if target.exists() and not target.is_file():
+        raise ManifestValidationError(f"destination exists and is not a regular file: {target}")
+    return target
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Conservative Windows liveness probe using only the standard library.
+
+    Opens the process with limited query rights and checks whether its exit
+    code is STILL_ACTIVE (259). A process that cannot be opened is treated as
+    dead; an unexpected query failure is treated conservatively as alive.
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong)
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+class _ArtifactLock:
+    """Per-destination lock stored under the external cache root.
+
+    The lock key is the first validated namespace component, so manifests that
+    can write overlapping destination paths serialize even when their URLs,
+    hashes, roles, or plan digests differ. Acquisition uses atomic directory
+    creation and writes a unique unpredictable owner token into owner.json.
+    touch() and release() act only while owner.json still contains this
+    object's token, so a replaced lock generation is never touched. Automatic
+    stale-lock removal is disabled: any existing lock (stale or not) is left
+    untouched, acquisition polls against the bounded wait and returns
+    LOCK_CONFLICT, and stale locks are removed manually by an operator after
+    confirming no active acquisition.
+    """
+
+    def __init__(self, cache_root: Path, lock_key: str, plan_id: str) -> None:
+        self.cache_root = _absolute(cache_root)
+        self.lock_root = self.cache_root / ".locks"
+        self.lock_key = lock_key
+        self.lock_dir = self.lock_root / lock_key
+        self.owner_path = self.lock_dir / "owner.json"
+        self.owner_token = secrets.token_hex(16)
+        self.owner = {
+            "lock_key": lock_key,
+            "plan_id": plan_id,
+            "owner_token": self.owner_token,
+            "pid": os.getpid(),
+            "start_epoch": time.time(),
+        }
+
+    def _validate_lock_root(self) -> None:
+        """Ensure the lock root cannot escape the configured cache root.
+
+        An existing `.locks` symlink, a non-directory `.locks` path, or a lock
+        root that resolves outside the resolved cache root is refused with a
+        stable path-policy failure before any lock or owner metadata is
+        created.
+        """
+        real_root = Path(os.path.realpath(self.cache_root))
+        if self.lock_root.is_symlink():
+            raise ManifestValidationError(f"lock root is a symlink: {self.lock_root}")
+        if self.lock_root.exists() and not self.lock_root.is_dir():
+            raise ManifestValidationError(
+                f"lock root exists and is not a directory: {self.lock_root}"
+            )
+        try:
+            self.lock_root.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise LockConflictError(
+                f"cannot create lock root {self.lock_root}: {error}"
+            ) from error
+        try:
+            Path(os.path.realpath(self.lock_root)).relative_to(real_root)
+        except ValueError as error:
+            raise ManifestValidationError(
+                f"lock root escapes the model cache: {self.lock_root} resolves outside {real_root}"
+            ) from error
+
+    def _owns_lock(self) -> bool:
+        """Return True only while owner.json belongs to this acquisition.
+
+        Owner metadata is read without following symlinks, and the comparison
+        is based on the unique owner token, never on PID or path identity
+        alone.
+        """
+        try:
+            if self.owner_path.is_symlink() or not self.owner_path.is_file():
+                return False
+            owner = json.loads(self.owner_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return isinstance(owner, dict) and owner.get("owner_token") == self.owner_token
+
+    def _cleanup_created_lock(self) -> None:
+        """Remove the lock directory this object just created (no owner yet)."""
+        try:
+            self.lock_dir.rmdir()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _owner_alive(pid: int) -> bool:
+        """Return whether *pid* is still running.
+
+        POSIX uses os.kill(pid, 0). On Windows os.kill does not act as a
+        liveness probe (signal 0 maps to a console Ctrl+C event), so a
+        conservative ctypes-based probe is used there instead.
+        """
+        if os.name == "nt":
+            return _windows_pid_alive(pid)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    @classmethod
+    def _stale(cls, lock_dir: Path) -> bool:
+        owner_path = lock_dir / "owner.json"
+        try:
+            if owner_path.exists():
+                age = time.time() - owner_path.stat().st_mtime
+                if age < STALE_LOCK_GRACE_SECONDS:
+                    return False
+                try:
+                    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                    pid = int(owner.get("pid", -1))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pid = -1
+                if pid > 0 and cls._owner_alive(pid):
+                    return False
+                return True
+            return time.time() - lock_dir.stat().st_mtime > STALE_LOCK_NO_OWNER_GRACE_SECONDS
+        except OSError:
+            return False
+
+    def acquire(self) -> None:
+        self._validate_lock_root()
+        if self.lock_dir.is_symlink():
+            raise ManifestValidationError(f"lock directory is a symlink: {self.lock_dir}")
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                os.mkdir(self.lock_dir)
+                break
+            except FileExistsError:
+                # Automatic stale-lock removal is disabled: an existing lock
+                # generation is never deleted (not even a stale one), so an
+                # active replacement can never be destroyed by a stale
+                # observer. Acquisition polls against the bounded deadline and
+                # fails with LOCK_CONFLICT.
+                if time.monotonic() >= deadline:
+                    stale_hint = ""
+                    if self._stale(self.lock_dir):
+                        stale_hint = (
+                            "; existing lock appears stale; stale lock removal "
+                            "is a manual operator action"
+                        )
+                    raise LockConflictError(
+                        f"another process holds the artifact-set lock {self.lock_dir.name}; "
+                        f"waited {LOCK_WAIT_SECONDS:g}s without success{stale_hint}"
+                    )
+                time.sleep(LOCK_POLL_INTERVAL)
+            except OSError as error:
+                raise LockConflictError(
+                    f"cannot create artifact-set lock {self.lock_dir}: {error}"
+                ) from error
+        try:
+            Path(os.path.realpath(self.lock_dir)).relative_to(
+                Path(os.path.realpath(self.cache_root))
+            )
+        except ValueError as error:
+            self._cleanup_created_lock()
+            raise ManifestValidationError(
+                f"lock directory escapes the model cache: {self.lock_dir}"
+            ) from error
+        if self.owner_path.is_symlink():
+            self._cleanup_created_lock()
+            raise ManifestValidationError(
+                f"lock owner metadata is a symlink: {self.owner_path}"
+            )
+        try:
+            self.owner_path.write_text(
+                json.dumps(self.owner, sort_keys=True), encoding="utf-8"
+            )
+        except OSError as error:
+            self._cleanup_created_lock()
+            raise LockConflictError(f"could not write lock owner metadata: {error}") from error
+
+    def touch(self) -> None:
+        """Refresh the heartbeat only while this acquisition still owns the lock."""
+        if self._owns_lock():
+            try:
+                os.utime(self.owner_path, None)
+            except OSError:
+                pass
+
+    def release(self) -> None:
+        """Remove the lock only while this acquisition still owns it.
+
+        If the lock generation was replaced by another owner token, the
+        replacement lock and its owner metadata are left completely untouched.
+        """
+        if not self._owns_lock():
+            return
+        try:
+            self.owner_path.unlink()
+        except OSError:
+            return
+        try:
+            self.lock_dir.rmdir()
+        except OSError:
+            pass
+
+
+class _TimedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        if self.sock is not None:
+            self.sock.settimeout(READ_TIMEOUT)
+
+
+class _TimedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        super().connect()
+        if self.sock is not None:
+            self.sock.settimeout(READ_TIMEOUT)
+
+
+class _TimedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request: urllib.request.Request) -> Any:
+        return self.do_open(_TimedHTTPConnection, request)
+
+
+class _TimedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request: urllib.request.Request) -> Any:
+        return self.do_open(_TimedHTTPSConnection, request)
+
+
+class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only when the target still obeys the manifest policy.
+
+    Every redirect target is validated with the same rules as a manifest URL:
+    unsupported schemes, embedded credentials, and mutable source references
+    are refused. HTTPS sources never downgrade to HTTP and never redirect into
+    loopback or test hosts. Loopback/test HTTP redirects are allowed only when
+    the original request was itself an allowed loopback/test fixture URL.
+    Redirect response bodies are consumed in bounded chunks and counted against
+    the same shared transfer budget as final artifacts, attempts, and retries.
+    """
+
+    def __init__(
+        self,
+        budget: _TransferBudget | None = None,
+        stats: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self._budget = budget
+        self._stats = stats
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):  # type: ignore[override]
+        original = urllib.parse.urlparse(request.full_url)
+        try:
+            _validated_url(newurl)
+        except ManifestValidationError:
+            return None
+        parsed = urllib.parse.urlparse(newurl)
+        if original.scheme == "https":
+            if parsed.scheme == "http":
+                return None
+            host = (parsed.hostname or "").lower()
+            if _is_loopback_host(host) or host in TEST_HOSTS:
+                return None
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+    def _redirect_with_budget(self, req, fp, code, msg, headers):  # type: ignore[override]
+        if "location" in headers:
+            newurl = headers["location"]
+        elif "uri" in headers:
+            newurl = headers["uri"]
+        else:
+            return
+        url = urllib.parse.urljoin(req.full_url, newurl)
+        new = self.redirect_request(req, fp, code, msg, headers, url)
+        if new is None:
+            return
+        try:
+            if self._budget is not None:
+                while True:
+                    remaining = self._budget.remaining
+                    if remaining <= 0:
+                        raise IntegrityError(
+                            f"redirect body exceeded the total byte allowance {self._budget.max_bytes}"
+                        )
+                    try:
+                        chunk = fp.read(min(CHUNK_SIZE, remaining))
+                    except http.client.IncompleteRead as error:
+                        partial = getattr(error, "partial", None)
+                        if partial:
+                            self._budget.record(len(partial))
+                        raise
+                    except (TimeoutError, http.client.HTTPException, OSError) as error:
+                        raise _NetworkReadError() from error
+                    if not chunk:
+                        break
+                    self._budget.record(len(chunk))
+            else:
+                fp.read()
+        finally:
+            fp.close()
+        # Count the followed redirect as an actual HTTP request attempt. A
+        # refused redirect returns above without incrementing, so no
+        # nonexistent target request is ever counted.
+        if self._stats is not None:
+            self._stats["requests_attempted"] += 1
+        return self.parent.open(new, timeout=req.timeout)
+
+    def http_error_301(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_302(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_303(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_307(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+    def http_error_308(self, req, fp, code, msg, headers):  # type: ignore[override]
+        return self._redirect_with_budget(req, fp, code, msg, headers)
+
+
+def _opener(
+    budget: _TransferBudget | None = None,
+    stats: dict[str, int] | None = None,
+) -> urllib.request.OpenerDirector:
+    handlers: list[Any] = [urllib.request.ProxyHandler({}), _RestrictedRedirectHandler(budget, stats)]
+    if getattr(ssl, "create_default_context", None) is not None:
+        handlers.append(_TimedHTTPHandler())
+        handlers.append(_TimedHTTPSHandler())
+    return urllib.request.build_opener(*handlers)
+
+
+def _is_retryable(error: BaseException) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in (408, 429) or error.code >= 500
+    if isinstance(error, (urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError)):
+        return True
+    return False
+
+
+class _TransferBudget:
+    """Shared hard cap on total response-body bytes received by an acquisition.
+
+    All artifacts, all attempts, and all retries consume one budget; bytes
+    received during failed or interrupted attempts are never refunded.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self.received = 0
+
+    @property
+    def remaining(self) -> int:
+        return self.max_bytes - self.received
+
+    def record(self, count: int) -> None:
+        self.received += count
+        if self.received > self.max_bytes:
+            raise IntegrityError(
+                f"transfer exceeded the total byte allowance {self.max_bytes} "
+                f"(received at least {self.received})"
+            )
+
+
+def _stream_once(
+    *,
+    url: str,
+    expected_size: int,
+    expected_sha256: str,
+    budget: _TransferBudget,
+    target_part: Path,
+    lock: _ArtifactLock | None,
+    stats: dict[str, int],
+) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    stats["requests_attempted"] += 1
+    response = _opener(budget, stats).open(request, timeout=CONNECT_TIMEOUT)
+    try:
+        # Bounded acquisition requires an exact declared body size. Responses
+        # without Content-Length or with chunked transfer encoding are refused
+        # before any body byte is consumed so the shared transfer allowance can
+        # never be bypassed by an unbounded stream.
+        if response.headers.get("Transfer-Encoding") is not None:
+            raise IntegrityError(
+                f"response for {url} uses Transfer-Encoding; an exact Content-Length is required"
+            )
+        content_length = response.headers.get("Content-Length")
+        if content_length is None:
+            raise IntegrityError(
+                f"response for {url} has no Content-Length; an exact declared size is required"
+            )
+        try:
+            declared = int(content_length)
+        except ValueError:
+            raise IntegrityError(
+                f"response for {url} has an invalid Content-Length {content_length!r}"
+            ) from None
+        if declared != expected_size:
+            raise IntegrityError(
+                f"Content-Length {declared} does not match expected size {expected_size}"
+            )
+        # The final response body must fit within the remaining shared transfer
+        # allowance before any body byte is consumed; redirect bodies have
+        # already consumed their share of the same budget.
+        if expected_size > budget.remaining:
+            raise IntegrityError(
+                f"remaining allowance {budget.remaining} bytes is less than the expected size {expected_size}"
+            )
+        # Create the temporary file with O_EXCL/O_NOFOLLOW before writing any
+        # response bytes so a symlink planted at the temporary path is never
+        # followed. The descriptor is owned by os.fdopen below, so it is
+        # closed on every path after creation.
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(str(target_part), flags, 0o600)
+        except OSError as error:
+            raise LocalIOError(f"cannot create temporary file {target_part}: {error}") from error
+        digest = hashlib.sha256()
+        written = 0
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                while written < expected_size:
+                    if budget.remaining <= 0:
+                        raise IntegrityError(
+                            f"remaining allowance exhausted before {url} completed"
+                        )
+                    read_size = min(CHUNK_SIZE, expected_size - written, budget.remaining)
+                    try:
+                        chunk = response.read(read_size)
+                    except http.client.IncompleteRead as error:
+                        partial = getattr(error, "partial", None)
+                        if partial:
+                            budget.record(len(partial))
+                        raise
+                    except (TimeoutError, http.client.HTTPException, OSError) as error:
+                        raise _NetworkReadError() from error
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > expected_size:
+                        raise IntegrityError(
+                            f"download exceeded expected size {expected_size} (received at least {written})"
+                        )
+                    budget.record(len(chunk))
+                    digest.update(chunk)
+                    try:
+                        handle.write(chunk)
+                    except OSError as error:
+                        raise LocalIOError(
+                            f"cannot write temporary file {target_part}: {error}"
+                        ) from error
+                    if lock is not None:
+                        lock.touch()
+                try:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                except OSError as error:
+                    raise LocalIOError(
+                        f"cannot flush temporary file {target_part}: {error}"
+                    ) from error
+        except LocalIOError:
+            raise
+        except OSError as error:
+            raise LocalIOError(
+                f"temporary file operation failed for {target_part}: {error}"
+            ) from error
+        if written != expected_size:
+            if written < expected_size:
+                # Premature EOF before the declared body was fully received is
+                # a transport-level interruption (the bytes already received
+                # are accounted against the shared budget) and follows the
+                # finite retry policy instead of being reported as an
+                # integrity failure.
+                raise _NetworkReadError() from ConnectionError(
+                    f"connection closed early after {written} of {expected_size} bytes"
+                )
+            raise IntegrityError(
+                f"downloaded size {written} does not match expected size {expected_size}"
+            )
+        if digest.hexdigest() != expected_sha256:
+            raise IntegrityError("SHA-256 mismatch after download")
+    finally:
+        response.close()
+
+
+def _download_file(
+    *,
+    url: str,
+    expected_size: int,
+    expected_sha256: str,
+    budget: _TransferBudget,
+    target_part: Path,
+    lock: _ArtifactLock | None,
+    stats: dict[str, int],
+) -> None:
+    attempts = 0
+    retries = 0
+    last_error: BaseException | None = None
+    while attempts <= MAX_RETRIES:
+        attempts += 1
+        try:
+            _stream_once(
+                url=url,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+                budget=budget,
+                target_part=target_part,
+                lock=lock,
+                stats=stats,
+            )
+            return
+        except urllib.error.HTTPError as error:
+            last_error = error
+            if not _is_retryable(error):
+                raise _NonRetryableHttpError(
+                    f"server returned HTTP {error.code} for {url}", attempts=attempts, retries=retries
+                ) from error
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException, OSError) as error:
+            last_error = error
+        except _NetworkReadError as error:
+            last_error = error.__cause__ or error
+        if attempts > MAX_RETRIES:
+            break
+        if expected_size > budget.remaining:
+            raise IntegrityError(
+                f"cannot retry {url}: remaining allowance {budget.remaining} bytes "
+                f"is less than the expected size {expected_size}"
+            )
+        _remove_part(target_part)
+        retries += 1
+        stats["retries"] += 1
+        time.sleep(RETRY_BACKOFF_SECONDS)
+    raise TransportError(
+        f"download failed after {attempts} attempt(s) and {retries} retry(ies): {last_error}",
+        attempts=attempts,
+        retries=retries,
+    )
+
+
+def _remove_part(target_part: Path | None) -> None:
+    if target_part is None:
+        return
+    try:
+        target_part.unlink()
+    except OSError:
+        pass
+
+
+def _base_report(
+    *,
+    command: str,
+    manifest: dict[str, Any] | None,
+    cache_root: Path,
+    entries: list[dict[str, Any]] | None,
+    max_bytes: int | None,
+    network: dict[str, int],
+) -> dict[str, Any]:
+    file_count = len(manifest["files"]) if manifest is not None else 0
+    total = manifest["total_size"] if manifest is not None else 0
+    required = 0
+    counts = {state: 0 for state in FILE_STATES}
+    if entries is not None:
+        counts = _count_states(entries)
+        required = sum(
+            entry["expected_size"] for entry in entries if entry["state"] != "VERIFIED"
+        )
+    report: dict[str, Any] = {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "command": command,
+        "success": False,
+        "classification": "ERROR",
+        "exit_code": EXIT_INTERNAL_ERROR,
+        "artifact_set": manifest["artifact_set"] if manifest is not None else None,
+        "revision": manifest["revision"] if manifest is not None else None,
+        "namespace": manifest["namespace"] if manifest is not None else None,
+        "plan_id": _plan_id(manifest) if manifest is not None else None,
+        "cache_root": str(cache_root),
+        "file_count": file_count,
+        "file_counts": counts,
+        "bytes": {
+            "total_expected": total,
+            "required": required,
+            "max_bytes": max_bytes,
+        },
+        "acquirable": manifest is not None,
+        "fully_cached": entries is not None and required == 0,
+        "files": entries or [],
+        "network": {"requests_attempted": 0, "retries": 0, "bytes_received": 0, **dict(network)},
+        "detail": None,
+    }
+    return report
+
+
+def _success_report(report: dict[str, Any]) -> dict[str, Any]:
+    report.update(success=True, classification="OK", exit_code=EXIT_OK)
+    return report
+
+
+def _failure_report(report: dict[str, Any], error: ModelCacheError) -> dict[str, Any]:
+    report.update(
+        success=False,
+        classification=error.classification,
+        exit_code=error.exit_code,
+        detail=str(error),
+    )
+    return report
+
+
+def _read_manifest(manifest_arg: str) -> dict[str, Any]:
+    path = Path(manifest_arg)
+    if not path.exists():
+        raise ManifestValidationError(f"manifest file does not exist: {path}")
+    return parse_manifest(path)
+
+
+def run_plan(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:
+    manifest = _read_manifest(args.manifest)
+    cache_root = _cache_root(environment)
+    entries = _collect_states(cache_root, manifest)
+    report = _base_report(
+        command="plan",
+        manifest=manifest,
+        cache_root=cache_root,
+        entries=entries,
+        max_bytes=None,
+        network={"requests_attempted": 0, "retries": 0},
+    )
+    return _success_report(report)
+
+
+def run_status(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:
+    manifest = _read_manifest(args.manifest)
+    cache_root = _cache_root(environment)
+    entries = _collect_states(cache_root, manifest)
+    report = _base_report(
+        command="status",
+        manifest=manifest,
+        cache_root=cache_root,
+        entries=entries,
+        max_bytes=None,
+        network={"requests_attempted": 0, "retries": 0},
+    )
+    return _success_report(report)
+
+
+def run_verify(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:
+    manifest = _read_manifest(args.manifest)
+    cache_root = _cache_root(environment)
+    entries = _collect_states(cache_root, manifest)
+    report = _base_report(
+        command="verify",
+        manifest=manifest,
+        cache_root=cache_root,
+        entries=entries,
+        max_bytes=None,
+        network={"requests_attempted": 0, "retries": 0},
+    )
+    all_verified = all(entry["state"] == "VERIFIED" for entry in entries)
+    if all_verified:
+        return _success_report(report)
+    report.update(
+        success=False,
+        classification="NOT_VERIFIED",
+        exit_code=EXIT_INTEGRITY_FAILURE,
+        detail="one or more artifacts are not verified (see per-file states)",
+    )
+    return report
+
+
+def run_acquire(args: argparse.Namespace, environment: dict[str, str]) -> dict[str, Any]:
+    manifest = _read_manifest(args.manifest)
+    cache_root = _cache_root(environment)
+    entries = _collect_states(cache_root, manifest)
+    required = sum(entry["expected_size"] for entry in entries if entry["state"] != "VERIFIED")
+
+    if not args.confirm_download:
+        error = PolicyRefusalError(
+            "acquisition requires --confirm-download; no network access was attempted"
+        )
+        error.entries = entries
+        error.manifest = manifest
+        raise error
+    if args.max_bytes is None:
+        error = PolicyRefusalError(
+            "acquisition requires --max-bytes; no network access was attempted"
+        )
+        error.entries = entries
+        error.manifest = manifest
+        raise error
+    if args.max_bytes < required:
+        error = PolicyRefusalError(
+            f"required {required} bytes exceeds --max-bytes {args.max_bytes}; "
+            "no network access was attempted"
+        )
+        error.entries = entries
+        error.manifest = manifest
+        raise error
+
+    plan_id = _plan_id(manifest)
+    stats = {"requests_attempted": 0, "retries": 0, "bytes_received": 0}
+    lock = _ArtifactLock(cache_root, _lock_key(manifest), plan_id)
+    try:
+        lock.acquire()
+    except ModelCacheError as error:
+        error.entries = entries
+        error.stats = stats
+        error.manifest = manifest
+        raise
+    cumulative = 0
+    try:
+        # Re-inspect the cache after acquiring the lock so files verified by a
+        # concurrent acquirer are reused instead of downloaded again.
+        entries = _collect_states(cache_root, manifest)
+        # The pre-lock required-byte calculation can become stale while the
+        # lock is being acquired (for example a previously verified file may
+        # disappear), so the hard allowance is enforced again under the lock
+        # and before the first network request.
+        required = sum(entry["expected_size"] for entry in entries if entry["state"] != "VERIFIED")
+        if args.max_bytes < required:
+            error = PolicyRefusalError(
+                f"required {required} bytes exceeds --max-bytes {args.max_bytes} "
+                "after cache recheck; no network access was attempted"
+            )
+            error.entries = entries
+            error.stats = stats
+            error.manifest = manifest
+            raise error
+        budget = _TransferBudget(args.max_bytes)
+        # Unsafe acquisition-reserved temporary paths (symlinks, directories,
+        # devices, or other non-regular files) are refused before any network
+        # request; only safe regular stale temporaries follow the documented
+        # restart-from-zero cleanup policy.
+        for entry in entries:
+            target = _target_path(cache_root, manifest, entry["path"])
+            if not target.parent.is_dir():
+                continue
+            for reserved in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"):
+                if reserved.is_symlink() or not reserved.is_file():
+                    error = LocalIOError(f"reserved temporary path is unsafe: {reserved}")
+                    error.entries = entries
+                    error.stats = stats
+                    error.budget = budget
+                    error.manifest = manifest
+                    raise error
+        for entry in entries:
+            entry["downloaded"] = False
+            target_part: Path | None = None
+            if entry["state"] == "VERIFIED":
+                entry["action"] = "reused"
+                continue
+            try:
+                target = _validate_destination(cache_root, manifest, entry["path"])
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as error:
+                    raise LocalIOError(
+                        f"cannot create destination directory {target.parent}: {error}"
+                    ) from error
+                # Each acquisition uses a genuinely unique temporary filename
+                # that is not representable as a manifest destination, created
+                # with O_EXCL/O_NOFOLLOW on the destination filesystem.
+                token = os.urandom(8).hex()
+                target_part = _temp_path(target, token)
+                _download_file(
+                    url=entry["url"],
+                    expected_size=entry["expected_size"],
+                    expected_sha256=entry["sha256"],
+                    budget=budget,
+                    target_part=target_part,
+                    lock=lock,
+                    stats=stats,
+                )
+                try:
+                    os.replace(target_part, target)
+                except OSError as error:
+                    raise LocalIOError(
+                        f"cannot promote verified download to {target}: {error}"
+                    ) from error
+                cumulative += entry["expected_size"]
+                entry["downloaded"] = True
+                entry["action"] = "downloaded"
+                entry["state"] = "VERIFIED"
+                entry["detail"] = None
+            except ModelCacheError as error:
+                error.entries = entries
+                error.stats = stats
+                error.budget = budget
+                error.manifest = manifest
+                _remove_part(target_part)
+                raise
+        # No acquisition-owned temporary files may remain after success, and
+        # the complete manifest is re-verified under the lock so success is
+        # reported only when every final artifact exists and matches its exact
+        # expected size and SHA-256.
+        for entry in entries:
+            target = _target_path(cache_root, manifest, entry["path"])
+            if not target.parent.is_dir():
+                continue
+            for reserved in target.parent.glob(f"{TEMP_PREFIX}*{TEMP_SUFFIX}"):
+                if reserved.is_symlink() or not reserved.is_file():
+                    error = LocalIOError(f"reserved temporary path is unsafe: {reserved}")
+                    error.entries = entries
+                    error.stats = stats
+                    error.budget = budget
+                    error.manifest = manifest
+                    raise error
+                try:
+                    reserved.unlink()
+                except OSError as error:
+                    raise LocalIOError(
+                        f"cannot remove reserved temporary file {reserved}: {error}"
+                    ) from error
+        final_entries = _collect_states(cache_root, manifest)
+        for entry in final_entries:
+            if entry["state"] != "VERIFIED":
+                detail = f" ({entry['detail']})" if entry.get("detail") else ""
+                error = IntegrityError(
+                    f"final verification failed for {entry['path']}: {entry['state']}{detail}"
+                )
+                error.entries = final_entries
+                error.stats = stats
+                error.budget = budget
+                error.manifest = manifest
+                raise error
+    finally:
+        lock.release()
+
+    stats["bytes_received"] = budget.received
+    report = _base_report(
+        command="acquire",
+        manifest=manifest,
+        cache_root=cache_root,
+        entries=entries,
+        max_bytes=args.max_bytes,
+        network=stats,
+    )
+    report["bytes"]["downloaded"] = cumulative
+    return _success_report(report)
+
+
+def _build_parser() -> _ArgumentParser:
+    parser = _ArgumentParser(
+        prog="models",
+        description="Manage the external model cache (plan/status/acquire/verify).",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True, metavar="SUBCOMMAND")
+
+    for name in ("plan", "status", "verify"):
+        sub = subparsers.add_parser(name, help=f"inspect model cache {name} offline")
+        sub.add_argument("--manifest", required=True, help="path to the artifact manifest JSON")
+        sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
+    acquire = subparsers.add_parser("acquire", help="download artifacts with explicit authorization")
+    acquire.add_argument("--manifest", required=True, help="path to the artifact manifest JSON")
+    acquire.add_argument("--confirm-download", action="store_true", help="explicitly authorize downloads")
+    acquire.add_argument("--max-bytes", type=int, default=None, help="hard maximum byte allowance")
+    acquire.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    return parser
+
+
+def _usage_report(message: str) -> dict[str, Any]:
+    return {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "command": None,
+        "success": False,
+        "classification": UsageError.classification,
+        "exit_code": UsageError.exit_code,
+        "artifact_set": None,
+        "revision": None,
+        "namespace": None,
+        "plan_id": None,
+        "cache_root": str(_cache_root()),
+        "file_count": 0,
+        "file_counts": {state: 0 for state in FILE_STATES},
+        "bytes": {"total_expected": 0, "required": 0, "max_bytes": None},
+        "acquirable": False,
+        "fully_cached": False,
+        "files": [],
+        "network": {"requests_attempted": 0, "retries": 0, "bytes_received": 0},
+        "detail": message,
+    }
+
+
+def _internal_error_report(command: str | None, detail: str) -> dict[str, Any]:
+    return {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "command": command,
+        "success": False,
+        "classification": "INTERNAL_ERROR",
+        "exit_code": EXIT_INTERNAL_ERROR,
+        "artifact_set": None,
+        "revision": None,
+        "namespace": None,
+        "plan_id": None,
+        "cache_root": str(_cache_root()),
+        "file_count": 0,
+        "file_counts": {state: 0 for state in FILE_STATES},
+        "bytes": {"total_expected": 0, "required": 0, "max_bytes": None},
+        "acquirable": False,
+        "fully_cached": False,
+        "files": [],
+        "network": {"requests_attempted": 0, "retries": 0, "bytes_received": 0},
+        "detail": detail,
+    }
+
+
+def _format_human(report: dict[str, Any]) -> str:
+    lines = [
+        f"SCHEMA_VERSION={report['schema_version']}",
+        f"COMMAND={report['command']}",
+        f"STATUS={'OK' if report['success'] else report['classification']}",
+        f"EXIT_CODE={report['exit_code']}",
+        f"ARTIFACT_SET={report['artifact_set']}",
+        f"REVISION={report['revision']}",
+        f"NAMESPACE={report['namespace']}",
+        f"PLAN_ID={report['plan_id']}",
+        f"CACHE_ROOT={report['cache_root']}",
+        f"FILE_COUNT={report['file_count']}",
+        "FILE_COUNTS=" + ", ".join(f"{key}={value}" for key, value in report["file_counts"].items()),
+        "BYTES=" + ", ".join(f"{key}={value}" for key, value in report["bytes"].items()),
+        f"ACQUIRABLE={'YES' if report['acquirable'] else 'NO'}",
+        f"FULLY_CACHED={'YES' if report['fully_cached'] else 'NO'}",
+        f"REQUESTS_ATTEMPTED={report['network']['requests_attempted']}",
+        f"RETRIES={report['network']['retries']}",
+        f"BYTES_RECEIVED={report['network'].get('bytes_received', 0)}",
+    ]
+    if report.get("detail"):
+        lines.append(f"DETAIL={report['detail']}")
+    lines.append("FILES:")
+    for entry in report.get("files", []):
+        lines.append(
+            f"- {entry['path']}: {entry['state']} (expected {entry['expected_size']} bytes, target {entry['target']})"
+        )
+    return "\n".join(lines)
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    environment: dict[str, str] | None = None,
+) -> int:
+    env = dict(os.environ if environment is None else environment)
+    parser = _build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except UsageError as error:
+        print(json.dumps(_usage_report(str(error)), indent=2, sort_keys=True))
+        return error.exit_code
+
+    if getattr(args, "max_bytes", None) is not None and args.max_bytes < 0:
+        print(json.dumps(_usage_report("--max-bytes must be a non-negative integer"), indent=2, sort_keys=True))
+        return UsageError.exit_code
+
+    try:
+        if args.subcommand == "plan":
+            report = run_plan(args, env)
+        elif args.subcommand == "status":
+            report = run_status(args, env)
+        elif args.subcommand == "verify":
+            report = run_verify(args, env)
+        elif args.subcommand == "acquire":
+            report = run_acquire(args, env)
+        else:  # pragma: no cover - argparse enforces the subcommand set
+            raise UsageError(f"unknown subcommand {args.subcommand!r}")
+    except ModelCacheError as error:
+        stats = dict(error.stats or {"requests_attempted": 0, "retries": 0})
+        budget = getattr(error, "budget", None)
+        if budget is not None:
+            stats["bytes_received"] = budget.received
+        report = _failure_report(_base_report(
+            command=args.subcommand,
+            manifest=error.manifest,
+            cache_root=_cache_root(env),
+            entries=error.entries,
+            max_bytes=getattr(args, "max_bytes", None) if args.subcommand == "acquire" else None,
+            network=stats,
+        ), error)
+    except Exception as error:  # pragma: no cover - defensive boundary
+        report = _internal_error_report(args.subcommand, f"{type(error).__name__}: {error}")
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(_format_human(report))
+    return report["exit_code"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

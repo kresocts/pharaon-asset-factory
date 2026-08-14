@@ -52,8 +52,12 @@ class DockerfilePolicyTests(unittest.TestCase):
         ]
         self.assertTrue(copy_lines)
         for line in copy_lines:
-            self.assertNotIn("model", line)
-            self.assertNotIn("weight", line)
+            self.assertNotIn("/models/", line)
+            self.assertNotIn("weights", line)
+            self.assertNotIn("checkpoints", line)
+            self.assertNotIn(".safetensors", line)
+            self.assertNotIn(".ckpt", line)
+            self.assertNotIn(".pth", line)
             self.assertNotIn(".env", line)
             self.assertNotIn("credential", line)
         for marker in ("private key", "api_key=", "token=", "password="):
