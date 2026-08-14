@@ -1,7 +1,7 @@
 # T-0025 Hunyuan shape provenance evidence
 
 - Base SHA: `c61e7c200dd3837b25a429f9fb5f8b0beb4c8873`
-- Final SHA: `397a1b8f20b79a2acfd30a1f49af14dd19c7ee70`
+- Implementation content SHA: `397a1b8f20b79a2acfd30a1f49af14dd19c7ee70`
 - Branch: `ticket/T-0025-production-shape-provenance-retry`
 - PR: one non-draft PR targeting `main`
 - PR #22: closed and unmerged; used only as historical audit context
