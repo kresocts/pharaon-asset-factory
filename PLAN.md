@@ -35,6 +35,14 @@ Phase boundaries may overlap through small exploratory tickets, but production i
 - External model cache
 - GHCR publishing
 
+## Phase 1 completion
+
+Phase 1 is complete. T-0017's first controlled GHCR publication failed and is
+`SUPERSEDED`, not `DONE`. T-0018 fixed the stale `$LASTEXITCODE` blocker, and T-0019
+completed the separately approved successful immutable SHA-only GHCR publication.
+Phase 2 — Asset worker is the next phase; model weights and inference remain
+unimplemented.
+
 ## Phase 2 — Asset worker
 
 - Hunyuan shape generation
