@@ -47,6 +47,22 @@ success it reports `SHAPE_MODEL_PREFLIGHT_READY`, `model_binding_supported: true
 manifest/license/provenance and Hunyuan runtime/GPU execution remain future tickets;
 no weights or inference are implemented.
 
+T-0027 adds the verified offline provenance logger:
+
+```bash
+python tools/provenance_capture.py validate-plan --plan session-plan.json
+python tools/provenance_capture.py init --session-dir DIR --plan session-plan.json
+python tools/provenance_capture.py request --session-dir DIR --entry-id ENTRY
+python tools/provenance_capture.py verify --session-dir DIR
+python tools/provenance_capture.py finalize --session-dir DIR
+```
+
+The logger is append-only, hash-chained, and plan-bound. It resolves relative
+redirects safely and follows a redirect only when the session plan explicitly names
+the exact approved target. T-0027 performs no live research and authorizes no future
+network use; a later ticket must obtain fresh operator authorization before using it
+against public endpoints.
+
 Shape generation, texture generation, post-processing, packaging, and API/server work
 remain future tickets, and Phase 2 is not complete.
 
