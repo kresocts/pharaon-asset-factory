@@ -175,6 +175,7 @@ class PublisherLogicTests(unittest.TestCase):
         shell = shutil.which("pwsh") or shutil.which("powershell")
         env = os.environ.copy()
         env["REPO_ROOT"] = str(ROOT)
+        env["NATIVE_PWSH"] = shell
         script = (
             "$ErrorActionPreference = 'Stop'\n"
             ". (Join-Path $env:REPO_ROOT 'scripts/publisher/publisher.ps1')\n"
@@ -190,11 +191,13 @@ class PublisherLogicTests(unittest.TestCase):
             check=False,
         )
 
-    def _run_native_state_process(self, docker_command: str, epilogue_exit: bool = True) -> subprocess.CompletedProcess:
+    def _run_native_state_process(self, mock_script: str, epilogue_exit: bool = True) -> subprocess.CompletedProcess:
         body = (
+            "$pwshPath = $env:NATIVE_PWSH\n"
             "$config = Join-Path ([System.IO.Path]::GetTempPath()) ('t0018-' + [guid]::NewGuid().ToString('N'))\n"
             "New-Item -ItemType Directory -Path $config | Out-Null\n"
-            f"function docker {{ {docker_command} }}\n"
+            f"$mockScript = {mock_script}\n"
+            "function docker { & $pwshPath -NoProfile -NonInteractive -Command $mockScript }\n"
             "$state = Test-PublisherRegistryTagState -DockerConfig $config -Reference 'mock/ref:test'\n"
             "Write-Output ('STATE=' + $state)\n"
             "Write-Output ('LASTEXITCODE=' + $LASTEXITCODE)\n"
@@ -216,7 +219,7 @@ class PublisherLogicTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
     def test_absent_native_exit_is_normalized_in_separate_process(self) -> None:
         result = self._run_native_state_process(
-            '& cmd /c "echo no such manifest: mock 1>&2 & exit /b 1"',
+            "'Write-Error \"no such manifest: mock\"; exit 1'",
             epilogue_exit=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -226,9 +229,11 @@ class PublisherLogicTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
     def test_existing_tag_refuses_and_exits_nonzero(self) -> None:
         body = (
+            "$pwshPath = $env:NATIVE_PWSH\n"
             "$config = Join-Path ([System.IO.Path]::GetTempPath()) ('t0018-existing-' + [guid]::NewGuid().ToString('N'))\n"
             "New-Item -ItemType Directory -Path $config | Out-Null\n"
-            "function docker { & cmd /c 'exit /b 0' }\n"
+            "$mockScript = 'exit 0'\n"
+            "function docker { & $pwshPath -NoProfile -NonInteractive -Command $mockScript }\n"
             "try {\n"
             "  Assert-PublisherTagsAbsent -DockerConfig $config -Image 'mock' -Tags @('exists')\n"
             "  Write-Output 'UNEXPECTED_SUCCESS'\n"
@@ -258,7 +263,7 @@ class PublisherLogicTests(unittest.TestCase):
         for message in scenarios:
             with self.subTest(message=message):
                 result = self._run_native_state_process(
-                    f'& cmd /c "echo {message} 1>&2 & exit /b 1"',
+                    f"'Write-Error \"{message}\"; exit 1'",
                     epilogue_exit=True,
                 )
                 self.assertNotEqual(result.returncode, 0, result.stderr)
@@ -267,14 +272,17 @@ class PublisherLogicTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
     def test_handled_absence_does_not_hide_later_failure(self) -> None:
         body = (
+            "$pwshPath = $env:NATIVE_PWSH\n"
             "$config = Join-Path ([System.IO.Path]::GetTempPath()) ('t0018-isolation-' + [guid]::NewGuid().ToString('N'))\n"
             "New-Item -ItemType Directory -Path $config | Out-Null\n"
             "$script:mockMode = 'absent'\n"
+            "$mockAbsent = 'Write-Error \"no such manifest: mock\"; exit 1'\n"
+            "$mockError = 'Write-Error \"unauthorized\"; exit 1'\n"
             "function docker {\n"
             "  if ($script:mockMode -eq 'absent') {\n"
-            "    & cmd /c \"echo no such manifest: mock 1>&2 & exit /b 1\"\n"
+            "    & $pwshPath -NoProfile -NonInteractive -Command $mockAbsent\n"
             "  } else {\n"
-            "    & cmd /c \"echo unauthorized 1>&2 & exit /b 1\"\n"
+            "    & $pwshPath -NoProfile -NonInteractive -Command $mockError\n"
             "  }\n"
             "}\n"
             "$state1 = Test-PublisherRegistryTagState -DockerConfig $config -Reference 'mock/ref:test'\n"
@@ -292,9 +300,11 @@ class PublisherLogicTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
     def test_later_write_host_does_not_convert_native_error_to_success(self) -> None:
         body = (
+            "$pwshPath = $env:NATIVE_PWSH\n"
             "$config = Join-Path ([System.IO.Path]::GetTempPath()) ('t0018-writehost-' + [guid]::NewGuid().ToString('N'))\n"
             "New-Item -ItemType Directory -Path $config | Out-Null\n"
-            "function docker { & cmd /c \"echo unauthorized 1>&2 & exit /b 1\" }\n"
+            "$mockScript = 'Write-Error \"unauthorized\"; exit 1'\n"
+            "function docker { & $pwshPath -NoProfile -NonInteractive -Command $mockScript }\n"
             "$state = Test-PublisherRegistryTagState -DockerConfig $config -Reference 'mock/ref:test'\n"
             "Write-Host 'later-success'\n"
             "Write-Output ('STATE=' + $state + ' LASTEXITCODE=' + $LASTEXITCODE)\n"
@@ -304,7 +314,6 @@ class PublisherLogicTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("later-success", result.stdout)
         self.assertIn("STATE=Error LASTEXITCODE=1", result.stdout)
-
     def test_integration_script_uses_explicit_exit_decision(self) -> None:
         self.assertIn("function Get-PublisherProcessExitCode", self.publisher)
         self.assertIn("$primaryFailure = $null", self.integration)
@@ -362,6 +371,7 @@ class PublisherLogicTests(unittest.TestCase):
         env = os.environ.copy()
         env["REPO_ROOT"] = str(ROOT)
         shell = shutil.which("pwsh") or shutil.which("powershell")
+        env["NATIVE_PWSH"] = shell
         result = subprocess.run(
             [shell, "-NoProfile", "-NonInteractive", "-Command", script],
             cwd=ROOT,
