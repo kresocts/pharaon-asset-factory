@@ -33,6 +33,16 @@ model-cache verification, and GPU execution.
 
 T-0023 adds the offline model-binding/cache-preflight boundary:
 
+T-0025 adds the reviewed official production shape inventory and provenance:
+
+- `model-manifests/production/hunyuan3d-2.1-shape.json`
+- `model-manifests/production/hunyuan3d-2.1-shape.provenance.json`
+
+It passes the existing T-0014 manifest parser and T-0023 immutable binding policy and
+includes the bounded request log and exact loader source line ranges. It does not
+authorize acquisition or inference. Validate it offline with
+`python validation/validate_production_shape_manifest.py`.
+
 ```bash
 python -m asset_pipeline.cli shape preflight   --job path/to/job.json   --backend hunyuan3d-2.1-shape   --model-manifest path/to/model-manifest.json   --json
 ```

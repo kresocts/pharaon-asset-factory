@@ -139,6 +139,19 @@ imports, GPU initialization, or inference. Cache verification never repairs or
 acquires missing files; acquisition remains the separately authorized `models acquire`
 command.
 
+
+## Production Hunyuan shape manifest and provenance
+
+T-0025 adds the independently reviewed official production shape inventory under
+`model-manifests/production/`. The manifest is valid T-0014 schema version 1 and
+passes the T-0023 immutable binding policy. No runtime behavior changed, and no
+model weight, cache population, or acquisition is authorized.
+
+Validate the manifest and provenance offline with:
+
+```bash
+python validation/validate_production_shape_manifest.py
+```
 ## Future work
 
 This ticket does not implement production weight manifests, real model hashes,

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "artifact_set": "hunyuan3d-2.1-shape",
+  "revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327",
+  "namespace": "hunyuan3d-2.1-shape/0b94677654c57bb9a6b6845cd7b704ccf551d327",
+  "files": [
+    {
+      "path": "config.yaml",
+      "role": "shape-config",
+      "size": 2078,
+      "sha256": "a9e9b66f0163a9b827d730633ac88f47fcc8e3071dcbb9ee12d88ef7537c5c6e",
+      "url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-dit-v2-1/config.yaml"
+    },
+    {
+      "path": "model.fp16.ckpt",
+      "role": "shape-weights",
+      "size": 7366389768,
+      "sha256": "6b519fc7242f78e9b5f47ea4d55668fe3d944a2d27332f4ca68d29a6ff603f5e",
+      "url": "https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/0b94677654c57bb9a6b6845cd7b704ccf551d327/hunyuan3d-dit-v2-1/model.fp16.ckpt"
+    }
+  ]
+}

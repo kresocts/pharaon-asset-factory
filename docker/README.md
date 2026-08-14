@@ -528,3 +528,12 @@ validated actual Docker CLI behavior against a disposable `127.0.0.1` registry. 
 failed T-0017 run remains recorded as failure. T-0019 completed a separately
 approved second controlled publication after T-0018 was merged and independently
 approved.
+
+## T-0025 production shape provenance
+
+The repository now includes the reviewed immutable Hunyuan3D 2.1 shape manifest and
+provenance under `model-manifests/production/`. The manifest contains no model payload
+and does not authorize acquisition. `models plan`, `models status`, and `models verify`
+can consume it offline; `models acquire` remains a separate explicitly authorized
+operation. Loader source compatibility and the exact bounded research session are
+recorded in the provenance and offline validator.
