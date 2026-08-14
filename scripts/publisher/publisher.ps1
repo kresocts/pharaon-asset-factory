@@ -72,6 +72,15 @@ function Get-PublisherTags {
     return $tags
 }
 
+function Reset-PublisherLastExitCodeAfterAbsence {
+    param(
+        [int]$NativeExitCode
+    )
+
+    Write-Verbose "Handled expected registry absence from native exit code $NativeExitCode; normalizing process exit state."
+    $global:LASTEXITCODE = 0
+}
+
 function Test-PublisherRegistryTagState {
     param(
         [string]$DockerConfig,
@@ -116,6 +125,7 @@ function Test-PublisherRegistryTagState {
     )
     foreach ($signal in $absenceSignals) {
         if ($text -match [regex]::Escape($signal)) {
+            Reset-PublisherLastExitCodeAfterAbsence -NativeExitCode $exitCode
             return "Absent"
         }
     }

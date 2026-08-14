@@ -1,61 +1,52 @@
 # T-0017 first controlled GHCR publication evidence
 
-Status: NOT YET EXECUTED
+Status: FAILED
 
-This evidence record must not be populated until the single real production
-publication has been performed and independently observed. Do not pre-populate PASS
-values.
+## Run identity
 
-## Publication metadata
+- Workflow run ID: 31800647785
+- Workflow run URL: https://github.com/kresocts/pharaon-asset-factory/actions/runs/31800647785
+- Workflow: Publish container to GHCR
+- Exact source commit: 60d62bb6cbee247799da3a64ea86f62b935f20d9
+- Branch: main
+- Trigger: workflow_dispatch
+- Dispatch count: 1
+- Environment approval completed: Yes
+- Runner manually started: Yes
+- Runner manually stopped: Yes
+- Runner final state: Offline
 
-- Publication date/time in UTC: [PENDING]
-- Exact source commit: [PENDING]
-- Workflow run URL: [PENDING]
-- Workflow run ID: [PENDING]
-- Runner name: [PENDING]
-- Image tag: [PENDING]
-- Digest: [PENDING]
-- Digest-qualified image reference: [PENDING]
-- Platform result: [PENDING]
-- Environment approval result: [PENDING]
-- Package visibility observed: [PENDING]
-- Latest tag absent: [PENDING]
-- Release tag absent: [PENDING]
-- Runner stopped: [PENDING]
-- Runner final status: [PENDING]
-- Model weights absent: [PENDING]
-- Paid/cloud resources absent: [PENDING]
-- Final result: [PENDING]
+## Observed failure
 
-## Stage B pre-dispatch preflight
-
-- Executed main SHA equals origin/main: [PENDING]
-- PowerShell/pwsh version: [PENDING]
-- Docker engine OSType: [PENDING]
-- Docker version: [PENDING]
-- Buildx version: [PENDING]
-- D-drive free space before dispatch: [PENDING]
-- Runner status before dispatch: [PENDING]
-- Unexpected queued self-hosted jobs absent: [PENDING]
-- Runner status before environment approval: [PENDING]
-- Runner status before manual startup: [PENDING]
-- Exact confirm_publish value: [PENDING]
-- Exact expected_sha value: [PENDING]
-- Release tag input empty: [PENDING]
+- Failed step: Refuse existing requested tags
+- Observed absent-tag message: Requested tag is not present: sha-60d62bb6cbee247799da3a64ea86f62b935f20d9
+- Process exit code: 1
+- Build not reached: Yes
+- Push: None
+- Digest: None
+- SHA tag absent: Yes
+- Release tag absent: Yes
+- Latest tag absent: Yes
+- No weights: Yes
+- No paid/cloud resources: Yes
+- No automatic retry: Yes
 
 ## Verification notes
 
-- Workflow conclusion: [PENDING]
-- Release tag input was empty: [PENDING]
-- No release tag published by this run: [PENDING]
-- No latest tag published by this run: [PENDING]
-- Temporary Docker credentials cleaned: [PENDING]
-- Docker auth JSON and credentials omitted from this record: [PENDING]
+- Workflow conclusion: failure
+- Release tag input was empty: Yes
+- No release tag published by this run: Yes
+- No latest tag published by this run: Yes
+- Docker auth JSON and credentials omitted from this record: Yes
 
 ## Operator checkpoints
 
-- Stage A preparation PR merged: [PENDING]
-- Owner authorized Stage B: [PENDING]
-- Owner approved `ghcr-publish`: [PENDING]
-- Owner manually started runner: [PENDING]
-- Owner manually stopped runner: [PENDING]
+- Stage A preparation PR merged: Yes
+- Owner authorized Stage B: Yes
+- Owner approved ghcr-publish: Yes
+- Owner manually started runner: Yes
+- Owner manually stopped runner: Yes
+
+This record preserves the failed T-0017 run observed facts and does not mark T-0017 DONE.
+A separate T-0019 publication ticket will be prepared only after T-0018 is merged and
+independently approved.
