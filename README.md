@@ -17,8 +17,21 @@ python -m asset_pipeline.cli shape plan --job path/to/job.json --json
 
 The command validates and normalizes one reference-image job and emits a
 machine-readable plan. It does not download model weights or run Hunyuan inference.
-Shape generation, texture generation, post-processing, packaging, and API/server work
-remain future tickets, and Phase 2 is not complete.
+
+T-0022 extends that foundation with an explicit backend registry and immutable
+execution request:
+
+```bash
+python -m asset_pipeline.cli shape prepare --job path/to/job.json --backend hunyuan3d-2.1-shape --json
+```
+
+`shape prepare` reuses the `shape plan` validation and path policy, resolves the
+canonical Hunyuan3D 2.1 shape backend from a fixed local registry, and emits a
+schema-versioned execution request. It reports `preparation_supported: true` and
+`execution_supported: false`, with deterministic blockers for future model binding,
+model-cache verification, and GPU execution. Shape generation, texture generation,
+post-processing, packaging, and API/server work remain future tickets, and Phase 2 is
+not complete.
 
 ## Intended architecture
 

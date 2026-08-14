@@ -22,3 +22,4 @@ Keep ADRs concise and link the relevant ticket and pull request. Do not rewrite 
 - [0006: External model cache and controlled acquisition](0006-external-model-cache-and-controlled-acquisition.md)
 - [0007: Secure Windows GHCR publishing workflow](0007-secure-ghcr-publishing-workflow.md)
 - [0008: Deterministic shape-job contract and offline preflight](0008-deterministic-shape-job-contract.md)
+- [0009: Shape execution-request and backend registry](0009-shape-execution-request-and-backend-registry.md)

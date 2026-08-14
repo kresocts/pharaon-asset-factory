@@ -86,6 +86,30 @@ are emitted.
 Expected validation and policy failures emit concise versioned JSON, not Python
 tracebacks.
 
+## Shape execution-request and backend registry
+
+T-0022 adds an explicit, immutable preparation handoff. Run:
+
+```bash
+python -m asset_pipeline.cli shape prepare \
+  --job path/to/job.json \
+  --backend hunyuan3d-2.1-shape \
+  --json
+```
+
+The command reuses `shape plan` validation and path policy, resolves the backend from
+a fixed local registry, and emits a schema-versioned execution request. `--backend` is
+required; no hidden default or dynamic plugin loading exists. The canonical backend is
+`hunyuan3d-2.1-shape`, implementation `hunyuan3d-2.1`, and it references the same
+Hunyuan3D 2.1 repository and immutable commit pinned in `docker/Dockerfile`.
+
+Valid preparation output has `classification: SHAPE_EXECUTION_REQUEST_READY`,
+`preparation_supported: true`, and `execution_supported: false`. It includes
+deterministic blockers for missing production model-manifest binding, model-cache
+verification, and GPU execution. Repeated runs with the same job and roots are
+byte-identical. The command performs no writes, downloads, model-cache access, heavy
+runtime imports, GPU initialization, or inference.
+
 ## Future work
 
 This ticket does not implement model manifests, weights, GPU execution, raw mesh

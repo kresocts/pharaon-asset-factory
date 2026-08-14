@@ -1,4 +1,4 @@
-"""Focused tests for the canonical ``shape plan`` command-line interface."""
+"""Focused tests for the canonical shape plan and prepare command-line interface."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,7 +80,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(payload["execution_supported"])
         self.assertEqual(payload["requirements"]["inference_backend"], "hunyuan3d-2.1-shape")
 
-    def test_human_readable_mode_is_available(self):
+    def test_human_readable_plan_mode_is_available(self):
         code, stdout, stderr = self._run(
             ["shape", "plan", "--job", str(self.job_path)]
         )
@@ -193,7 +195,6 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("secret details", stdout)
         self.assertNotIn("Traceback", stderr)
 
-
     def test_deeply_nested_json_returns_invalid_document_without_traceback(self):
         self._write_job("[" * 10000 + "0" + "]" * 10000)
         code, stdout, stderr = self._run(
@@ -220,6 +221,276 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["classification"], "INTERNAL_ERROR")
         self.assertNotIn("secret read details", stdout)
         self.assertNotIn("Traceback", stderr)
+
+    def test_valid_json_prepare_is_repeatable_and_byte_identical(self):
+        args = [
+            "shape",
+            "prepare",
+            "--job",
+            str(self.job_path),
+            "--backend",
+            "hunyuan3d-2.1-shape",
+            "--json",
+        ]
+        first_code, first_out, first_err = self._run(args)
+        second_code, second_out, second_err = self._run(args)
+        self.assertEqual(first_code, 0)
+        self.assertEqual(second_code, 0)
+        self.assertEqual(first_out, second_out)
+        self.assertEqual(first_err, "")
+        self.assertEqual(second_err, "")
+        payload = json.loads(first_out)
+        self.assertEqual(payload["classification"], "SHAPE_EXECUTION_REQUEST_READY")
+        self.assertTrue(payload["preparation_supported"])
+        self.assertFalse(payload["execution_supported"])
+        self.assertEqual(payload["backend"]["backend_id"], "hunyuan3d-2.1-shape")
+        self.assertEqual(
+            payload["execution_request"]["job_id"], "pharaoh-001"
+        )
+        self.assertEqual(len(payload["blockers"]), 3)
+
+    def test_human_readable_prepare_mode_is_available(self):
+        code, stdout, stderr = self._run(
+            [
+                "shape",
+                "prepare",
+                "--job",
+                str(self.job_path),
+                "--backend",
+                "hunyuan3d-2.1-shape",
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("SHAPE_EXECUTION_REQUEST_READY", stdout)
+        self.assertEqual(stderr, "")
+
+    def test_prepare_requires_backend(self):
+        with self.assertRaises(SystemExit) as caught:
+            cli.main(["shape", "prepare", "--job", str(self.job_path)])
+        self.assertEqual(caught.exception.code, 64)
+
+    def test_prepare_unknown_backend_returns_structured_error(self):
+        code, stdout, stderr = self._run(
+            [
+                "shape",
+                "prepare",
+                "--job",
+                str(self.job_path),
+                "--backend",
+                "unknown-shape",
+                "--json",
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["classification"], "UNKNOWN_SHAPE_BACKEND")
+        self.assertNotIn("Traceback", stdout)
+
+    def test_prepare_malformed_case_variant_and_padded_backend_are_refused(self):
+        for backend in ("Hunyuan3D-2.1-shape", " hunyuan3d-2.1-shape", "hunyuan3d-2.1-shape "):
+            with self.subTest(backend=backend):
+                code, stdout, stderr = self._run(
+                    [
+                        "shape",
+                        "prepare",
+                        "--job",
+                        str(self.job_path),
+                        "--backend",
+                        backend,
+                        "--json",
+                    ]
+                )
+                self.assertEqual(code, 2)
+                payload = json.loads(stdout)
+                self.assertEqual(
+                    payload["classification"], "MALFORMED_SHAPE_BACKEND"
+                )
+                self.assertEqual(stderr, "")
+
+    def test_prepare_uses_no_network_writes_or_model_cache(self):
+        with (
+            mock.patch("socket.create_connection", side_effect=AssertionError("network")),
+            mock.patch("urllib.request.urlopen", side_effect=AssertionError("network")),
+            mock.patch("os.makedirs", side_effect=AssertionError("write")),
+            mock.patch("os.mkdir", side_effect=AssertionError("write")),
+            mock.patch("pathlib.Path.read_bytes", side_effect=AssertionError("cache")),
+            mock.patch("pathlib.Path.glob", side_effect=AssertionError("cache")),
+        ):
+            code, stdout, stderr = self._run(
+                [
+                    "shape",
+                    "prepare",
+                    "--job",
+                    str(self.job_path),
+                    "--backend",
+                    "hunyuan3d-2.1-shape",
+                    "--json",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["classification"], "SHAPE_EXECUTION_REQUEST_READY")
+        self.assertEqual(stderr, "")
+
+    def test_prepare_unexpected_internal_error_is_sanitized(self):
+        registry_mock = mock.Mock()
+        registry_mock.resolve.side_effect = RuntimeError("secret backend failure")
+        with mock.patch("asset_pipeline.cli.DEFAULT_REGISTRY", registry_mock):
+            code, stdout, stderr = self._run(
+                [
+                    "shape",
+                    "prepare",
+                    "--job",
+                    str(self.job_path),
+                    "--backend",
+                    "hunyuan3d-2.1-shape",
+                    "--json",
+                ]
+            )
+        self.assertEqual(code, 70)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["classification"], "INTERNAL_ERROR")
+        self.assertNotIn("secret backend failure", stdout)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_prepare_missing_input_preserves_policy_error(self):
+        (self.input_dir / "references" / "pharaoh.png").unlink()
+        code, stdout, stderr = self._run(
+            [
+                "shape",
+                "prepare",
+                "--job",
+                str(self.job_path),
+                "--backend",
+                "hunyuan3d-2.1-shape",
+                "--json",
+            ]
+        )
+        self.assertEqual(code, 2)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["classification"], "INPUT_POLICY_REFUSAL")
+
+    def test_prepare_deeply_nested_json_preserves_contract_error(self):
+        self._write_job("[" * 10000 + "0" + "]" * 10000)
+        code, stdout, stderr = self._run(
+            [
+                "shape",
+                "prepare",
+                "--job",
+                str(self.job_path),
+                "--backend",
+                "hunyuan3d-2.1-shape",
+                "--json",
+            ]
+        )
+        self.assertEqual(code, 2)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["classification"], "INVALID_JOB_DOCUMENT")
+        self.assertNotIn("Traceback", stdout)
+        self.assertEqual(stderr, "")
+
+
+    def test_prepare_fresh_process_does_not_import_heavy_runtime_modules(self):
+        script = r"""
+import io
+import json
+import os
+import sys
+import tempfile
+from contextlib import redirect_stdout
+from pathlib import Path
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+
+with tempfile.TemporaryDirectory() as directory:
+    base = Path(directory)
+    input_dir = base / "input"
+    output_dir = base / "output"
+    workspace_dir = base / "workspace"
+    for item in (input_dir, output_dir, workspace_dir):
+        item.mkdir()
+    (input_dir / "references").mkdir(parents=True)
+    (input_dir / "references" / "pharaoh.png").write_bytes(PNG_BYTES)
+    job = base / "job.json"
+    job.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "job_id": "pharaoh-001",
+                "reference_image": "references/pharaoh.png",
+                "seed": 12345,
+                "remove_background": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.environ["INPUT_DIR"] = str(input_dir)
+    os.environ["OUTPUT_DIR"] = str(output_dir)
+    os.environ["WORKSPACE_DIR"] = str(workspace_dir)
+
+    from asset_pipeline.cli import main
+
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        exit_code = main(
+            [
+                "shape",
+                "prepare",
+                "--job",
+                str(job),
+                "--backend",
+                "hunyuan3d-2.1-shape",
+                "--json",
+            ]
+        )
+    payload = json.loads(stdout.getvalue())
+    forbidden_roots = (
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "diffusers",
+        "transformers",
+        "accelerate",
+        "hunyuan3d",
+        "hy3dgen",
+        "cuda",
+        "cupy",
+    )
+    forbidden_modules = [
+        name
+        for name in sys.modules
+        if any(name == root or name.startswith(root + ".") for root in forbidden_roots)
+    ]
+    print(
+        json.dumps(
+            {
+                "exit_code": exit_code,
+                "classification": payload.get("classification"),
+                "forbidden_modules": forbidden_modules,
+            }
+        )
+    )
+    if exit_code != 0 or forbidden_modules:
+        raise SystemExit(1)
+"""
+        repo_root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["exit_code"], 0)
+        self.assertEqual(
+            payload["classification"], "SHAPE_EXECUTION_REQUEST_READY"
+        )
+        self.assertEqual(payload["forbidden_modules"], [])
 
 if __name__ == "__main__":
     unittest.main()
