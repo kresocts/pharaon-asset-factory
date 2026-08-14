@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, Optional, Sequence
 
 from .backends import BackendError, DEFAULT_REGISTRY
 from .contract import ContractError, read_job_document
-from .execution import build_preparation_envelope
+from .execution import build_preflight_envelope, build_preparation_envelope
+from .models import (
+    ModelBindingError,
+    ModelCacheVerificationError,
+    ModelManifestError,
+    bind_model_manifest,
+)
+from docker import model_cache
 from .paths import (
     InputPolicyError,
     RuntimeRootError,
@@ -71,6 +79,31 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit machine-readable JSON (the authoritative output)",
     )
+
+    preflight = shape_subparsers.add_parser(
+        "preflight",
+        help="bind one immutable shape model manifest and verify the offline cache",
+    )
+    preflight.add_argument(
+        "--job",
+        required=True,
+        help="path to the shape-job JSON document",
+    )
+    preflight.add_argument(
+        "--backend",
+        required=True,
+        help="explicit shape backend ID from the fixed local registry",
+    )
+    preflight.add_argument(
+        "--model-manifest",
+        required=True,
+        help="path to the operator-supplied immutable model manifest",
+    )
+    preflight.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON (the authoritative output)",
+    )
     return parser
 
 
@@ -96,7 +129,7 @@ def _emit_unexpected_error(exc: Exception, json_mode: bool) -> int:
             "status": "ERROR",
             "classification": "INTERNAL_ERROR",
             "exit_code": 70,
-            "message": "internal error while planning shape job",
+            "message": "internal error while handling shape command",
         }
         print(json.dumps(payload, indent=2))
         print(f"internal error: {type(exc).__name__}", file=sys.stderr)
@@ -121,6 +154,28 @@ def _print_human_plan(plan: dict[str, Any]) -> None:
     print(f"inference_backend: {requirements['inference_backend']}")
     print(f"model_weights: {requirements['model_weights']}")
     print(f"gpu: {requirements['gpu']}")
+
+
+def _print_human_preflight(envelope: dict[str, Any]) -> None:
+    job = envelope["job"]
+    paths = envelope["paths"]
+    backend = envelope["backend"]
+    binding = envelope["model_binding"]
+    cache = envelope["cache_verification"]
+    print("SHAPE_MODEL_PREFLIGHT_READY")
+    print(f"job_id: {job['job_id']}")
+    print(f"reference_image: {job['reference_image']}")
+    print(f"seed: {job['seed']}")
+    print(f"remove_background: {job['remove_background']}")
+    print(f"backend_id: {backend['backend_id']}")
+    print(f"input_image: {paths['input_image']}")
+    print(f"output_directory: {paths['output_directory']}")
+    print(f"workspace_directory: {paths['workspace_directory']}")
+    print(f"model_manifest_plan_id: {binding['plan_id']}")
+    print(f"model_cache_verified: {cache['fully_cached']}")
+    print("execution_supported: false")
+    for blocker in envelope["blockers"]:
+        print(f"blocker: {blocker['code']}")
 
 
 def _print_human_prepare(envelope: dict[str, Any]) -> None:
@@ -150,10 +205,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     json_mode = bool(getattr(args, "json", False))
-    if args.command != "shape" or args.shape_command not in {"plan", "prepare"}:
+    if args.command != "shape" or args.shape_command not in {"plan", "prepare", "preflight"}:
         parser.error(
-            "expected 'shape plan --job JOB [--json]' or "
-            "'shape prepare --job JOB --backend BACKEND [--json]'"
+            "expected 'shape plan --job JOB [--json]', "
+            "'shape prepare --job JOB --backend BACKEND [--json]', or "
+            "'shape preflight --job JOB --backend BACKEND "
+            "--model-manifest MANIFEST [--json]'"
         )
 
     try:
@@ -163,6 +220,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.shape_command == "prepare":
             backend = DEFAULT_REGISTRY.resolve(args.backend)
             result = build_preparation_envelope(document, plan, backend)
+        elif args.shape_command == "preflight":
+            backend = DEFAULT_REGISTRY.resolve(args.backend)
+            cache_root = model_cache.cache_root_from_environment()
+            binding = bind_model_manifest(
+                args.model_manifest,
+                backend_id=backend.backend_id,
+                cache_root=cache_root,
+            )
+            verification = model_cache.verify_manifest_cache(
+                args.model_manifest, cache_root
+            )
+            if not verification["fully_cached"]:
+                raise ModelCacheVerificationError(
+                    "one or more model cache artifacts are not verified"
+                )
+            result = build_preflight_envelope(
+                document, plan, backend, binding, verification
+            )
         else:
             result = plan
     except (
@@ -171,6 +246,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         InputPolicyError,
         SafePathError,
         BackendError,
+        ModelBindingError,
+        ModelManifestError,
+        ModelCacheVerificationError,
+        model_cache.ManifestValidationError,
     ) as exc:
         return _emit_expected_error(exc, json_mode)
     except Exception as exc:  # pragma: no cover - defensive unexpected boundary
@@ -180,6 +259,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(result, indent=2))
     elif args.shape_command == "prepare":
         _print_human_prepare(result)
+    elif args.shape_command == "preflight":
+        _print_human_preflight(result)
     else:
         _print_human_plan(result)
     return 0

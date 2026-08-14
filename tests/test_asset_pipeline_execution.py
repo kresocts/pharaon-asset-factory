@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from asset_pipeline import backends, contract, execution, paths
+from asset_pipeline import backends, contract, execution, models, paths
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
@@ -115,6 +115,112 @@ class ExecutionRequestTests(unittest.TestCase):
         self.assertNotIn("pid", raw.lower())
         self.assertNotIn("hostname", raw.lower())
         self.assertNotIn("username", raw.lower())
+
+
+class PreflightEnvelopeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.input_dir = base / "input"
+        self.output_dir = base / "output"
+        self.workspace_dir = base / "workspace"
+        for directory in (self.input_dir, self.output_dir, self.workspace_dir):
+            directory.mkdir()
+        (self.input_dir / "references").mkdir(parents=True)
+        (self.input_dir / "references" / "pharaoh.png").write_bytes(PNG_BYTES)
+        self.roots = paths.load_runtime_roots(
+            {
+                "INPUT_DIR": str(self.input_dir),
+                "OUTPUT_DIR": str(self.output_dir),
+                "WORKSPACE_DIR": str(self.workspace_dir),
+            }
+        )
+        self.backend = backends.DEFAULT_REGISTRY.resolve(
+            backends.CANONICAL_BACKEND_ID
+        )
+        document = contract.validate_job_document(_document())
+        self.plan = paths.build_plan(document, self.roots)
+        self.document = document
+
+    def _binding(self):
+        revision = "a" * 40
+        files = (
+            models.ModelFileBinding("config/model.json", "shape-config", 1, "0" * 64),
+            models.ModelFileBinding(
+                "weights/model.safetensors", "shape-weights", 2, "1" * 64
+            ),
+        )
+        return models.ModelBinding(
+            schema_version=1,
+            backend_id="hunyuan3d-2.1-shape",
+            artifact_set="hunyuan3d-2.1-shape",
+            revision=revision,
+            namespace=f"hunyuan3d-2.1-shape/{revision}",
+            plan_id="2" * 64,
+            model_root="/models/hunyuan3d-2.1-shape/" + revision,
+            file_count=2,
+            total_expected_bytes=3,
+            files=files,
+        )
+
+    def _verification(self):
+        return {
+            "schema_version": 1,
+            "command": "verify",
+            "success": True,
+            "classification": "OK",
+            "exit_code": 0,
+            "artifact_set": "hunyuan3d-2.1-shape",
+            "revision": "a" * 40,
+            "namespace": "hunyuan3d-2.1-shape/" + "a" * 40,
+            "plan_id": "2" * 64,
+            "cache_root": "/models",
+            "file_count": 2,
+            "file_counts": {
+                "ABSENT": 0,
+                "PARTIAL": 0,
+                "CORRUPTED": 0,
+                "VERIFIED": 2,
+            },
+            "bytes": {"total_expected": 3, "required": 0, "max_bytes": None},
+            "fully_cached": True,
+            "files": [],
+        }
+
+    def test_preflight_envelope_is_deterministic_and_complete(self):
+        binding = self._binding()
+        verification = self._verification()
+        first = execution.build_preflight_envelope(
+            self.document, self.plan, self.backend, binding, verification
+        )
+        second = execution.build_preflight_envelope(
+            self.document, self.plan, self.backend, binding, verification
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["classification"], "SHAPE_MODEL_PREFLIGHT_READY")
+        self.assertEqual(first["exit_code"], 0)
+        self.assertTrue(first["preparation_supported"])
+        self.assertTrue(first["model_binding_supported"])
+        self.assertTrue(first["model_cache_verified"])
+        self.assertFalse(first["execution_supported"])
+        self.assertEqual(
+            [blocker["code"] for blocker in first["blockers"]],
+            ["GPU_EXECUTION_NOT_IMPLEMENTED"],
+        )
+        self.assertEqual(first["cache_verification"]["required_bytes"], 0)
+        self.assertTrue(first["cache_verification"]["fully_cached"])
+        self.assertNotIn("url", json.dumps(first["model_binding"]))
+
+    def test_preflight_emitted_dictionaries_are_defensive(self):
+        binding = self._binding()
+        envelope = execution.build_preflight_envelope(
+            self.document, self.plan, self.backend, binding, self._verification()
+        )
+        envelope["model_binding"]["files"].append({"path": "mutated"})
+        envelope["cache_verification"]["state_counts"]["VERIFIED"] = 999
+        self.assertEqual(len(binding.files), 2)
+        self.assertEqual(binding.files[0].path, "config/model.json")
 
 
 if __name__ == "__main__":
