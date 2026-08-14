@@ -171,6 +171,64 @@ class PublisherLogicTests(unittest.TestCase):
         self.assertIn("RUN LOCAL PUBLISHER TEST", self.integration)
         self.assertIn("[switch]$PreflightOnly", self.integration)
 
+    def _run_pwsh_exit(self, body: str) -> subprocess.CompletedProcess:
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        env = os.environ.copy()
+        env["REPO_ROOT"] = str(ROOT)
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            ". (Join-Path $env:REPO_ROOT 'scripts/publisher/publisher.ps1')\n"
+            + body
+        )
+        return subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_integration_script_uses_explicit_exit_decision(self) -> None:
+        self.assertIn("function Get-PublisherProcessExitCode", self.publisher)
+        self.assertIn("$primaryFailure = $null", self.integration)
+        self.assertIn("$primarySucceeded = $false", self.integration)
+        self.assertIn("$cleanupFailures = New-Object System.Collections.Generic.List[string]", self.integration)
+        self.assertIn("Get-PublisherProcessExitCode", self.integration)
+        self.assertIn("exit $finalExitCode", self.integration)
+        self.assertNotIn("Set-Content -LiteralPath $RecordPath", self.integration)
+
+    def test_integration_cleanup_runs_in_finally_and_feeds_exit_code(self) -> None:
+        self.assertIn("finally {", self.integration)
+        self.assertIn("docker rm --force --volumes $registryContainer", self.integration)
+        self.assertIn("Remove-Item -LiteralPath $tempBase -Recurse -Force", self.integration)
+        self.assertIn("Get-PublisherProcessExitCode", self.integration)
+        self.assertIn("CLEANUP_FAILURE=", self.integration)
+
+    @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
+    def test_process_exit_failure_is_not_converted_by_later_write_host(self) -> None:
+        result = self._run_pwsh_exit(
+            "Write-Host 'later-success'\n"
+            "exit (Get-PublisherProcessExitCode -PrimarySuccess $false -CleanupSuccess $true -EvidenceWritten $false)\n"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("later-success", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
+    def test_process_exit_success_requires_cleanup_and_evidence(self) -> None:
+        result = self._run_pwsh_exit(
+            "exit (Get-PublisherProcessExitCode -PrimarySuccess $true -CleanupSuccess $true -EvidenceWritten $true)\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
+    def test_process_exit_cleanup_failure_is_nonzero(self) -> None:
+        result = self._run_pwsh_exit(
+            "exit (Get-PublisherProcessExitCode -PrimarySuccess $true -CleanupSuccess $false -EvidenceWritten $false)\n"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+
     @unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"), "PowerShell is not available")
     def test_pure_powershell_functions_when_pwsh_available(self) -> None:
         script = (

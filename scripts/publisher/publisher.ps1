@@ -359,3 +359,16 @@ function Get-PublisherDigestQualifiedReference {
 
     return "${Image}@${Digest}"
 }
+
+function Get-PublisherProcessExitCode {
+    param(
+        [bool]$PrimarySuccess,
+        [bool]$CleanupSuccess,
+        [bool]$EvidenceWritten
+    )
+
+    if (-not $PrimarySuccess -or -not $CleanupSuccess -or -not $EvidenceWritten) {
+        return 1
+    }
+    return 0
+}

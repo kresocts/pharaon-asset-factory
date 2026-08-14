@@ -78,6 +78,16 @@ def _block_after(raw: str, marker: str) -> str:
     return "\n".join(block)
 
 
+def _step_block(raw: str, name: str) -> str:
+    marker = f"      - name: {name}"
+    start = raw.index(marker)
+    rest = raw[start:]
+    next_marker = rest.find("\n      - name:", len(marker))
+    if next_marker == -1:
+        return rest
+    return rest[:next_marker]
+
+
 def _list_after(raw: str, marker: str) -> list[str]:
     match = re.search(rf"^\s*{re.escape(marker)}\s*\n((?:^\s*-\s+.*\n?)+)", raw, flags=re.MULTILINE)
     if not match:
@@ -182,7 +192,7 @@ class GhcrWorkflowTests(unittest.TestCase):
         self.assertNotRegex(self.publisher, r"\+\[0-9a-z")
         self.assertNotIn("$segments", self.publisher)
         self.assertNotIn("$mutable", self.publisher)
-        self.assertIn("Assert-PublisherReleaseTag -ReleaseTag $releaseTag", self.raw)
+        self.assertIn("Assert-PublisherReleaseTag -ReleaseTag $env:RELEASE_TAG", self.raw)
 
     def test_release_tag_grammar_adversarial(self) -> None:
         valid = [
@@ -361,6 +371,30 @@ class GhcrWorkflowTests(unittest.TestCase):
             self.raw.index("$requiredFreeGiB = [int64]150"),
             self.raw.index("Authenticate to GHCR with temporary Docker config"),
         )
+
+    def test_pre_checkout_preflight_is_self_contained(self) -> None:
+        first_step = _step_block(self.raw, "Trusted-context preflight")
+        self.assertNotIn("PUBLISHER_SCRIPT", first_step)
+        self.assertNotIn("GITHUB_WORKSPACE", first_step)
+        self.assertNotIn("publisher.ps1", first_step)
+        self.assertNotIn(". $publisherScript", first_step)
+        self.assertIn("github.sha is not a full 40-character lowercase hex SHA", first_step)
+        self.assertIn("release_tag must be an immutable version such as v1.0.0 or v1.2.3-rc.1.", first_step)
+
+    def test_checkout_and_head_verification_precede_shared_publisher_code(self) -> None:
+        checkout_index = self.raw.index("- name: Check out repository")
+        verify_index = self.raw.index("- name: Verify checked-out commit and clean tree")
+        load_index = self.raw.index("- name: Load verified publisher script and revalidate tags")
+        first_dot_source = self.raw.index(". $publisherScript")
+        self.assertLess(checkout_index, verify_index)
+        self.assertLess(verify_index, load_index)
+        self.assertLess(load_index, first_dot_source)
+
+    def test_no_repository_code_executes_before_checkout(self) -> None:
+        checkout_index = self.raw.index("- name: Check out repository")
+        prefix = self.raw[:checkout_index]
+        self.assertNotIn(". $publisherScript", prefix)
+        self.assertNotIn(". $publisherScript", prefix)
 
     def test_no_forbidden_automation_or_cloud_runner_paths(self) -> None:
         forbidden_patterns = [

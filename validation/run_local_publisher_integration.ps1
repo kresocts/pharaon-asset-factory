@@ -240,7 +240,11 @@ $metadataFile = Join-Path $tempBase "build-metadata.json"
 $buildLog = Join-Path $tempBase "buildx-build.log"
 $digest = ""
 $digestQualified = ""
-$result = "NOT_STARTED"
+$primaryFailure = $null
+$primarySucceeded = $false
+$evidenceWritten = $false
+$cleanupSucceeded = $false
+$cleanupFailures = New-Object System.Collections.Generic.List[string]
 
 try {
     $registryPort = Get-AvailableLoopbackPort
@@ -381,7 +385,84 @@ try {
         throw "Offline model status did not remain offline or failed."
     }
 
-    $result = "PASS"
+
+    $primarySucceeded = $true
+}
+catch {
+    $primaryFailure = $_
+    Write-Host "PRIMARY_FAILURE=$($_.Exception.Message)"
+}
+finally {
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $pulledImageRemoved = $true
+        if ($digestQualified) {
+            docker rmi $digestQualified 2>$null | Out-Null
+            & docker image inspect $digestQualified 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $pulledImageRemoved = $false
+            }
+        }
+        if (-not $pulledImageRemoved) {
+            $cleanupFailures.Add("pulled digest image still present")
+        }
+
+        $registryGone = $true
+        if ($registryContainer) {
+            $ids = & docker ps -a --filter "name=^/$registryContainer$" --format "{{.ID}}"
+            if ($ids) {
+                docker rm --force --volumes $registryContainer 2>$null | Out-Null
+            }
+            $remaining = & docker ps -a --filter "name=^/$registryContainer$" --format "{{.ID}}"
+            if (($remaining | ForEach-Object { $_.ToString() }) -join "") {
+                $registryGone = $false
+            }
+        }
+        if (-not $registryGone) {
+            $cleanupFailures.Add("registry container still present")
+        }
+
+        if (Test-Path -LiteralPath $tempBase) {
+            Remove-Item -LiteralPath $tempBase -Recurse -Force -ErrorAction Continue
+        }
+        $tempDirGone = -not (Test-Path -LiteralPath $tempBase)
+        if (-not $tempDirGone) {
+            $cleanupFailures.Add("temporary directory still present")
+        }
+
+        if ($registryPort -gt 0) {
+            $portClosed = Test-LoopbackPortClosed -Port $registryPort
+        }
+        else {
+            $portClosed = $true
+        }
+        if (-not $portClosed) {
+            $cleanupFailures.Add("loopback port still listening")
+        }
+
+        $normalConfigAfter = Get-DockerConfigFingerprint -Path $normalDockerConfig
+        $normalConfigUnchanged = ($normalConfigAfter -eq $normalConfigBefore)
+        if (-not $normalConfigUnchanged) {
+            $cleanupFailures.Add("normal Docker config changed")
+        }
+
+        docker buildx inspect | Out-Null
+        $cacheProbeExit = $LASTEXITCODE
+        $cacheAvailable = ($cacheProbeExit -eq 0)
+        if (-not $cacheAvailable) {
+            $cleanupFailures.Add("Buildx cache unavailable after cleanup")
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+}
+
+$cleanupSucceeded = ($cleanupFailures.Count -eq 0)
+$finalExitCode = Get-PublisherProcessExitCode -PrimarySuccess $primarySucceeded -CleanupSuccess $cleanupSucceeded -EvidenceWritten $false
+
+if ($primarySucceeded -and $cleanupSucceeded) {
     $record = @"
 # T-0016 local publisher integration validation
 
@@ -398,15 +479,15 @@ Branch: $branch
 - D drive free before build: $diskBefore bytes
 - D drive free after build: $diskAfter bytes
 - Registry image: $RegistryImage
-- Loopback binding: `127.0.0.1:$registryPort->5000`
+- Loopback binding: 127.0.0.1:$registryPort->5000
 
 ## Build
 
-- Exact command: shared `Invoke-PublisherBuildxBuild` with `--file docker/Dockerfile --platform linux/amd64 --provenance=false --sbom=false --push`, SHA/release tags, OCI labels, temporary Docker config, and no cache-pruning flags.
+- Exact command: Invoke-PublisherBuildxBuild --file docker/Dockerfile --platform linux/amd64 --provenance=false --sbom=false --push
 - Start: $($buildStart.ToString("o"))
 - End: $($buildEnd.ToString("o"))
 - Duration: $([math]::Round($buildDuration.TotalSeconds, 2)) seconds
-- Cache observation: Buildx used the existing default builder without `--no-cache`, prune, or external cache export. Exact cache reuse was not independently measured from raw logs.
+- Cache observation: Buildx used the existing default builder without --no-cache, prune, or external cache export. Exact cache reuse was not independently measured from raw logs.
 
 ## Tags and digest
 
@@ -423,7 +504,7 @@ Branch: $branch
 - Before build: both tags classified ABSENT.
 - After push: both tags classified EXISTING.
 - Second preflight refusal: PASS ($refusalMessage)
-- Observed absence output shape:
+- Observed absence output:
   - SHA tag exit code: $($absenceOutputs[0].ExitCode)
   - SHA tag first line: $($absenceOutputs[0].Text.Split("`n")[0])
   - Release tag exit code: $($absenceOutputs[1].ExitCode)
@@ -440,69 +521,35 @@ Branch: $branch
 
 ## Cleanup and integrity
 
-- Registry container removed: PASS
-- Localhost port closed after cleanup: PASS
-- Ticket-owned temporary directory removed: PASS
-- Normal Docker config unchanged: PASS
-- Shared Docker Buildx cache remains available: PASS
+- Registry container removed: $registryGone
+- Loopback port closed: $portClosed
+- Ticket-owned temporary directory removed: $tempDirGone
+- Normal Docker config unchanged: $normalConfigUnchanged
+- Shared Docker Buildx cache available: $cacheAvailable
+- Pulled digest image removed: $pulledImageRemoved
 - No GHCR authentication, request, or publication occurred.
 - Self-hosted runner remained offline and unused.
 - No model weights were downloaded.
 - No paid or cloud resources were used.
 "@
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $RecordPath) | Out-Null
-    Set-Content -LiteralPath $RecordPath -Value $record -Encoding UTF8
-    Write-Host "RESULT=PASS"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Resolve-Path -LiteralPath $RecordPath).Path, $record, $utf8NoBom)
+    $evidenceWritten = $true
+    $finalExitCode = Get-PublisherProcessExitCode -PrimarySuccess $true -CleanupSuccess $true -EvidenceWritten $true
 }
-catch {
-    $result = "FAIL"
-    Write-Host "RESULT=FAIL"
-    Write-Host "ERROR=$($_.Exception.Message)"
+
+if ($primaryFailure) {
+    Write-Host "PRIMARY_FAILURE=$($primaryFailure.Exception.Message)"
 }
-finally {
-    if ($digestQualified) {
-        docker rmi $digestQualified 2>$null | Out-Null
-    }
-
-    if ($registryContainer) {
-        $ids = & docker ps -a --filter "name=^/$registryContainer$" --format "{{.ID}}"
-        if ($ids) {
-            docker rm --force --volumes $registryContainer 2>$null | Out-Null
-        }
-    }
-
-    if (Test-Path -LiteralPath $tempBase) {
-        Remove-Item -LiteralPath $tempBase -Recurse -Force
-    }
-
-    if ($registryPort -gt 0) {
-        $portClosed = Test-LoopbackPortClosed -Port $registryPort
-    }
-    else {
-        $portClosed = $true
-    }
-
-    $normalConfigAfter = Get-DockerConfigFingerprint -Path $normalDockerConfig
-    $normalConfigUnchanged = ($normalConfigAfter -eq $normalConfigBefore)
-
-    $cacheAvailable = $false
-    docker buildx inspect | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        $cacheAvailable = $true
-    }
-
-    $registryGone = $true
-    if ($registryContainer) {
-        $remaining = & docker ps -a --filter "name=^/$registryContainer$" --format "{{.ID}}"
-        if ($remaining) {
-            $registryGone = $false
-        }
-    }
-
-    Write-Host "CLEANUP_REGISTRY_GONE=$registryGone"
-    Write-Host "CLEANUP_PORT_CLOSED=$portClosed"
-    Write-Host "CLEANUP_TEMP_DIR_GONE=$(-not (Test-Path -LiteralPath $tempBase))"
-    Write-Host "CLEANUP_NORMAL_DOCKER_CONFIG_UNCHANGED=$normalConfigUnchanged"
-    Write-Host "CLEANUP_BUILDX_CACHE_AVAILABLE=$cacheAvailable"
-    Write-Host "FINAL_RESULT=$result"
+foreach ($failure in $cleanupFailures) {
+    Write-Host "CLEANUP_FAILURE=$failure"
 }
+Write-Host "CLEANUP_REGISTRY_GONE=$registryGone"
+Write-Host "CLEANUP_PORT_CLOSED=$portClosed"
+Write-Host "CLEANUP_TEMP_DIR_GONE=$tempDirGone"
+Write-Host "CLEANUP_NORMAL_DOCKER_CONFIG_UNCHANGED=$normalConfigUnchanged"
+Write-Host "CLEANUP_BUILDX_CACHE_AVAILABLE=$cacheAvailable"
+Write-Host "CLEANUP_PULLED_IMAGE_REMOVED=$pulledImageRemoved"
+Write-Host "RESULT=$(if ($finalExitCode -eq 0) { 'PASS' } else { 'FAIL' })"
+exit $finalExitCode

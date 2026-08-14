@@ -59,8 +59,6 @@ jobs:
           RUNNER_OS: ${{ runner.os }}
         run: |
           $ErrorActionPreference = "Stop"
-          $publisherScript = Join-Path $env:GITHUB_WORKSPACE $env:PUBLISHER_SCRIPT
-          . $publisherScript
 
           if ($env:EVENT_NAME -ne "workflow_dispatch") {
             throw "Publication is only allowed from workflow_dispatch."
@@ -85,8 +83,27 @@ jobs:
           }
 
           $releaseTag = $env:RELEASE_TAG
-          Assert-PublisherShaTag -Sha $env:SHA
-          Assert-PublisherReleaseTag -ReleaseTag $releaseTag
+          if ($releaseTag -ne "") {
+            if ($releaseTag.Length -gt 128) {
+              throw "release_tag is excessively long."
+            }
+            if ($releaseTag -match "\s") {
+              throw "release_tag contains whitespace."
+            }
+            if ($releaseTag.Contains("/")) {
+              throw "release_tag contains a slash."
+            }
+            if ($releaseTag.ToLowerInvariant() -cne $releaseTag) {
+              throw "release_tag contains uppercase characters."
+            }
+            if ($releaseTag -match '[&|;<>$]') {
+              throw "release_tag contains shell metacharacters."
+            }
+            if (-not ($releaseTag -cmatch "^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:[0-9a-z]+(?:-[0-9a-z]+)*)(?:\.(?:[0-9a-z]+(?:-[0-9a-z]+)*))*)?$")) {
+              throw "release_tag must be an immutable version such as v1.0.0 or v1.2.3-rc.1."
+            }
+          }
+
           Write-Host "Trusted-context preflight passed."
 
       - name: Check out repository
@@ -111,6 +128,20 @@ jobs:
             throw "Working tree is not clean after checkout."
           }
           Write-Host "Checkout verified."
+
+      - name: Load verified publisher script and revalidate tags
+        shell: pwsh
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publisherScript = Join-Path $env:GITHUB_WORKSPACE $env:PUBLISHER_SCRIPT
+          . $publisherScript
+
+          Assert-PublisherShaTag -Sha $env:GITHUB_SHA
+          Assert-PublisherReleaseTag -ReleaseTag $env:RELEASE_TAG
+          Write-Host "Shared publisher tag validation passed after checkout."
 
       - name: Docker and D-drive preflight
         shell: pwsh
