@@ -19,9 +19,11 @@ performs no network access until the manifest, cache state, byte budget, file-co
 policy, and artifact-set lock all pass. Downloads stream into a `.part` temporary
 file, verify exact size and SHA-256, and promote atomically; verified files are reused
 without network access. Retries (2) and timeouts (10 s connect, 30 s read) are finite,
-and integrity and permanent 4xx failures are never retried. A per-plan atomic lock
-under the cache serializes acquisition with a bounded wait and conservative
-stale-lock handling that never breaks an active lock. Every subcommand emits versioned
+and integrity and permanent 4xx failures are never retried. A per-destination atomic
+lock under the cache serializes acquisition with a bounded wait; every lock carries a
+unique owner token, `touch()`/`release()` act only while the token still matches,
+automatic stale-lock removal is disabled, and stale locks are removed manually by an
+operator after confirming no active acquisition. Every subcommand emits versioned
 JSON with a fixed exit-code contract. Docker build, startup, health, and readiness
 remain download-free. T-0014 validation uses only tiny local fixtures; production
 Hunyuan manifests and the first real acquisition are deferred to a later explicitly
@@ -30,9 +32,10 @@ approved ticket.
 **Consequences:** Operators and future controllers get a scriptable, budgeted,
 integrity-checked model-cache boundary without startup downloads or accidental
 spending. The manifest, lock, and exit-code contracts become stable interfaces that
-must be versioned and documented before breaking changes. The 24-hour stale-lock
-grace favors safety over convenience; a crashed acquisition leaves a conservative
-lock that an operator may remove manually after confirming no active acquisition.
+must be versioned and documented before breaking changes. Automatic stale-lock
+removal is disabled: a crashed or stale lock remains until an operator removes it
+manually after confirming no active acquisition, and conflicts return `LOCK_CONFLICT`
+after the bounded wait.
 
 **Alternatives considered:** Downloading weights during the image build would bake
 licensed mutable data into layers and violate the external-cache boundary. A startup

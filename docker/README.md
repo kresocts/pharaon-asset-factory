@@ -284,17 +284,17 @@ Acquisition is serialized per destination namespace with an atomic lock director
 under `<cache root>/.locks/<first namespace component>`. Any manifests that can write
 overlapping destination paths share the same lock even when their URLs, hashes, roles,
 or plan digests differ; the complete-manifest `plan_id` remains reported separately.
-Lock acquisition waits at most 10 seconds and then fails cleanly with exit code `6`
-and `LOCK_CONFLICT` classification, preserving the full manifest and cache context
-(artifact identity, plan id, per-file states, byte totals, and cache root) in the JSON
-response. Stale locks are
-handled conservatively: a lock is broken only when its owner metadata is older than 24
-hours AND the recorded owner process is no longer alive; an active lock is never broken.
-If a stale lock cannot actually be removed (for example an unremovable `owner.json`
-entry), acquisition keeps polling against the bounded wait and returns `LOCK_CONFLICT`
-when it expires; it never busy-loops, never follows owner-metadata symlinks, and never
-removes directories recursively. The lock holder refreshes the owner heartbeat during
-long downloads and removes the lock on completion.
+Every successful acquisition writes a unique unpredictable `owner_token` into
+`owner.json`; `touch()` refreshes the heartbeat and `release()` removes the lock only
+while `owner.json` still contains the object's own token, so a replaced lock
+generation is never touched or deleted. Automatic stale-lock removal is disabled:
+stale locks are removed manually by an operator after confirming no active
+acquisition. Lock acquisition waits at most 10 seconds and then fails cleanly with
+exit code `6` and `LOCK_CONFLICT` classification (including a hint when the existing
+lock appears stale), preserving the full manifest and cache context (artifact
+identity, plan id, per-file states, byte totals, and cache root) in the JSON
+response. The lock holder refreshes the owner heartbeat during long downloads and
+removes its own lock on completion.
 
 ### JSON and exit-code contract
 

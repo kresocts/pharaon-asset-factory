@@ -38,6 +38,7 @@ import http.client
 import json
 import os
 import re
+import secrets
 import ssl
 import sys
 import time
@@ -624,10 +625,13 @@ class _ArtifactLock:
     The lock key is the first validated namespace component, so manifests that
     can write overlapping destination paths serialize even when their URLs,
     hashes, roles, or plan digests differ. Acquisition uses atomic directory
-    creation. A bounded wait is attempted before failing with a clean
-    LOCK_CONFLICT. Stale locks are broken only conservatively: the owner
-    metadata must be older than a long grace period AND the recorded owner
-    process must no longer be alive. An active lock is never broken.
+    creation and writes a unique unpredictable owner token into owner.json.
+    touch() and release() act only while owner.json still contains this
+    object's token, so a replaced lock generation is never touched. Automatic
+    stale-lock removal is disabled: any existing lock (stale or not) is left
+    untouched, acquisition polls against the bounded wait and returns
+    LOCK_CONFLICT, and stale locks are removed manually by an operator after
+    confirming no active acquisition.
     """
 
     def __init__(self, cache_root: Path, lock_key: str, plan_id: str) -> None:
@@ -636,9 +640,11 @@ class _ArtifactLock:
         self.lock_key = lock_key
         self.lock_dir = self.lock_root / lock_key
         self.owner_path = self.lock_dir / "owner.json"
+        self.owner_token = secrets.token_hex(16)
         self.owner = {
             "lock_key": lock_key,
             "plan_id": plan_id,
+            "owner_token": self.owner_token,
             "pid": os.getpid(),
             "start_epoch": time.time(),
         }
@@ -670,6 +676,28 @@ class _ArtifactLock:
             raise ManifestValidationError(
                 f"lock root escapes the model cache: {self.lock_root} resolves outside {real_root}"
             ) from error
+
+    def _owns_lock(self) -> bool:
+        """Return True only while owner.json belongs to this acquisition.
+
+        Owner metadata is read without following symlinks, and the comparison
+        is based on the unique owner token, never on PID or path identity
+        alone.
+        """
+        try:
+            if self.owner_path.is_symlink() or not self.owner_path.is_file():
+                return False
+            owner = json.loads(self.owner_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return isinstance(owner, dict) and owner.get("owner_token") == self.owner_token
+
+    def _cleanup_created_lock(self) -> None:
+        """Remove the lock directory this object just created (no owner yet)."""
+        try:
+            self.lock_dir.rmdir()
+        except OSError:
+            pass
 
     @staticmethod
     def _owner_alive(pid: int) -> bool:
@@ -709,27 +737,6 @@ class _ArtifactLock:
         except OSError:
             return False
 
-    def _break_stale(self) -> bool:
-        """Attempt to remove a stale lock; True only when removal succeeded.
-
-        Owner metadata is unlinked without following symlinks, and directories
-        are never removed recursively. Any failure leaves the lock remnants
-        intact and reports False so the caller can keep polling against the
-        bounded deadline instead of busy-looping.
-        """
-        if not self.lock_dir.is_dir():
-            return False
-        try:
-            if self.owner_path.is_symlink() or self.owner_path.is_file():
-                self.owner_path.unlink()
-        except OSError:
-            return False
-        try:
-            self.lock_dir.rmdir()
-        except OSError:
-            return False
-        return not self.lock_dir.exists()
-
     def acquire(self) -> None:
         self._validate_lock_root()
         if self.lock_dir.is_symlink():
@@ -740,16 +747,21 @@ class _ArtifactLock:
                 os.mkdir(self.lock_dir)
                 break
             except FileExistsError:
-                # Retry creation immediately only when the stale lock was
-                # actually removed. An unremovable stale lock (for example an
-                # owner.json directory) keeps polling against the bounded
-                # deadline and fails with LOCK_CONFLICT when it expires.
-                if self._stale(self.lock_dir) and self._break_stale():
-                    continue
+                # Automatic stale-lock removal is disabled: an existing lock
+                # generation is never deleted (not even a stale one), so an
+                # active replacement can never be destroyed by a stale
+                # observer. Acquisition polls against the bounded deadline and
+                # fails with LOCK_CONFLICT.
                 if time.monotonic() >= deadline:
+                    stale_hint = ""
+                    if self._stale(self.lock_dir):
+                        stale_hint = (
+                            "; existing lock appears stale; stale lock removal "
+                            "is a manual operator action"
+                        )
                     raise LockConflictError(
                         f"another process holds the artifact-set lock {self.lock_dir.name}; "
-                        f"waited {LOCK_WAIT_SECONDS:g}s without success"
+                        f"waited {LOCK_WAIT_SECONDS:g}s without success{stale_hint}"
                     )
                 time.sleep(LOCK_POLL_INTERVAL)
             except OSError as error:
@@ -761,12 +773,12 @@ class _ArtifactLock:
                 Path(os.path.realpath(self.cache_root))
             )
         except ValueError as error:
-            self.release()
+            self._cleanup_created_lock()
             raise ManifestValidationError(
                 f"lock directory escapes the model cache: {self.lock_dir}"
             ) from error
         if self.owner_path.is_symlink():
-            self.release()
+            self._cleanup_created_lock()
             raise ManifestValidationError(
                 f"lock owner metadata is a symlink: {self.owner_path}"
             )
@@ -775,23 +787,31 @@ class _ArtifactLock:
                 json.dumps(self.owner, sort_keys=True), encoding="utf-8"
             )
         except OSError as error:
-            self.release()
+            self._cleanup_created_lock()
             raise LockConflictError(f"could not write lock owner metadata: {error}") from error
 
     def touch(self) -> None:
-        """Refresh the owner heartbeat during long downloads."""
-        try:
-            if self.owner_path.exists():
+        """Refresh the heartbeat only while this acquisition still owns the lock."""
+        if self._owns_lock():
+            try:
                 os.utime(self.owner_path, None)
-        except OSError:
-            pass
+            except OSError:
+                pass
 
     def release(self) -> None:
+        """Remove the lock only while this acquisition still owns it.
+
+        If the lock generation was replaced by another owner token, the
+        replacement lock and its owner metadata are left completely untouched.
+        """
+        if not self._owns_lock():
+            return
         try:
-            if self.owner_path.exists():
-                self.owner_path.unlink()
-            if self.lock_dir.is_dir():
-                self.lock_dir.rmdir()
+            self.owner_path.unlink()
+        except OSError:
+            return
+        try:
+            self.lock_dir.rmdir()
         except OSError:
             pass
 
