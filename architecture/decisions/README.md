@@ -23,3 +23,4 @@ Keep ADRs concise and link the relevant ticket and pull request. Do not rewrite 
 - [0007: Secure Windows GHCR publishing workflow](0007-secure-ghcr-publishing-workflow.md)
 - [0008: Deterministic shape-job contract and offline preflight](0008-deterministic-shape-job-contract.md)
 - [0009: Shape execution-request and backend registry](0009-shape-execution-request-and-backend-registry.md)
+- [0010: Immutable shape-model binding and offline cache preflight](0010-immutable-shape-model-binding-and-offline-cache-preflight.md)

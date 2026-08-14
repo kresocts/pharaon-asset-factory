@@ -29,9 +29,26 @@ python -m asset_pipeline.cli shape prepare --job path/to/job.json --backend huny
 canonical Hunyuan3D 2.1 shape backend from a fixed local registry, and emits a
 schema-versioned execution request. It reports `preparation_supported: true` and
 `execution_supported: false`, with deterministic blockers for future model binding,
-model-cache verification, and GPU execution. Shape generation, texture generation,
-post-processing, packaging, and API/server work remain future tickets, and Phase 2 is
-not complete.
+model-cache verification, and GPU execution.
+
+T-0023 adds the offline model-binding/cache-preflight boundary:
+
+```bash
+python -m asset_pipeline.cli shape preflight   --job path/to/job.json   --backend hunyuan3d-2.1-shape   --model-manifest path/to/model-manifest.json   --json
+```
+
+`shape preflight` validates one operator-supplied immutable Hunyuan shape-model
+manifest with the existing T-0014 policy and verifies every required artifact already
+present in `MODEL_CACHE_DIR` by exact size and SHA-256. It performs no writes,
+downloads, network access, heavy ML imports, GPU initialization, or inference. On
+success it reports `SHAPE_MODEL_PREFLIGHT_READY`, `model_binding_supported: true`,
+`model_cache_verified: true`, and `execution_supported: false`, with only the
+`GPU_EXECUTION_NOT_IMPLEMENTED` blocker remaining. The real official production model
+manifest/license/provenance and Hunyuan runtime/GPU execution remain future tickets;
+no weights or inference are implemented.
+
+Shape generation, texture generation, post-processing, packaging, and API/server work
+remain future tickets, and Phase 2 is not complete.
 
 ## Intended architecture
 

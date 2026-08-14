@@ -290,5 +290,156 @@ class OfflinePlanTests(unittest.TestCase):
         self.assertIn("reserved temporary path is unsafe", by_path["data/a.bin"]["detail"])
 
 
+    def test_public_verify_api_matches_cli(self):
+        with mock.patch.object(module, "_opener", side_effect=AssertionError("network access")):
+            cli_code, cli_report = self._run("verify")
+        api_report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        self.assertEqual(cli_code, 4)
+        self.assertEqual(api_report, cli_report)
+        self.assertEqual(api_report["plan_id"], cli_report["plan_id"])
+        self.assertEqual(api_report["file_counts"], cli_report["file_counts"])
+        self.assertEqual(api_report["bytes"], cli_report["bytes"])
+        self.assertEqual(api_report["fully_cached"], False)
+
+    def test_parsed_verify_api_matches_path_based_api(self):
+        parsed = module.parse_manifest(self.fixture.manifest_path)
+        path_report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        parsed_report = module.verify_parsed_manifest_cache(
+            parsed, self.fixture.cache
+        )
+        self.assertEqual(parsed_report, path_report)
+
+    def test_public_verify_api_fully_verified_cache(self):
+        for name, data in self.fixture.files.items():
+            target = self.fixture.target(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        self.assertTrue(report["success"])
+        self.assertEqual(report["classification"], "OK")
+        self.assertEqual(report["exit_code"], 0)
+        self.assertTrue(report["fully_cached"])
+        self.assertEqual(report["file_counts"]["VERIFIED"], 2)
+        self.assertEqual(report["bytes"]["required"], 0)
+
+    def test_public_verify_api_absent_partial_size_and_sha(self):
+        # Absent.
+        report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        self.assertFalse(report["success"])
+        self.assertEqual(report["file_counts"]["ABSENT"], 2)
+        self.assertEqual(report["bytes"]["required"], 48)
+
+        # Partial.
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.with_name("_acq-a1.part").write_bytes(b"partial")
+        report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual(by_path["data/a.bin"]["state"], "PARTIAL")
+
+        # Size mismatch.
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"short")
+        report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual(by_path["data/a.bin"]["state"], "CORRUPTED")
+        self.assertIn("size mismatch", by_path["data/a.bin"]["detail"])
+
+        # SHA-256 mismatch.
+        wrong = b"X" * len(self.fixture.files["a.bin"])
+        target.write_bytes(wrong)
+        report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual(by_path["data/a.bin"]["state"], "CORRUPTED")
+        self.assertIn("SHA-256", by_path["data/a.bin"]["detail"])
+
+    def test_public_verify_api_final_symlink_and_non_regular(self):
+        target = self.fixture.target("a.bin")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        outside = self.fixture.root / "outside.bin"
+        outside.write_bytes(self.fixture.files["a.bin"])
+        try:
+            target.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual(by_path["data/a.bin"]["state"], "CORRUPTED")
+        self.assertIn("symlink", by_path["data/a.bin"]["detail"])
+
+        target.unlink()
+        target.mkdir()
+        report = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual(by_path["data/a.bin"]["state"], "CORRUPTED")
+        self.assertIn("not a regular file", by_path["data/a.bin"]["detail"])
+
+    def test_public_verify_api_symlink_ancestor_is_corrupted(self):
+        root = Path(os.path.abspath(str(self.fixture.cache)))
+        target_parent = root / "fixture-set" / "v1-abcdef0123456789" / "data"
+        outside = self.fixture.root / "outside"
+
+        def fake_is_symlink(path):
+            return Path.__fspath__(path) == str(target_parent)
+
+        def fake_realpath(value):
+            return str(outside) if str(value) == str(target_parent) else str(value)
+
+        with (
+            mock.patch.object(module.Path, "is_symlink", new=fake_is_symlink),
+            mock.patch.object(module.os.path, "realpath", new=fake_realpath),
+        ):
+            report = module.verify_manifest_cache(
+                self.fixture.manifest_path, self.fixture.cache
+            )
+        by_path = {entry["path"]: entry for entry in report["files"]}
+        self.assertEqual(by_path["data/a.bin"]["state"], "CORRUPTED")
+        self.assertIn("symlink", by_path["data/a.bin"]["detail"])
+
+    def test_public_verify_api_is_read_only_and_defensive(self):
+        for name, data in self.fixture.files.items():
+            target = self.fixture.target(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        with (
+            mock.patch.object(module, "_opener", side_effect=AssertionError("network")),
+            mock.patch.object(module.os, "replace", side_effect=AssertionError("write")),
+            mock.patch.object(module.os, "mkdir", side_effect=AssertionError("write")),
+            mock.patch.object(module.os, "makedirs", side_effect=AssertionError("write")),
+            mock.patch.object(module._ArtifactLock, "acquire", side_effect=AssertionError("lock")),
+        ):
+            first = module.verify_manifest_cache(
+                self.fixture.manifest_path, self.fixture.cache
+            )
+        first["files"].append({"path": "mutated", "state": "VERIFIED"})
+        first["file_counts"]["VERIFIED"] = 999
+        first["bytes"]["required"] = 999
+        second = module.verify_manifest_cache(
+            self.fixture.manifest_path, self.fixture.cache
+        )
+        self.assertEqual(second["file_counts"]["VERIFIED"], 2)
+        self.assertEqual(second["bytes"]["required"], 0)
+        self.assertEqual(len(second["files"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .backends import ShapeBackendDescriptor
+from .models import (
+    ModelBinding,
+    assert_binding_matches_verification,
+    verification_summary,
+)
 
 
 EXECUTION_REQUEST_SCHEMA_VERSION = 1
@@ -70,6 +75,17 @@ def build_execution_request(
     )
 
 
+def _execution_blocker() -> tuple[dict[str, str], ...]:
+    return (
+        {
+            "code": "GPU_EXECUTION_NOT_IMPLEMENTED",
+            "message": (
+                "Hunyuan GPU runtime binding and inference are not implemented."
+            ),
+        },
+    )
+
+
 def _blockers() -> tuple[dict[str, str], ...]:
     return (
         {
@@ -94,6 +110,52 @@ def _blockers() -> tuple[dict[str, str], ...]:
             ),
         },
     )
+
+
+def build_preflight_envelope(
+    document: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    backend: ShapeBackendDescriptor,
+    binding: ModelBinding,
+    verification: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the deterministic shape-model preflight JSON envelope.
+
+    Successful output retains the one remaining future-execution blocker
+    (``GPU_EXECUTION_NOT_IMPLEMENTED``) while recording that the production
+    model manifest is bound and the external cache is fully verified.
+    """
+
+    assert_binding_matches_verification(binding, verification)
+    execution_request = build_execution_request(document, plan, backend)
+    return {
+        "schema_version": 1,
+        "status": "VALID",
+        "classification": "SHAPE_MODEL_PREFLIGHT_READY",
+        "exit_code": 0,
+        "stage": "shape",
+        "preparation_supported": True,
+        "model_binding_supported": True,
+        "model_cache_verified": True,
+        "execution_supported": False,
+        "job": {
+            "schema_version": plan["job"]["schema_version"],
+            "job_id": plan["job"]["job_id"],
+            "reference_image": plan["job"]["reference_image"],
+            "seed": plan["job"]["seed"],
+            "remove_background": plan["job"]["remove_background"],
+        },
+        "paths": {
+            "input_image": plan["paths"]["input_image"],
+            "output_directory": plan["paths"]["output_directory"],
+            "workspace_directory": plan["paths"]["workspace_directory"],
+        },
+        "backend": backend.to_dict(),
+        "execution_request": execution_request.to_dict(),
+        "model_binding": binding.to_dict(),
+        "cache_verification": verification_summary(verification),
+        "blockers": _execution_blocker(),
+    }
 
 
 def build_preparation_envelope(
