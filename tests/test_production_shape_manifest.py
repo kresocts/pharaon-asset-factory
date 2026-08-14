@@ -282,8 +282,11 @@ class ProductionShapeManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["classification"], "MODEL_CACHE_NOT_VERIFIED")
-        self.assertEqual(payload["revision"], REVISION)
-        self.assertEqual(payload["plan_id"], PLAN_ID)
+        self.assertNotIn("revision", payload)
+        self.assertNotIn("plan_id", payload)
+        manifest = _load(MANIFEST_PATH)
+        self.assertEqual(manifest["revision"], REVISION)
+        self.assertEqual(model_cache.manifest_plan_id(model_cache.parse_manifest(MANIFEST_PATH)), PLAN_ID)
         self.assertEqual(_snapshot(self.output_dir), before_output)
         self.assertEqual(_snapshot(self.workspace_dir), before_workspace)
         self.assertEqual(_snapshot(self.model_cache_dir), before_cache)
@@ -349,6 +352,40 @@ class ProductionShapeManifestTests(unittest.TestCase):
         def mutate_plan_id(data):
             data["manifest_plan_id"] = "0" * 64
         self._assert_validator_rejects(mutate_provenance=mutate_plan_id)
+
+    def test_validator_rejects_old_model_worker_line_list(self):
+        def mutate(data):
+            for ref in data["source_references"]:
+                if ref.get("file") == "model_worker.py":
+                    ref["lines"] = [61, 62, 99]
+        self._assert_validator_rejects(mutate_provenance=mutate)
+
+    def test_validator_requires_pipelines_loader_reference(self):
+        def mutate(data):
+            data["source_references"] = [
+                ref for ref in data["source_references"]
+                if ref.get("file") != "hy3dshape/hy3dshape/pipelines.py"
+            ]
+        self._assert_validator_rejects(mutate_provenance=mutate)
+
+    def test_validator_requires_utils_smart_load_model_reference(self):
+        def mutate(data):
+            data["source_references"] = [
+                ref for ref in data["source_references"]
+                if ref.get("file") != "hy3dshape/hy3dshape/utils/utils.py"
+            ]
+        self._assert_validator_rejects(mutate_provenance=mutate)
+
+    def test_validator_rejects_mutable_or_wrong_source_url_or_revision(self):
+        def mutate_url(data):
+            for ref in data["source_references"]:
+                if ref.get("file") == "hy3dshape/hy3dshape/pipelines.py":
+                    ref["url"] = ref["url"].replace(SOURCE_REVISION, "main")
+        self._assert_validator_rejects(mutate_provenance=mutate_url)
+
+        def mutate_revision(data):
+            data["source_code_revision"] = "0" * 40
+        self._assert_validator_rejects(mutate_provenance=mutate_revision)
 
     def test_validator_is_deterministic_and_successful(self):
         env = self._env()

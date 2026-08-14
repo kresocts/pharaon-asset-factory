@@ -21,7 +21,7 @@
 | 2 | https://huggingface.co/api/models/tencent/Hunyuan3D-2.1/revision/0b94677654c57bb9a6b6845cd7b704ccf551d327 | 200 | 5203 | none |
 | 3 | https://huggingface.co/api/models/tencent/Hunyuan3D-2.1/revision/0b94677654c57bb9a6b6845cd7b704ccf551d327?blobs=true | 200 | 7875 | none |
 | 4 | https://huggingface.co/api/models/tencent/Hunyuan3D-2.1/revision/0b94677654c57bb9a6b6845cd7b704ccf551d327?blobs=true | 200 | 7875 | none |
-| 5 | https://api.github.com/repos/Tencent-Hunyuan/Hunyuan3D-2.1/git/trees/82920d643c0dc2f7bfd7255f45f62d386edfe60c?recursive=1 | 200 | not captured | none |
+| 5 | https://api.github.com/repos/Tencent-Hunyuan/Hunyuan3D-2.1/git/trees/82920d643c0dc2f7bfd7255f45f62d386edfe60c?recursive=1 | 200 | BLOCKED | none |
 | 6 | https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/82920d643c0dc2f7bfd7255f45f62d386edfe60c/api_models.py | 200 | 2365 | none |
 | 7 | https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/82920d643c0dc2f7bfd7255f45f62d386edfe60c/model_worker.py | 200 | 8225 | none |
 | 8 | https://huggingface.co/api/models/tencent/Hunyuan3D-2.1 | 200 | 5203 | none |
@@ -32,11 +32,11 @@
 
 
 Total request count: 12.
-Total known response bytes: 82,584. The GitHub source-tree enumeration response was
-not byte-captured by the exploratory command and is conservatively excluded from this
-sum; all retrieved bodies were small text/metadata and total remained far below the
-10 MiB limit. No Authorization header, token, cookie, or locally cached credential was
-used. No weight body was requested.
+Exact total response bytes: BLOCKED. Request #5 was not byte-captured, and no saved
+response body, temp file, transcript, shell history, or local research log containing
+that exact count has been found. The sum of the other 11 recorded bytes is 82,584; no
+estimate or 13th request is authorized. No Authorization header, token, cookie, or
+locally cached credential was used. No weight body was requested.
 
 ## Production inventory
 
@@ -51,17 +51,24 @@ Total expected bytes: 7366391846.
 
 ## Loader compatibility evidence
 
-Official immutable source `model_worker.py` at `82920d643c0dc2f7bfd7255f45f62d386edfe60c`:
+Retained official immutable source `model_worker.py` at
+`82920d643c0dc2f7bfd7255f45f62d386edfe60c`:
 
-- line 61: `model_path='tencent/Hunyuan3D-2.1'`
-- line 62: `subfolder='hunyuan3d-dit-v2-1'`
-- line 99: `self.pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)`
+- line 55: `model_path='tencent/Hunyuan3D-2.1'`
+- line 56: `subfolder='hunyuan3d-dit-v2-1'`
+- line 91: `Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)`
 
-The immutable `hunyuan3d-dit-v2-1/config.yaml` declares the `model`, `vae`,
-`conditioner`, `scheduler`, `image_processor`, and `pipeline` targets. Therefore the
-normal non-safetensors shape path resolves one config file and one fp16 checkpoint from
-the default subfolder, and does not require the separate paint-model inventory for
-shape-only inference.
+The exact file-selection flow is recorded in provenance as:
+
+- `hy3dshape/hy3dshape/pipelines.py` -> `Hunyuan3DDiTPipeline.from_pretrained`
+- `hy3dshape/hy3dshape/utils/utils.py` -> `smart_load_model`
+
+Those two source bodies were not retained during the bounded 12-request session, so
+their exact line ranges are marked `BLOCKED` and are not independently verified in this
+repository. No new retrieval was performed. The immutable `hunyuan3d-dit-v2-1/config.yaml`
+still declares the `model`, `vae`, `conditioner`, `scheduler`, `image_processor`, and
+`pipeline` targets, and the separate paint-model inventory is not required for shape-only
+inference.
 
 ## License and model-card facts
 
@@ -98,8 +105,8 @@ or deploy the model.
 
 - `main` was used once to resolve the immutable revision; no mutable reference is
   committed or used by runtime/tests/validators.
-- The exploratory GitHub source-tree response byte count was not captured; it is the
-  only retrieval log entry without an exact byte count.
+- Request #5 exact byte count is `BLOCKED`; no local saved body or transcript contains it.
+- Exact line ranges for `pipelines.py` and `utils/utils.py` are `BLOCKED`; their source bodies were not retained in the bounded session.
 - Live upstream verification is intentionally not performed in CI; a future refresh is
   a new reviewed ticket with a new immutable revision.
 
@@ -122,7 +129,11 @@ python docker/model_cache.py verify --manifest model-manifests/production/hunyua
   -> exit 4, NOT_VERIFIED, fully_cached=false, ABSENT=2
 
 python -m asset_pipeline.cli shape preflight --job JOB --backend hunyuan3d-2.1-shape --model-manifest model-manifests/production/hunyuan3d-2.1-shape.json --json
-  -> exit 4, MODEL_CACHE_NOT_VERIFIED, revision=0b94677654c57bb9a6b6845cd7b704ccf551d327, plan_id=5b6005ace3fa63b9719da75d1fc10a0793c41718e4f15666c8e527e16ff41cd8
+  -> exit 4, MODEL_CACHE_NOT_VERIFIED
+
+Revision and plan_id are derived separately from the committed manifest and canonical
+`docker.model_cache.manifest_plan_id` calculation, not from the preflight error JSON.
+
 ```
 
 Filesystem snapshots before and after the plan/status/verify/preflight commands

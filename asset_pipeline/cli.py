@@ -107,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _emit_expected_error(exc: Exception, json_mode: bool, manifest: Any | None = None) -> int:
+def _emit_expected_error(exc: Exception, json_mode: bool) -> int:
     payload = {
         "schema_version": 1,
         "status": exc.status,
@@ -115,9 +115,6 @@ def _emit_expected_error(exc: Exception, json_mode: bool, manifest: Any | None =
         "exit_code": exc.exit_code,
         "message": str(exc),
     }
-    if manifest is not None and isinstance(exc, ModelCacheVerificationError):
-        payload["revision"] = manifest.get("revision")
-        payload["plan_id"] = model_cache.manifest_plan_id(manifest)
     if json_mode:
         print(json.dumps(payload, indent=2))
     else:
@@ -216,7 +213,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "--model-manifest MANIFEST [--json]'"
         )
 
-    manifest: Any | None = None
     try:
         document = read_job_document(args.job)
         roots = load_runtime_roots()
@@ -259,7 +255,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ModelCacheVerificationError,
         model_cache.ManifestValidationError,
     ) as exc:
-        return _emit_expected_error(exc, json_mode, manifest)
+        return _emit_expected_error(exc, json_mode)
     except Exception as exc:  # pragma: no cover - defensive unexpected boundary
         return _emit_unexpected_error(exc, json_mode)
 

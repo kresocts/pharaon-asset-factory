@@ -123,9 +123,34 @@ def _validate_provenance(prov: dict[str, Any]) -> None:
     _require(prov.get("source_code_repository") == "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git", "provenance source_code_repository mismatch")
     _require(prov.get("source_code_revision") == EXPECTED_SOURCE_REVISION, "provenance source_code_revision mismatch")
     refs = prov.get("source_references")
-    _require(isinstance(refs, list) and len(refs) == 2, "provenance source_references must contain two records")
-    _require(any(ref.get("file") == "model_worker.py" for ref in refs), "provenance source_references missing model_worker.py")
-    _require(any(ref.get("file") == "hunyuan3d-dit-v2-1/config.yaml" for ref in refs), "provenance source_references missing config.yaml")
+    _require(isinstance(refs, list) and len(refs) >= 4, "provenance source_references must contain model_worker, pipelines, utils, and config records")
+    by_file = {ref.get("file"): ref for ref in refs}
+
+    model_worker = by_file.get("model_worker.py")
+    _require(model_worker is not None, "provenance source_references missing model_worker.py")
+    _require(model_worker.get("lines") == [55, 56, 91], "model_worker source lines must be exactly [55, 56, 91]")
+    _require(model_worker.get("url") == f"https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/{EXPECTED_SOURCE_REVISION}/model_worker.py", "model_worker source URL mismatch")
+
+    pipelines = by_file.get("hy3dshape/hy3dshape/pipelines.py")
+    _require(pipelines is not None, "provenance source_references missing pipelines.py")
+    _require(pipelines.get("function") == "Hunyuan3DDiTPipeline.from_pretrained", "pipelines.py function mismatch")
+    _require(pipelines.get("line_range_status") == "BLOCKED", "pipelines.py line_range_status must be BLOCKED")
+    _require(pipelines.get("url") == f"https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/{EXPECTED_SOURCE_REVISION}/hy3dshape/hy3dshape/pipelines.py", "pipelines.py source URL mismatch")
+
+    utils = by_file.get("hy3dshape/hy3dshape/utils/utils.py")
+    _require(utils is not None, "provenance source_references missing utils.py")
+    _require(utils.get("function") == "smart_load_model", "utils.py function mismatch")
+    _require(utils.get("line_range_status") == "BLOCKED", "utils.py line_range_status must be BLOCKED")
+    _require(utils.get("url") == f"https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/{EXPECTED_SOURCE_REVISION}/hy3dshape/hy3dshape/utils/utils.py", "utils.py source URL mismatch")
+
+    config = by_file.get("hunyuan3d-dit-v2-1/config.yaml")
+    _require(config is not None, "provenance source_references missing config.yaml")
+    _require(config.get("url") == f"https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/{prov.get("model_revision")}/hunyuan3d-dit-v2-1/config.yaml", "config.yaml source URL mismatch")
+
+    for ref in refs:
+        url = ref.get("url", "")
+        _require(isinstance(url, str) and url.startswith("https://"), "source reference URL must be HTTPS")
+        _require("main" not in url.lower() and "master" not in url.lower() and "latest" not in url.lower() and "head" not in url.lower(), "source reference URL contains a mutable reference")
     license_data = prov.get("license")
     _require(isinstance(license_data, dict), "provenance license must be an object")
     _require(license_data.get("license_name") == "tencent-hunyuan-community", "provenance license_name mismatch")

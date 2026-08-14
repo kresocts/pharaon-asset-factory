@@ -58,12 +58,26 @@
     {
       "file": "model_worker.py",
       "lines": [
-        61,
-        62,
-        99
+        55,
+        56,
+        91
       ],
-      "note": "Constructor defaults to Hunyuan3D-2.1 and hunyuan3d-dit-v2-1; calls Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path).",
+      "note": "Retained local source body; constructor defaults to Hunyuan3D-2.1 and hunyuan3d-dit-v2-1; calls Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path).",
       "url": "https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/82920d643c0dc2f7bfd7255f45f62d386edfe60c/model_worker.py"
+    },
+    {
+      "file": "hy3dshape/hy3dshape/pipelines.py",
+      "function": "Hunyuan3DDiTPipeline.from_pretrained",
+      "line_range_status": "BLOCKED",
+      "note": "Independent review identifies use_safetensors=False, variant=fp16, subfolder=hunyuan3d-dit-v2-1, delegation to smart_load_model, and from_single_file loading model/VAE/conditioner. Source body was not retained in the bounded session; exact line ranges are not independently verified.",
+      "url": "https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/82920d643c0dc2f7bfd7255f45f62d386edfe60c/hy3dshape/hy3dshape/pipelines.py"
+    },
+    {
+      "file": "hy3dshape/hy3dshape/utils/utils.py",
+      "function": "smart_load_model",
+      "line_range_status": "BLOCKED",
+      "note": "Independent review identifies extension=ckpt, variant=.fp16, ckpt_name=model.fp16.ckpt, and config_path=config.yaml. Source body was not retained in the bounded session; exact line ranges are not independently verified.",
+      "url": "https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/82920d643c0dc2f7bfd7255f45f62d386edfe60c/hy3dshape/hy3dshape/utils/utils.py"
     },
     {
       "file": "hunyuan3d-dit-v2-1/config.yaml",
