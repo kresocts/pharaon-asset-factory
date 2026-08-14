@@ -42,7 +42,6 @@ jobs:
       DOCKERFILE: docker/Dockerfile
       BUILD_CONTEXT: .
       PLATFORM: linux/amd64
-      MIN_DISK_FREE_GIB: 150
       DOCKER_CONFIG_NAME: ghcr-docker-config-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
@@ -149,9 +148,11 @@ jobs:
             throw "D:\actions-runner does not exist."
           }
 
+          $requiredFreeGiB = [int64]150
+          $requiredFreeBytes = $requiredFreeGiB * 1GB
           $drive = Get-PSDrive -Name D
-          if (-not $drive -or $drive.Free -lt ($env:MIN_DISK_FREE_GIB * 1GB)) {
-            throw "D drive does not have at least $env:MIN_DISK_FREE_GIB GiB free."
+          if (-not $drive -or [int64]$drive.Free -lt $requiredFreeBytes) {
+            throw "D drive does not have at least $requiredFreeGiB GiB free."
           }
 
           Write-Host "Docker Linux engine and D-drive preflight passed."
@@ -197,7 +198,22 @@ jobs:
             if ($exitCode -eq 0) {
               throw "Requested tag already exists and publication is refused: $tag"
             }
-            if ($text -notmatch "no such manifest|manifest unknown|not found|NAME_UNKNOWN|MANIFEST_UNKNOWN") {
+            $absenceSignals = @(
+              "MANIFEST_UNKNOWN",
+              "NAME_UNKNOWN",
+              "manifest unknown",
+              "no such manifest"
+            )
+
+            $isAbsent = $false
+            foreach ($signal in $absenceSignals) {
+              if ($text -match [regex]::Escape($signal)) {
+                $isAbsent = $true
+                break
+              }
+            }
+
+            if (-not $isAbsent) {
               throw "Registry or authentication error while checking tag $tag. Refusing to continue."
             }
 

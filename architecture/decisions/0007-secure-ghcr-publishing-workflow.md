@@ -20,9 +20,13 @@ full commit SHA with exact release comments (`actions/checkout` v7.0.1 and
 `secrets.GITHUB_TOKEN` with `--password-stdin`, and keep credentials in a unique
 temporary Docker config under `RUNNER_TEMP` with an `if: always()` cleanup. Check
 Docker Linux-engine, Buildx, `D:\actions-runner`, and a conservative 150 GiB D-drive
-threshold before login/build. Refuse existing requested tags before Buildx, always
-publish an immutable `sha-<full-sha>` tag, optionally publish a strictly validated
-immutable release tag, and never publish rolling tags. Use a 180-minute timeout and a
+threshold before login/build. Calculate that threshold as `[int64]150` multiplied
+numerically by `1GB` and compare it with `[int64]$drive.Free`; never multiply an
+environment-variable string directly by `1GB`. Refuse existing requested tags before
+Buildx and treat only `MANIFEST_UNKNOWN`, `NAME_UNKNOWN`, `manifest unknown`, and
+`no such manifest` as registry absence signals; all other registry or Docker errors
+fail closed. Always publish an immutable `sha-<full-sha>` tag, optionally publish a
+strictly validated immutable release tag, and never publish rolling tags. Use a 180-minute timeout and a
 non-cancelling global publication concurrency group. Build with Buildx for
 `linux/amd64` only, direct registry push, provenance/SBOM disabled, no cache export, no
 build secrets, and no model credentials. Capture and verify the pushed digest, remote

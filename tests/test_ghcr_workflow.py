@@ -18,6 +18,12 @@ STRICT_RELEASE_TAG = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-(?:[0-9a-z]+(?:-[0-9a-z]+)*)(?:\.(?:[0-9a-z]+(?:-[0-9a-z]+)*))*)?$"
 )
+REGISTRY_ABSENCE_SIGNALS = (
+    "MANIFEST_UNKNOWN",
+    "NAME_UNKNOWN",
+    "manifest unknown",
+    "no such manifest",
+)
 
 
 def discover_workflows(root: Path = ROOT) -> list[Path]:
@@ -47,6 +53,11 @@ def _release_tag_allowed(tag: str) -> bool:
     if re.search(r"[&|;<>$]", tag):
         return False
     return bool(STRICT_RELEASE_TAG.fullmatch(tag))
+
+
+def _registry_absence_confirmed(text: str) -> bool:
+    lowered = text.lower()
+    return any(signal.lower() in lowered for signal in REGISTRY_ABSENCE_SIGNALS)
 
 
 def _block_after(raw: str, marker: str) -> str:
@@ -269,10 +280,39 @@ class GhcrWorkflowTests(unittest.TestCase):
         self.assertIn("docker --config $config manifest inspect", self.raw)
         self.assertIn("Requested tag already exists", self.raw)
         self.assertIn("Registry or authentication error", self.raw)
+        self.assertIn("$absenceSignals = @(", self.raw)
+        self.assertIn("foreach ($signal in $absenceSignals)", self.raw)
+        self.assertNotIn('"not found"', self.raw)
         self.assertLess(
             self.raw.index("Refuse existing requested tags"),
             self.raw.index("Build and push immutable container"),
         )
+
+    def test_registry_absence_classifier_is_strict(self) -> None:
+        for signal in REGISTRY_ABSENCE_SIGNALS:
+            self.assertIn(signal, self.raw)
+
+        accepted = [
+            "MANIFEST_UNKNOWN",
+            "NAME_UNKNOWN",
+            "manifest unknown",
+            "no such manifest",
+        ]
+        rejected = [
+            "credential helper not found",
+            "404 Not Found",
+            "unauthorized",
+            "denied",
+            "TLS failure",
+            "timeout",
+            "connection failure",
+            "arbitrary unknown error",
+        ]
+
+        for text in accepted:
+            self.assertTrue(_registry_absence_confirmed(text), f"expected absence: {text}")
+        for text in rejected:
+            self.assertFalse(_registry_absence_confirmed(text), f"expected hard failure: {text}")
 
     def test_docker_credential_isolation_and_cleanup(self) -> None:
         self.assertIn("RUNNER_TEMP", self.raw)
@@ -296,8 +336,18 @@ class GhcrWorkflowTests(unittest.TestCase):
             self.raw.index("Build and push immutable container"),
         )
         self.assertIn("D:\\actions-runner", self.raw)
-        self.assertIn("MIN_DISK_FREE_GIB", self.raw)
         self.assertNotIn("prune", self.raw.lower())
+
+    def test_disk_threshold_is_numeric_and_trusted(self) -> None:
+        self.assertNotIn("$env:MIN_DISK_FREE_GIB * 1GB", self.raw)
+        self.assertNotIn("MIN_DISK_FREE_GIB", self.raw)
+        self.assertIn("$requiredFreeGiB = [int64]150", self.raw)
+        self.assertIn("$requiredFreeBytes = $requiredFreeGiB * 1GB", self.raw)
+        self.assertIn("[int64]$drive.Free -lt $requiredFreeBytes", self.raw)
+        self.assertLess(
+            self.raw.index("$requiredFreeGiB = [int64]150"),
+            self.raw.index("Authenticate to GHCR with temporary Docker config"),
+        )
 
     def test_no_forbidden_automation_or_cloud_runner_paths(self) -> None:
         forbidden_patterns = [

@@ -391,9 +391,14 @@ name, Dockerfile, build context, platform, or runner.
 
 Before Buildx starts, the workflow inspects the required SHA tag and any optional
 release tag through the temporary Docker config. If either tag already exists, the job
-fails and reports the conflicting tag. Registry or authentication errors also fail
-closed. There is no force/overwrite input. Registry preflight plus the non-cancelling
-concurrency group reduce but cannot make registry tag creation fully atomic.
+fails and reports the conflicting tag. Only a narrow allowlist of actual registry
+absence signals is accepted as proof that a tag is absent: `MANIFEST_UNKNOWN`,
+`NAME_UNKNOWN`, `manifest unknown`, and `no such manifest`. Authentication,
+authorization, TLS, DNS, timeout, Docker component, credential-helper, and unknown
+errors all fail closed. There is no force/overwrite input. Registry preflight plus the
+non-cancelling concurrency group reduce but cannot make registry tag creation fully
+atomic. T-0016 will empirically validate the exact local-registry and Docker outputs
+before the first GHCR publication.
 
 ### Permissions and credentials
 
@@ -408,9 +413,11 @@ does not delete images, caches, or unrelated files.
 
 Before login or build, the workflow checks that Docker is reachable, `docker info`
 reports `OSType=linux`, Buildx is available, `D:\actions-runner` exists, and the D
-drive has at least 150 GiB free. On insufficient capacity it fails clearly without
-logging in, building, pruning, or selecting another runner. No Docker prune command is
-used.
+drive has at least a trusted 150 GiB free. The threshold is declared as `[int64]150`,
+converted to bytes with numeric multiplication, and compared against
+`[int64]$drive.Free`; no environment-variable string is multiplied directly by `1GB`.
+On insufficient capacity it fails clearly without logging in, building, pruning, or
+selecting another runner. No Docker prune command is used.
 
 ### Timeout, concurrency, and action pinning
 
