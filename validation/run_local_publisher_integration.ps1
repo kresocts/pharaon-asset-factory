@@ -397,7 +397,7 @@ Branch: $branch
 - Builder: $builder
 - D drive free before build: $diskBefore bytes
 - D drive free after build: $diskAfter bytes
-- Registry image: `$RegistryImage`
+- Registry image: $RegistryImage
 - Loopback binding: `127.0.0.1:$registryPort->5000`
 
 ## Build
@@ -410,19 +410,19 @@ Branch: $branch
 
 ## Tags and digest
 
-- SHA-like tag: `$shaTagName`
-- Release-like tag: `$ReleaseTag`
-- Metadata digest: `$digest`
+- SHA-like tag: $shaTagName
+- Release-like tag: $ReleaseTag
+- Metadata digest: $digest
 - SHA tag digest match: PASS
 - Release tag digest match: PASS
 - Platform verification: Linux AMD64 PASS
-- Digest-qualified reference: `$digestQualified`
+- Digest-qualified reference: $digestQualified
 
 ## Existing-tag preflight
 
 - Before build: both tags classified ABSENT.
 - After push: both tags classified EXISTING.
-- Second preflight refusal: PASS (`$refusalMessage`)
+- Second preflight refusal: PASS ($refusalMessage)
 - Observed absence output shape:
   - SHA tag exit code: $($absenceOutputs[0].ExitCode)
   - SHA tag first line: $($absenceOutputs[0].Text.Split("`n")[0])
@@ -432,11 +432,11 @@ Branch: $branch
 ## Runtime checks
 
 - Pull by digest: PASS
-- `health --json --network none`: exit 0
-- `ready --profile cpu --json --network none`: READY
+- health --json --network none: exit 0
+- ready --profile cpu --json --network none: READY
 - Weight state: ABSENT, no detected files
-- `models plan --json --network none`: offline PASS
-- `models status --json --network none`: offline PASS
+- models plan --json --network none: offline PASS
+- models status --json --network none: offline PASS
 
 ## Cleanup and integrity
 
