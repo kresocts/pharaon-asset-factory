@@ -17,7 +17,15 @@ A redirect source records authorization only after exact target validation; it d
 not claim the redirect was followed until the adjacent target record exists and binds
 back to the source record hash. Finalization appends a terminal hash-chained record.
 Retained bodies use sequence-only filenames and are verified for safe containment,
-size, and SHA-256 during session verification.
+size, SHA-256, and single-link status during session verification.
+
+Plans enforce strict hard limits and field sets. `max_bytes` may not exceed
+`DEFAULT_MAX_BYTES`, request count may not exceed `max_requests`, unknown plan/request
+fields are rejected, duplicate allowed hosts are rejected, and the stored authoritative
+plan must contain its canonical lowercase 64-hex `plan_hash`. Conflicting
+`Content-Length`/`Transfer-Encoding` framing blocks the session. All retained-body,
+atomic JSON, and JSONL writes use full-write loops and fail closed on `OSError`,
+short writes, or fsync failures.
 
 Run with:
 

@@ -1792,5 +1792,226 @@ class ProvenanceCaptureTests(unittest.TestCase):
         session.verify_session()
 
 
+    def test_retained_body_os_open_failure_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a", retain=True),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        real_open = os.open
+
+        def fake_open(path, flags, mode=0o777):
+            if str(path).endswith("0001.bin"):
+                raise OSError("disk failure")
+            return real_open(path, flags, mode)
+
+        with mock.patch("tools.provenance_capture.os.open", side_effect=fake_open):
+            with self.assertRaises(pc.BudgetBlockedError):
+                session.request_one("r1", FakeTransport([FakeResponse(200, b"abc")]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
+        self.assertEqual(records[0]["response_body_bytes"], 3)
+        self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"abc"))
+        self.assertFalse((session.responses_dir / "0001.bin").exists())
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionFinalizedError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
+
+    def test_retained_body_os_write_short_write_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a", retain=True),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        real_write = os.write
+        calls = [0]
+
+        def fake_write(fd, data):
+            calls[0] += 1
+            if len(data) <= 3 and calls[0] <= 2:
+                return 1 if calls[0] == 1 else 0
+            return real_write(fd, data)
+
+        with mock.patch("tools.provenance_capture.os.write", side_effect=fake_write):
+            with self.assertRaises(pc.BudgetBlockedError):
+                session.request_one("r1", FakeTransport([FakeResponse(200, b"abc")]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
+        self.assertFalse((session.responses_dir / "0001.bin").exists())
+
+    def test_retained_body_fsync_failure_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a", retain=True),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        real_fsync = os.fsync
+        calls = [0]
+
+        def fake_fsync(fd):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise OSError("fsync failure")
+            return real_fsync(fd)
+
+        with mock.patch("tools.provenance_capture.os.fsync", side_effect=fake_fsync):
+            with self.assertRaises(pc.BudgetBlockedError):
+                session.request_one("r1", FakeTransport([FakeResponse(200, b"abc")]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
+        self.assertFalse((session.responses_dir / "0001.bin").exists())
+
+    def test_content_length_plus_chunked_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        response = FakeResponse(
+            200,
+            b"abc",
+            {"content-length": ["1"], "transfer-encoding": ["chunked"]},
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", FakeTransport([response]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
+        self.assertEqual(records[0]["response_body_bytes"], 0)
+        self.assertFalse(records[0]["body_measured"])
+
+    def test_chunked_without_content_length_streams(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        records = session.execute(
+            FakeTransport(
+                [FakeResponse(200, b"abc", {"transfer-encoding": ["chunked"]})]
+            )
+        )
+        self.assertEqual(records[0]["status"], 200)
+        self.assertEqual(records[0]["response_body_bytes"], 3)
+        self.assertTrue(records[0]["body_complete"])
+
+    def test_transfer_encoding_mixed_case_and_unsupported(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        records = session.execute(
+            FakeTransport(
+                [FakeResponse(200, b"abc", {"transfer-encoding": ["  Chunked "]})]
+            )
+        )
+        self.assertEqual(records[0]["response_body_bytes"], 3)
+
+        plan2 = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session2 = pc.ProvenanceSession(
+            Path(self.tmp.name) / "session2",
+            plan=plan2,
+        )
+        session2.initialize()
+        with self.assertRaises(pc.BudgetBlockedError):
+            session2.request_one(
+                "r1",
+                FakeTransport(
+                    [FakeResponse(200, b"abc", {"transfer-encoding": ["gzip"]})]
+                ),
+            )
+        self.assertEqual(
+            session2.load_records()[0]["transport_classification"],
+            "CONTENT_LENGTH_INVALID",
+        )
+
+    def test_max_bytes_boundary(self):
+        make_plan(
+            [make_request("r1", "https://example.com/a")],
+            max_bytes=pc.DEFAULT_MAX_BYTES,
+        )
+        with self.assertRaises(pc.PlanValidationError):
+            make_plan(
+                [make_request("r1", "https://example.com/a")],
+                max_bytes=pc.DEFAULT_MAX_BYTES + 1,
+            )
+
+    def test_request_count_boundary(self):
+        make_plan([make_request("r1", "https://example.com/a")], max_requests=1)
+        with self.assertRaises(pc.PlanValidationError):
+            make_plan(
+                [
+                    make_request("r1", "https://example.com/a"),
+                    make_request("r2", "https://example.com/b"),
+                ],
+                max_requests=1,
+            )
+
+    def test_unknown_top_level_field_after_init_fails(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        data = json.loads(session.plan_path.read_text(encoding="utf-8"))
+        data["extra"] = "bad"
+        session.plan_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_unknown_request_field_after_init_fails(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        data = json.loads(session.plan_path.read_text(encoding="utf-8"))
+        data["requests"][0]["extra"] = "bad"
+        session.plan_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_missing_stored_plan_hash_fails(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        data = json.loads(session.plan_path.read_text(encoding="utf-8"))
+        del data["plan_hash"]
+        session.plan_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_replaced_stored_plan_hash_fails(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        data = json.loads(session.plan_path.read_text(encoding="utf-8"))
+        data["plan_hash"] = "0" * 64
+        session.plan_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_duplicate_allowed_hosts_fail(self):
+        payload = {
+            "schema_version": pc.SCHEMA_VERSION,
+            "max_requests": 1,
+            "max_bytes": 1024,
+            "allowed_hosts": ["example.com", "EXAMPLE.COM"],
+            "requests": [make_request("r1", "https://example.com/a")],
+        }
+        with self.assertRaises(pc.PlanValidationError):
+            pc.SessionPlan.from_dict(payload)
+
+    def test_plan_json_semantic_whitespace_reordering_passes(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        data = json.loads(session.plan_path.read_text(encoding="utf-8"))
+        session.plan_path.write_text(
+            json.dumps(data, indent=4, sort_keys=False),
+            encoding="utf-8",
+        )
+        session.verify_session()
+
+
 if __name__ == "__main__":
     unittest.main()

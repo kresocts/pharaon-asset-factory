@@ -52,6 +52,19 @@ Use a standard-library-only Python logger with these invariants:
 - The CLI exposes `validate-plan`, `init`, `request`, `verify`, and `finalize`.
   `request` executes exactly one planned hop, so a valid redirect response is logged
   before the target request is separately issued.
+- Plan limits and structure are strict: `1 <= max_bytes <= DEFAULT_MAX_BYTES`,
+  `1 <= max_requests <= DEFAULT_MAX_REQUESTS`, `len(requests) <= max_requests`,
+  unknown top-level/request fields are rejected, duplicate allowed hosts are
+  rejected, and the authoritative stored plan must contain a valid lowercase 64-hex
+  `plan_hash`.
+- Response framing is fail-closed: `Content-Length` plus `Transfer-Encoding` is
+  refused; only `Transfer-Encoding: chunked` without `Content-Length` is streamed and
+  measured; malformed, duplicated, mixed-case-normalized, or unsupported codings are
+  blocking.
+- Retained-body persistence, atomic JSON temporary writes, and JSONL append use
+  robust full-write loops. Real `OSError`, short writes, and fsync failures become
+  authoritative `RESPONSE_STORAGE_ERROR` records rather than escaping or allowing a
+  retry.
 
 ## Consequences
 

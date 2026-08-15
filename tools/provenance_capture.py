@@ -90,6 +90,26 @@ FORBIDDEN_BODY_PATH_FRAGMENTS = (
 FOLLOW_REDIRECT_STATUSES = frozenset({300, 301, 302, 303, 307, 308})
 REQUEST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SAFE_RETAINED_FILENAME_RE = re.compile(r"^[0-9]{4}\.bin$")
+PLAN_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "plan_hash",
+    "max_requests",
+    "max_bytes",
+    "allowed_hosts",
+    "requests",
+}
+PLAN_REQUEST_KEYS = {
+    "id",
+    "method",
+    "url",
+    "purpose",
+    "allow_query",
+    "retain",
+    "range_request",
+    "expected_statuses",
+    "redirect_target_id",
+    "redirect_from_id",
+}
 HTTP_RECORD_TYPE = "HTTP"
 TERMINAL_RECORD_TYPE = "SESSION_FINALIZED"
 
@@ -519,6 +539,11 @@ class SessionPlan:
     def from_dict(cls, value: Mapping[str, Any]) -> "SessionPlan":
         if not isinstance(value, dict):
             raise PlanValidationError("session plan must be a JSON object")
+        unknown_top = set(value) - PLAN_TOP_LEVEL_KEYS
+        if unknown_top:
+            raise PlanValidationError(
+                f"unknown session plan field(s): {', '.join(sorted(unknown_top))}"
+            )
         schema_version = value.get("schema_version")
         if schema_version != SCHEMA_VERSION:
             raise PlanValidationError(
@@ -534,8 +559,10 @@ class SessionPlan:
         max_bytes = value.get("max_bytes")
         if not isinstance(max_bytes, int) or isinstance(max_bytes, bool):
             raise PlanValidationError("max_bytes must be an integer")
-        if max_bytes <= 0:
-            raise PlanValidationError("max_bytes must be positive")
+        if not 1 <= max_bytes <= DEFAULT_MAX_BYTES:
+            raise PlanValidationError(
+                f"max_bytes must be between 1 and {DEFAULT_MAX_BYTES}"
+            )
 
         raw_allowed = value.get("allowed_hosts")
         if not isinstance(raw_allowed, list) or not raw_allowed:
@@ -544,7 +571,12 @@ class SessionPlan:
         for host in raw_allowed:
             if not isinstance(host, str) or not host or "://" in host:
                 raise PlanValidationError("allowed_hosts entries must be bare hostnames")
-            allowed_hosts.add(host.lower())
+            lowered_host = host.lower()
+            if lowered_host in allowed_hosts:
+                raise PlanValidationError(
+                    f"duplicate allowed host: {lowered_host!r}"
+                )
+            allowed_hosts.add(lowered_host)
 
         raw_requests = value.get("requests")
         if not isinstance(raw_requests, list) or not raw_requests:
@@ -553,6 +585,10 @@ class SessionPlan:
             raise PlanValidationError(
                 f"requests must contain at most {DEFAULT_MAX_REQUESTS} slots"
             )
+        if len(raw_requests) > max_requests:
+            raise PlanValidationError(
+                f"request count {len(raw_requests)} exceeds max_requests {max_requests}"
+            )
 
         requests: list[PlanRequest] = []
         ids: set[str] = set()
@@ -560,6 +596,12 @@ class SessionPlan:
         for index, raw in enumerate(raw_requests):
             if not isinstance(raw, dict):
                 raise PlanValidationError(f"requests[{index}] must be an object")
+            unknown_request = set(raw) - PLAN_REQUEST_KEYS
+            if unknown_request:
+                raise PlanValidationError(
+                    f"requests[{index}] has unknown field(s): "
+                    f"{', '.join(sorted(unknown_request))}"
+                )
             request_id = raw.get("id")
             if not isinstance(request_id, str) or not request_id:
                 raise PlanValidationError(
@@ -879,6 +921,22 @@ class ProvenanceSession:
         self._assert_regular_single_link_fd(fd, path, subject)
         return fd
 
+    def _write_all_fd(self, fd: int, data: bytes, subject: str) -> None:
+        view = memoryview(data)
+        total = 0
+        while total < len(data):
+            try:
+                written = os.write(fd, view[total:])
+            except OSError as error:
+                raise SessionInvalidError(
+                    f"cannot write {subject}: {error}"
+                ) from error
+            if written <= 0:
+                raise SessionInvalidError(
+                    f"short write while writing {subject}"
+                )
+            total += written
+
     def _write_exclusive_bytes(
         self,
         path: Path,
@@ -887,10 +945,28 @@ class ProvenanceSession:
     ) -> None:
         fd = self._open_exclusive_regular_file(path, subject)
         try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
+            self._write_all_fd(fd, data, subject)
+            try:
+                os.fsync(fd)
+            except OSError as error:
+                raise SessionInvalidError(
+                    f"cannot fsync {subject} {path}: {error}"
+                ) from error
+        except SessionInvalidError:
             os.close(fd)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        except Exception:
+            os.close(fd)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        os.close(fd)
 
     @contextmanager
     def _session_lock(self) -> Any:
@@ -926,6 +1002,14 @@ class ProvenanceSession:
             "session plan",
             MAX_PLAN_BYTES,
         )
+        plan_hash = value.get("plan_hash")
+        if (
+            not isinstance(plan_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", plan_hash)
+        ):
+            raise SessionInvalidError(
+                "stored session plan is missing a valid lowercase SHA-256 plan_hash"
+            )
         return SessionPlan.from_dict(value)
 
     def _read_state(self) -> dict[str, Any]:
@@ -999,12 +1083,7 @@ class ProvenanceSession:
         data = (
             json.dumps(value, indent=2, sort_keys=True) + "\n"
         ).encode("utf-8")
-        fd = self._open_exclusive_regular_file(temporary, subject)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        self._write_exclusive_bytes(temporary, data, subject)
         self._validate_authoritative_path(temporary)
         self._validate_authoritative_path(path)
         try:
@@ -1429,8 +1508,13 @@ class ProvenanceSession:
             ) from error
         self._assert_regular_single_link_fd(fd, self.log_path, "session log")
         try:
-            os.write(fd, line)
-            os.fsync(fd)
+            self._write_all_fd(fd, line, "session log")
+            try:
+                os.fsync(fd)
+            except OSError as error:
+                raise SessionInvalidError(
+                    f"cannot fsync session log {self.log_path}: {error}"
+                ) from error
         finally:
             os.close(fd)
 
@@ -1470,6 +1554,19 @@ class ProvenanceSession:
     def _header_values(self, response: Any, name: str) -> list[str]:
         headers = self._headers_dict(response)
         return list(headers.get(name.lower(), []))
+
+    def _transfer_codings(self, response: Any) -> list[str] | None:
+        values = self._header_values(response, "transfer-encoding")
+        if not values:
+            return None
+        codings: list[str] = []
+        for value in values:
+            for part in value.split(","):
+                token = part.strip().lower()
+                if not token or any(ch.isspace() for ch in token):
+                    return []
+                codings.append(token)
+        return codings
 
     def _parse_content_length(self, response: Any) -> int | None:
         headers = self._headers_dict(response)
@@ -1883,6 +1980,26 @@ class ProvenanceSession:
                 status=status,
                 target_context=target_context,
             )
+        transfer_codings = self._transfer_codings(response)
+        if transfer_codings is not None:
+            if content_length is not None:
+                return self._invalid_content_length_record(
+                    request=request,
+                    plan=plan,
+                    host=host,
+                    sequence=sequence,
+                    status=status,
+                    target_context=target_context,
+                )
+            if transfer_codings != ["chunked"]:
+                return self._invalid_content_length_record(
+                    request=request,
+                    plan=plan,
+                    host=host,
+                    sequence=sequence,
+                    status=status,
+                    target_context=target_context,
+                )
         location_values = self._header_values(response, "location")
         redirect_location = location_values[0] if len(location_values) == 1 else None
         final_host = getattr(response, "final_host", host)
