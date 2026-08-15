@@ -64,7 +64,8 @@ Use a standard-library-only Python logger with these invariants:
 - Retained-body persistence, atomic JSON temporary writes, and JSONL append use
   robust full-write loops. Real `OSError`, short writes, and fsync failures become
   authoritative `RESPONSE_STORAGE_ERROR` records rather than escaping or allowing a
-  retry.
+  retry. Every authorized attempt first appends a durable `REQUEST_RESERVED` record;
+  authoritative file opens compare `fstat`/`lstat` identity and reject path swaps.
 
 ## Consequences
 

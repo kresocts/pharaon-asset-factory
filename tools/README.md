@@ -23,9 +23,11 @@ Plans enforce strict hard limits and field sets. `max_bytes` may not exceed
 `DEFAULT_MAX_BYTES`, request count may not exceed `max_requests`, unknown plan/request
 fields are rejected, duplicate allowed hosts are rejected, and the stored authoritative
 plan must contain its canonical lowercase 64-hex `plan_hash`. Conflicting
-`Content-Length`/`Transfer-Encoding` framing blocks the session. All retained-body,
-atomic JSON, and JSONL writes use full-write loops and fail closed on `OSError`,
-short writes, or fsync failures.
+`Content-Length`/`Transfer-Encoding` framing blocks the session. Every attempt first
+appends a durable `REQUEST_RESERVED` record; response, metadata, read, and projection
+failures cannot make the session appear unused. All retained-body, atomic JSON, and
+JSONL writes use full-write loops and fail closed on `OSError`, short writes, or
+fsync failures. Authoritative file opens compare descriptor and path identity.
 
 Run with:
 

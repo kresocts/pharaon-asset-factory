@@ -99,6 +99,14 @@ def make_request(request_id, url, purpose="test", **kwargs):
     return data
 
 
+def http_records(records):
+    return [
+        record
+        for record in records
+        if record.get("record_type") == pc.HTTP_RECORD_TYPE
+    ]
+
+
 def make_plan(requests, max_requests=10, max_bytes=2 * 1024 * 1024,
               allowed_hosts=None):
     hosts = allowed_hosts or sorted(
@@ -177,7 +185,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         session = self.init_session(plan)
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(FakeTransport(error=RuntimeError("boom")))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertIsNone(records[0]["status"])
         self.assertEqual(records[0]["transport_classification"], "TRANSPORT_ERROR")
         self.assertEqual(records[0]["response_body_bytes"], 0)
@@ -189,7 +197,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         transport = FakeTransport(error=socket.timeout("timed out"))
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(transport)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "TIMEOUT")
         self.assertEqual(transport.calls, 1)
 
@@ -203,7 +211,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(FakeTransport([response]))
         self.assertEqual(response.read_calls, 0)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "BUDGET_REFUSAL")
         self.assertEqual(records[0]["response_body_bytes"], 0)
         self.assertFalse(records[0]["body_measured"])
@@ -230,7 +238,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         response = FakeResponse(200, b"hello")
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(FakeTransport([response]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "BYTE_BUDGET_EXCEEDED")
         self.assertEqual(records[0]["response_body_bytes"], 4)
         self.assertEqual(records[0]["remaining_byte_budget"], 0)
@@ -267,7 +275,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         transport = FakeTransport([FakeResponse(200, b"abc")])
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(transport)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(len(records), 1)
         self.assertEqual(transport.calls, 1)
 
@@ -359,7 +367,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         plan = make_plan([make_request("r1", "https://example.com/a")])
         session = self.init_session(plan)
         session.execute(FakeTransport([FakeResponse(200, b"ok")]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         records[0]["response_body_bytes"] = 999
         with self.assertRaises(pc.SessionInvalidError):
             pc.verify_record_chain(records)
@@ -380,7 +388,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 ]
             )
         )
-        records = session.load_records()
+        records = http_records(session.load_records())
         forged = dict(records[0])
         forged["sequence"] = 2
         forged["previous_hash"] = records[0]["current_hash"]
@@ -406,7 +414,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 ]
             )
         )
-        records = session.load_records()
+        records = http_records(session.load_records())
         with self.assertRaises(pc.SessionInvalidError):
             pc.verify_record_chain([records[1]])
 
@@ -426,7 +434,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 ]
             )
         )
-        records = session.load_records()
+        records = http_records(session.load_records())
         with self.assertRaises(pc.SessionInvalidError):
             pc.verify_record_chain([records[1], records[0]])
 
@@ -663,7 +671,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(307, b"r", {"location": ["https://evil.example/end"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "UNEXPECTED_REDIRECT")
         self.assertFalse(records[0]["redirect_followed"])
 
@@ -681,7 +689,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(307, b"r", {"location": ["https://example.com/wrong"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertFalse(records[0]["redirect_followed"])
         self.assertEqual(records[0]["redirect_refusal_reason"], "redirect_target_mismatch")
 
@@ -699,7 +707,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(307, b"r", {"location": ["https://example.com/end?rev=xyz"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertFalse(records[0]["redirect_followed"])
 
     def test_query_reordering_does_not_pass(self):
@@ -716,7 +724,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(307, b"r", {"location": ["https://example.com/end?b=2&a=1"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertFalse(records[0]["redirect_followed"])
 
     def test_redirect_with_fragment_fails(self):
@@ -733,7 +741,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(307, b"r", {"location": ["https://example.com/end#frag"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertFalse(records[0]["redirect_followed"])
 
     def test_redirect_containing_credentials_fails(self):
@@ -750,7 +758,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(307, b"r", {"location": ["https://user:pass@example.com/end"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertFalse(records[0]["redirect_followed"])
 
     def test_missing_location_fails(self):
@@ -763,7 +771,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         session = self.init_session(plan)
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(FakeTransport([FakeResponse(307, b"r")]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["redirect_refusal_reason"], "missing_location")
 
     def test_conflicting_location_fails(self):
@@ -791,7 +799,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     ]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["redirect_refusal_reason"], "conflicting_location_values")
 
     def test_unplanned_redirect_refused_after_logging_body(self):
@@ -803,7 +811,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(302, b"redirect", {"location": ["https://example.com/end"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "UNEXPECTED_REDIRECT")
         self.assertFalse(records[0]["redirect_followed"])
         self.assertEqual(records[0]["response_body_bytes"], len(b"redirect"))
@@ -919,7 +927,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(transport)
         self.assertEqual(transport.calls, 1)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(len(records), 1)
 
     def test_no_fabricated_target_record_on_refusal(self):
@@ -936,7 +944,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FakeResponse(307, b"r", {"location": ["https://example.com/wrong"]})]
                 )
             )
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["plan_entry_id"], "r1")
 
@@ -956,7 +964,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         )
         self.assertTrue(record["redirect_authorized"])
         self.assertFalse(record["redirect_followed"])
-        self.assertEqual(len(session.load_records()), 1)
+        self.assertEqual(len(http_records(session.load_records())), 1)
 
     def test_request_one_target_without_source_fails(self):
         plan = make_plan(
@@ -987,7 +995,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         self.assertEqual(record["status"], 200)
         self.assertTrue(record["redirect_followed"])
         self.assertEqual(record["redirect_source_entry_id"], "r1")
-        self.assertEqual(len(session.load_records()), 2)
+        self.assertEqual(len(http_records(session.load_records())), 2)
 
 
     def test_request_one_out_of_order_before_r1_refused(self):
@@ -1002,7 +1010,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.RequestPolicyError):
             session.request_one("r2", transport)
         self.assertEqual(transport.calls, 0)
-        self.assertEqual(session.load_records(), [])
+        self.assertEqual(http_records(session.load_records()), [])
 
     def test_request_one_skips_r2_after_r1_refused(self):
         plan = make_plan(
@@ -1023,7 +1031,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.RequestPolicyError):
             session.request_one("r3", transport)
         self.assertEqual(transport.calls, 1)
-        self.assertEqual(len(session.load_records()), 1)
+        self.assertEqual(len(http_records(session.load_records())), 1)
 
     def test_execute_refuses_redirect_target_after_normal_200(self):
         plan = make_plan(
@@ -1047,7 +1055,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.BudgetBlockedError):
             session.execute(transport)
         self.assertEqual(transport.calls, 1)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["plan_entry_id"], "r1")
         self.assertEqual(records[0]["transport_classification"], "UNEXPECTED_STATUS")
@@ -1193,7 +1201,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.SessionInvalidError):
             session.request_one("r2", transport)
         self.assertEqual(transport.calls, 0)
-        self.assertEqual(len(session.load_records()), 1)
+        self.assertEqual(len(http_records(session.load_records())), 1)
 
     def test_finalized_state_tamper_cannot_revive_session(self):
         plan = make_plan(
@@ -1365,9 +1373,9 @@ class ProvenanceCaptureTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(len(results), 1)
         self.assertEqual(loser_transport.calls, 0)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["sequence"], 1)
+        self.assertEqual(records[0]["sequence"], 2)
         session.verify_session()
 
     def test_response_read_timeout_before_body_blocks(self):
@@ -1383,7 +1391,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         )
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r1", transport)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["status"], 200)
         self.assertEqual(records[0]["transport_classification"], "RESPONSE_READ_TIMEOUT")
@@ -1407,7 +1415,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         )
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r1", transport)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "RESPONSE_READ_TIMEOUT")
         self.assertEqual(records[0]["response_body_bytes"], 3)
         self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"hel"))
@@ -1424,7 +1432,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         response = FakeResponse(200, b"ok", {"content-length": ["abc"]})
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r1", FakeTransport([response]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
         self.assertIsNone(records[0]["response_body_sha256"])
         self.assertFalse(records[0]["body_measured"])
@@ -1441,7 +1449,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         response = FakeResponse(200, b"ok", {"content-length": ["1", "2"]})
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r1", FakeTransport([response]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
         self.assertEqual(records[0]["response_body_bytes"], 0)
 
@@ -1456,7 +1464,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         response = FakeResponse(200, b"short", {"content-length": ["10"]})
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r1", FakeTransport([response]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
         self.assertEqual(records[0]["response_body_bytes"], 5)
         self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"short"))
@@ -1477,7 +1485,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         ):
             with self.assertRaises(pc.BudgetBlockedError):
                 session.request_one("r1", FakeTransport([FakeResponse(200, b"ok")]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
         self.assertIsNone(records[0]["retained_filename"])
         self.assertTrue(records[0]["body_complete"])
@@ -1582,7 +1590,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         target_transport = FakeTransport(error=socket.timeout("timed out"))
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r2", target_transport)
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(len(records), 2)
         target = records[1]
         self.assertEqual(target["plan_entry_id"], "r2")
@@ -1612,7 +1620,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         )
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r2", FakeTransport(error=RuntimeError("boom")))
-        target = session.load_records()[1]
+        target = http_records(session.load_records())[1]
         self.assertEqual(target["transport_classification"], "TRANSPORT_ERROR")
         self.assertTrue(target["redirect_followed"])
         self.assertEqual(target["redirect_source_entry_id"], "r1")
@@ -1639,7 +1647,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                     [FlakyResponse(200, b"hello", read_error_after=0, error=socket.timeout("read"))]
                 ),
             )
-        target = session.load_records()[1]
+        target = http_records(session.load_records())[1]
         self.assertEqual(target["transport_classification"], "RESPONSE_READ_TIMEOUT")
         self.assertTrue(target["redirect_followed"])
         self.assertEqual(target["redirect_source_entry_id"], "r1")
@@ -1664,7 +1672,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 "r2",
                 FakeTransport([FakeResponse(200, b"ok", {"content-length": ["abc"]})]),
             )
-        target = session.load_records()[1]
+        target = http_records(session.load_records())[1]
         self.assertEqual(target["transport_classification"], "CONTENT_LENGTH_INVALID")
         self.assertTrue(target["redirect_followed"])
         self.assertEqual(target["redirect_source_entry_id"], "r1")
@@ -1686,7 +1694,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         )
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r2", FakeTransport([FakeResponse(500, b"error")]))
-        target = session.load_records()[1]
+        target = http_records(session.load_records())[1]
         self.assertEqual(target["transport_classification"], "UNEXPECTED_STATUS")
         self.assertTrue(target["redirect_followed"])
         self.assertEqual(target["redirect_source_entry_id"], "r1")
@@ -1713,7 +1721,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         ):
             with self.assertRaises(pc.BudgetBlockedError):
                 session.request_one("r2", FakeTransport([FakeResponse(200, b"ok")]))
-        target = session.load_records()[1]
+        target = http_records(session.load_records())[1]
         self.assertEqual(target["transport_classification"], "RESPONSE_STORAGE_ERROR")
         self.assertTrue(target["redirect_followed"])
         self.assertEqual(target["redirect_source_entry_id"], "r1")
@@ -1810,7 +1818,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with mock.patch("tools.provenance_capture.os.open", side_effect=fake_open):
             with self.assertRaises(pc.BudgetBlockedError):
                 session.request_one("r1", FakeTransport([FakeResponse(200, b"abc")]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
         self.assertEqual(records[0]["response_body_bytes"], 3)
         self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"abc"))
@@ -1832,15 +1840,17 @@ class ProvenanceCaptureTests(unittest.TestCase):
         calls = [0]
 
         def fake_write(fd, data):
+            if len(data) > 3:
+                return real_write(fd, data)
             calls[0] += 1
-            if len(data) <= 3 and calls[0] <= 2:
-                return 1 if calls[0] == 1 else 0
-            return real_write(fd, data)
+            if calls[0] == 1:
+                return 1
+            return 0
 
         with mock.patch("tools.provenance_capture.os.write", side_effect=fake_write):
             with self.assertRaises(pc.BudgetBlockedError):
                 session.request_one("r1", FakeTransport([FakeResponse(200, b"abc")]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
         self.assertFalse((session.responses_dir / "0001.bin").exists())
 
@@ -1857,14 +1867,14 @@ class ProvenanceCaptureTests(unittest.TestCase):
 
         def fake_fsync(fd):
             calls[0] += 1
-            if calls[0] == 1:
+            if calls[0] == 4:
                 raise OSError("fsync failure")
             return real_fsync(fd)
 
         with mock.patch("tools.provenance_capture.os.fsync", side_effect=fake_fsync):
             with self.assertRaises(pc.BudgetBlockedError):
                 session.request_one("r1", FakeTransport([FakeResponse(200, b"abc")]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
         self.assertFalse((session.responses_dir / "0001.bin").exists())
 
@@ -1883,7 +1893,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         )
         with self.assertRaises(pc.BudgetBlockedError):
             session.request_one("r1", FakeTransport([response]))
-        records = session.load_records()
+        records = http_records(session.load_records())
         self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
         self.assertEqual(records[0]["response_body_bytes"], 0)
         self.assertFalse(records[0]["body_measured"])
@@ -1929,7 +1939,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(
-            session2.load_records()[0]["transport_classification"],
+            http_records(session2.load_records())[0]["transport_classification"],
             "CONTENT_LENGTH_INVALID",
         )
 
@@ -2011,6 +2021,112 @@ class ProvenanceCaptureTests(unittest.TestCase):
             encoding="utf-8",
         )
         session.verify_session()
+
+
+    def test_empty_url_path_canonical_duplicate_rejected(self):
+        with self.assertRaises(pc.PlanValidationError):
+            make_plan(
+                [
+                    make_request("r1", "https://example.com"),
+                    make_request("r2", "https://example.com/"),
+                ]
+            )
+
+    def test_post_transport_log_append_failure_blocks_retry(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        original_append = session._append_jsonl_line
+        calls = [0]
+
+        def fail_second(record):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise pc.SessionInvalidError("simulated zero-byte append")
+            return original_append(record)
+
+        with mock.patch.object(session, "_append_jsonl_line", side_effect=fail_second):
+            with self.assertRaises(pc.SessionInvalidError):
+                session.request_one("r1", FakeTransport([FakeResponse(200, b"ok")]))
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionInvalidError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
+        full = session.load_records()
+        self.assertEqual(full[0]["record_type"], pc.RESERVATION_RECORD_TYPE)
+
+    def test_response_metadata_and_bad_reads_block_without_retry(self):
+        class MetadataFailureResponse(FakeResponse):
+            def getheaders(self):
+                raise RuntimeError("metadata failure")
+
+        class NonBytesResponse(FakeResponse):
+            def read(self, amount=-1):
+                return "not-bytes"
+
+        class OversizedResponse(FakeResponse):
+            def read(self, amount=-1):
+                return b"x" * (amount + 5)
+
+        cases = [
+            MetadataFailureResponse(200, b"ok"),
+            NonBytesResponse(200, b"ok"),
+            OversizedResponse(200, b"ok"),
+        ]
+        for response in cases:
+            with self.subTest(response=type(response).__name__):
+                plan = make_plan(
+                    [
+                        make_request("r1", "https://example.com/a"),
+                        make_request("r2", "https://example.com/b"),
+                    ]
+                )
+                session = pc.ProvenanceSession(
+                    Path(self.tmp.name) / f"session-{type(response).__name__}",
+                    plan=plan,
+                )
+                session.initialize()
+                with self.assertRaises(pc.BudgetBlockedError):
+                    session.request_one("r1", FakeTransport([response]))
+                later = FakeTransport([FakeResponse(200, b"no")])
+                with self.assertRaises(pc.SessionFinalizedError):
+                    session.request_one("r2", later)
+                self.assertEqual(later.calls, 0)
+
+    def test_projection_failure_appends_storage_record(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        original_write = session._write_json_atomic
+
+        def fail_state(path, value, subject):
+            if path == session.state_path:
+                raise pc.SessionInvalidError("projection failure")
+            return original_write(path, value, subject)
+
+        with mock.patch.object(session, "_write_json_atomic", side_effect=fail_state):
+            with self.assertRaises(pc.SessionInvalidError):
+                session.request_one("r1", FakeTransport([FakeResponse(200, b"ok")]))
+        full = session.load_records()
+        self.assertTrue(
+            any(
+                record.get("record_type") == pc.PROJECTION_FAILURE_RECORD_TYPE
+                and record.get("transport_classification") == "RESPONSE_STORAGE_ERROR"
+                for record in full
+            )
+        )
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionInvalidError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
 
 
 if __name__ == "__main__":

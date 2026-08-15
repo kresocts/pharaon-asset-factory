@@ -111,7 +111,9 @@ PLAN_REQUEST_KEYS = {
     "redirect_from_id",
 }
 HTTP_RECORD_TYPE = "HTTP"
+RESERVATION_RECORD_TYPE = "REQUEST_RESERVED"
 TERMINAL_RECORD_TYPE = "SESSION_FINALIZED"
+PROJECTION_FAILURE_RECORD_TYPE = "SESSION_STORAGE_ERROR"
 
 
 class ProvenanceError(Exception):
@@ -279,28 +281,53 @@ def _parse_log_lines(lines: Sequence[str]) -> list[dict[str, Any]]:
 def _validate_exact_plan_prefix(
     plan: "SessionPlan",
     records: Sequence[Mapping[str, Any]],
+    *,
+    allow_pending_reservation: bool = False,
 ) -> None:
     terminal = bool(
         records
         and records[-1].get("record_type") == TERMINAL_RECORD_TYPE
     )
-    http_records = list(records[:-1]) if terminal else list(records)
-    if len(http_records) > len(plan.requests):
+    non_terminal = list(records[:-1]) if terminal else list(records)
+    pending_reservation = None
+    if allow_pending_reservation and non_terminal and non_terminal[-1].get("record_type") == RESERVATION_RECORD_TYPE:
+        pending_reservation = non_terminal[-1]
+        non_terminal = non_terminal[:-1]
+    if len(non_terminal) % 2 != 0:
         raise SessionInvalidError(
-            "session log contains more HTTP records than the plan allows"
+            "session log does not contain complete reservation/result pairs"
         )
-    for index, record in enumerate(http_records):
-        expected_id = plan.requests[index].id
-        if record.get("plan_entry_id") != expected_id:
+    pair_count = len(non_terminal) // 2
+    if pair_count + (1 if pending_reservation is not None else 0) > len(plan.requests):
+        raise SessionInvalidError(
+            "session log contains more attempts than the plan allows"
+        )
+    for index in range(pair_count):
+        request = plan.requests[index]
+        reservation = non_terminal[2 * index]
+        result = non_terminal[2 * index + 1]
+        if reservation.get("record_type") != RESERVATION_RECORD_TYPE:
             raise SessionInvalidError(
-                f"session log is not an exact contiguous plan prefix: "
-                f"record {index + 1} has plan_entry_id "
-                f"{record.get('plan_entry_id')!r}; expected {expected_id!r}"
+                f"expected reservation record before request {request.id!r}"
             )
-    if terminal and records[-1].get("record_type") != TERMINAL_RECORD_TYPE:
-        raise SessionInvalidError(
-            "extra record after the plan is not a terminal finalization record"
-        )
+        if reservation.get("plan_entry_id") != request.id:
+            raise SessionInvalidError(
+                f"reservation record plan_entry_id does not match {request.id!r}"
+            )
+        if result.get("record_type") != HTTP_RECORD_TYPE:
+            raise SessionInvalidError(
+                f"expected HTTP result record for request {request.id!r}"
+            )
+        if result.get("plan_entry_id") != request.id:
+            raise SessionInvalidError(
+                f"result record plan_entry_id does not match {request.id!r}"
+            )
+    if pending_reservation is not None:
+        expected_id = plan.requests[pair_count].id
+        if pending_reservation.get("plan_entry_id") != expected_id:
+            raise SessionInvalidError(
+                f"pending reservation plan_entry_id does not match {expected_id!r}"
+            )
 
 
 def _normalise_host(url: str) -> str:
@@ -353,7 +380,7 @@ def canonical_url_identity(url: str) -> tuple[str, str, int, str, str]:
         parts.scheme.lower(),
         host.lower(),
         parts.port or 443,
-        parts.path,
+        parts.path or "/",
         parts.query,
     )
 
@@ -895,6 +922,14 @@ class ProvenanceSession:
                 f"{subject} is not a single-link regular file: {path}"
             )
 
+    def _assert_fd_matches_path(self, fd: int, path: Path, subject: str) -> None:
+        fd_st = os.fstat(fd)
+        path_st = path.lstat()
+        if (fd_st.st_dev, fd_st.st_ino) != (path_st.st_dev, path_st.st_ino):
+            raise SessionInvalidError(
+                f"{subject} path and descriptor identity do not match: {path}"
+            )
+
     def _open_exclusive_regular_file(
         self,
         path: Path,
@@ -919,6 +954,7 @@ class ProvenanceSession:
                 f"cannot create {subject} {path}: {error}"
             ) from error
         self._assert_regular_single_link_fd(fd, path, subject)
+        self._assert_fd_matches_path(fd, path, subject)
         return fd
 
     def _write_all_fd(self, fd: int, data: bytes, subject: str) -> None:
@@ -1105,7 +1141,8 @@ class ProvenanceSession:
         return [
             dict(record)
             for record in records
-            if record.get("record_type") != TERMINAL_RECORD_TYPE
+            if record.get("record_type")
+            not in {TERMINAL_RECORD_TYPE, RESERVATION_RECORD_TYPE}
         ]
 
     def _blocked_reason_from_records(
@@ -1113,7 +1150,10 @@ class ProvenanceSession:
         records: Sequence[Mapping[str, Any]],
     ) -> str | None:
         for record in reversed(records):
-            if record.get("record_type") == TERMINAL_RECORD_TYPE:
+            if record.get("record_type") in {
+                TERMINAL_RECORD_TYPE,
+                RESERVATION_RECORD_TYPE,
+            }:
                 continue
             return self._is_blocking_classification(record)
         return None
@@ -1197,6 +1237,7 @@ class ProvenanceSession:
         self,
         *,
         allow_pending_retained: bool = False,
+        allow_pending_reservation: bool = False,
     ) -> list[dict[str, Any]]:
         self._validate_authoritative_files()
         try:
@@ -1218,7 +1259,11 @@ class ProvenanceSession:
             raise SessionInvalidError("session summary plan hash does not match the plan")
         if state.get("session_id") != summary.get("session_id"):
             raise SessionInvalidError("session state and summary session IDs do not match")
-        _validate_exact_plan_prefix(plan, records)
+        _validate_exact_plan_prefix(
+            plan,
+            records,
+            allow_pending_reservation=allow_pending_reservation,
+        )
         http_records = self._http_records(records)
         aggregate = sum(
             int(record.get("response_body_bytes", 0))
@@ -1438,7 +1483,10 @@ class ProvenanceSession:
         *,
         plan: SessionPlan,
     ) -> dict[str, Any]:
-        records = self.verify_session(allow_pending_retained=True)
+        records = self.verify_session(
+            allow_pending_retained=True,
+            allow_pending_reservation=True,
+        )
         state = self._read_state()
         session_id = state.get("session_id")
         if not isinstance(session_id, str) or not session_id:
@@ -1461,29 +1509,33 @@ class ProvenanceSession:
         records.append(full_record)
         blocked_reason = self._blocked_reason_from_records(records)
         finalized = full_record.get("record_type") == TERMINAL_RECORD_TYPE
-        self._write_json_atomic(
-            self.state_path,
-            self._new_state(
-                plan,
-                records,
-                blocked_reason=blocked_reason,
-                session_id=session_id,
-                created_utc=state.get("created_utc", utc_now()),
-                finalized=finalized,
-            ),
-            "session state",
-        )
-        self._write_json_atomic(
-            self.summary_path,
-            self._summary_from(
-                records,
-                plan,
-                session_id=session_id,
-                blocked_reason=blocked_reason,
-                finalized=finalized,
-            ),
-            "session summary",
-        )
+        try:
+            self._write_json_atomic(
+                self.state_path,
+                self._new_state(
+                    plan,
+                    records,
+                    blocked_reason=blocked_reason,
+                    session_id=session_id,
+                    created_utc=state.get("created_utc", utc_now()),
+                    finalized=finalized,
+                ),
+                "session state",
+            )
+            self._write_json_atomic(
+                self.summary_path,
+                self._summary_from(
+                    records,
+                    plan,
+                    session_id=session_id,
+                    blocked_reason=blocked_reason,
+                    finalized=finalized,
+                ),
+                "session summary",
+            )
+        except ProvenanceError:
+            self._append_projection_failure_record(full_record)
+            raise
         return full_record
 
     def _append_jsonl_line(self, record: Mapping[str, Any]) -> None:
@@ -1507,6 +1559,7 @@ class ProvenanceSession:
                 f"cannot append to session log {self.log_path}: {error}"
             ) from error
         self._assert_regular_single_link_fd(fd, self.log_path, "session log")
+        self._assert_fd_matches_path(fd, self.log_path, "session log")
         try:
             self._write_all_fd(fd, line, "session log")
             try:
@@ -1517,6 +1570,32 @@ class ProvenanceSession:
                 ) from error
         finally:
             os.close(fd)
+
+    def _append_projection_failure_record(
+        self,
+        full_record: Mapping[str, Any],
+    ) -> None:
+        previous_hash = full_record.get("current_hash")
+        sequence = int(full_record.get("sequence", 0)) + 1
+        failure_record: dict[str, Any] = {
+            "record_type": PROJECTION_FAILURE_RECORD_TYPE,
+            "schema_version": SCHEMA_VERSION,
+            "sequence": sequence,
+            "timestamp": utc_now(),
+            "previous_hash": previous_hash,
+            "session_id": full_record.get("session_id"),
+            "plan_sha256": full_record.get("plan_sha256"),
+            "transport_classification": "RESPONSE_STORAGE_ERROR",
+            "response_body_bytes": 0,
+            "body_measured": False,
+            "body_complete": False,
+            "plan_entry_id": full_record.get("plan_entry_id"),
+        }
+        failure_record["current_hash"] = record_hash(failure_record)
+        try:
+            self._append_jsonl_line(failure_record)
+        except ProvenanceError:
+            pass
 
     @_locked_session
     def finalize(self) -> dict[str, Any]:
@@ -1663,9 +1742,13 @@ class ProvenanceSession:
                 return b"".join(chunks), False, "RESPONSE_READ_TIMEOUT"
             except Exception:
                 return b"".join(chunks), False, "RESPONSE_READ_ERROR"
+            if not isinstance(chunk, (bytes, bytearray)):
+                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
+            if len(chunk) > remaining:
+                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
             if not chunk:
                 break
-            chunks.append(chunk)
+            chunks.append(bytes(chunk))
             remaining -= len(chunk)
         return b"".join(chunks), remaining == 0, None
 
@@ -1685,9 +1768,13 @@ class ProvenanceSession:
                 return b"".join(chunks), False, "RESPONSE_READ_TIMEOUT"
             except Exception:
                 return b"".join(chunks), False, "RESPONSE_READ_ERROR"
+            if not isinstance(chunk, (bytes, bytearray)):
+                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
+            if len(chunk) > remaining:
+                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
             if not chunk:
                 return b"".join(chunks), True, None
-            chunks.append(chunk)
+            chunks.append(bytes(chunk))
             remaining -= len(chunk)
 
     def _record_authorizes_redirect_target(
@@ -1715,7 +1802,8 @@ class ProvenanceSession:
         records: Sequence[Mapping[str, Any]],
         requested_id: str | None = None,
     ) -> PlanRequest:
-        next_index = len(records)
+        http_records = self._http_records(records)
+        next_index = len(http_records)
         if next_index >= len(plan.requests):
             raise RequestPolicyError("no pending plan entries remain")
         next_request = plan.requests[next_index]
@@ -1736,7 +1824,7 @@ class ProvenanceSession:
                     f"the immediate planned predecessor"
                 )
             if not self._record_authorizes_redirect_target(
-                records[-1],
+                http_records[-1],
                 source,
                 next_request,
             ):
@@ -1758,14 +1846,15 @@ class ProvenanceSession:
         while True:
             records = self.verify_session()
             self._ensure_writable()
-            if len(records) >= len(plan.requests):
-                return records
-            if len(records) >= plan.max_requests:
+            completed = self._http_records(records)
+            if len(completed) >= len(plan.requests):
+                return self._http_records(records)
+            if len(completed) >= plan.max_requests:
                 raise BudgetBlockedError("request budget is exhausted")
             request = self._authorize_next_entry(plan, records)
             aggregate = sum(
                 int(record.get("response_body_bytes", 0))
-                for record in records
+                for record in completed
             )
             if aggregate >= plan.max_bytes:
                 raise BudgetBlockedError("response-byte budget is exhausted")
@@ -1774,6 +1863,11 @@ class ProvenanceSession:
                 request,
                 plan,
                 remaining_bytes=remaining_bytes,
+            )
+            self._append_reservation(request, plan)
+            records = self.verify_session(
+                allow_pending_retained=True,
+                allow_pending_reservation=True,
             )
             record = self._perform_one(
                 request,
@@ -1790,7 +1884,7 @@ class ProvenanceSession:
             records = self.verify_session()
             if blocked_reason is not None:
                 raise BudgetBlockedError(f"session blocked: {blocked_reason}")
-        return self.load_records()
+        return self._http_records(self.load_records())
 
     @_locked_session
     def request_one(
@@ -1803,11 +1897,12 @@ class ProvenanceSession:
         records = self.verify_session()
         self._ensure_writable()
         request = self._authorize_next_entry(plan, records, entry_id)
+        completed = self._http_records(records)
         aggregate = sum(
             int(record.get("response_body_bytes", 0))
-            for record in records
+            for record in completed
         )
-        if len(records) >= plan.max_requests:
+        if len(completed) >= plan.max_requests:
             raise BudgetBlockedError("request budget is exhausted")
         if aggregate >= plan.max_bytes:
             raise BudgetBlockedError("response-byte budget is exhausted")
@@ -1816,6 +1911,11 @@ class ProvenanceSession:
             request,
             plan,
             remaining_bytes=remaining_bytes,
+        )
+        self._append_reservation(request, plan)
+        records = self.verify_session(
+            allow_pending_retained=True,
+            allow_pending_reservation=True,
         )
         record = self._perform_one(
             request,
@@ -1848,8 +1948,9 @@ class ProvenanceSession:
                 "redirect_source_entry_id": None,
                 "redirect_source_record_hash": None,
             }
-        source = plan.requests[len(records) - 1]
-        source_record = records[-1]
+        http_records = self._http_records(records)
+        source = plan.requests[len(http_records) - 1]
+        source_record = http_records[-1]
         return {
             "redirect_target_id": request.id,
             "redirect_exact_match": True,
@@ -1858,6 +1959,20 @@ class ProvenanceSession:
             "redirect_source_entry_id": source.id,
             "redirect_source_record_hash": source_record["current_hash"],
         }
+
+    def _append_reservation(
+        self,
+        request: PlanRequest,
+        plan: SessionPlan,
+    ) -> dict[str, Any]:
+        return self._append_record(
+            {
+                "record_type": RESERVATION_RECORD_TYPE,
+                "timestamp": utc_now(),
+                "plan_entry_id": request.id,
+            },
+            plan=plan,
+        )
 
     def _perform_one(
         self,
@@ -1899,16 +2014,39 @@ class ProvenanceSession:
                 detail="transport_error",
                 target_context=target_context,
             )
-        return self._response_record(
-            request,
-            plan,
-            response,
-            host,
-            sequence,
-            remaining_bytes,
-            records,
-            target_context=target_context,
-        )
+        try:
+            return self._response_record(
+                request,
+                plan,
+                response,
+                host,
+                sequence,
+                remaining_bytes,
+                records,
+                target_context=target_context,
+            )
+        except (socket.timeout, TimeoutError):
+            return self._transport_record(
+                request,
+                plan,
+                host,
+                sequence,
+                remaining_bytes,
+                "RESPONSE_READ_TIMEOUT",
+                detail="response_processing_timeout",
+                target_context=target_context,
+            )
+        except Exception:
+            return self._transport_record(
+                request,
+                plan,
+                host,
+                sequence,
+                remaining_bytes,
+                "RESPONSE_READ_ERROR",
+                detail="response_processing_error",
+                target_context=target_context,
+            )
 
     def _transport_record(
         self,
@@ -2052,7 +2190,12 @@ class ProvenanceSession:
                     classification = "BYTE_BUDGET_EXCEEDED"
 
         try:
-            retained = self._save_body(body, request=request, sequence=sequence)
+            retained_sequence = len(self._http_records(records)) + 1
+            retained = self._save_body(
+                body,
+                request=request,
+                sequence=retained_sequence,
+            )
         except ProvenanceError:
             retained = None
             classification = "RESPONSE_STORAGE_ERROR"
@@ -2079,7 +2222,8 @@ class ProvenanceSession:
             blocked = True
             refusal_reason = "status_not_in_expected_statuses"
         elif classification is None and request.redirect_from_id is not None:
-            source_record = records[-1]
+            http_records = self._http_records(records)
+            source_record = http_records[-1]
             redirect_target_id = request.id
             redirect_authorized = True
             redirect_exact_match = True
@@ -2148,6 +2292,7 @@ class ProvenanceSession:
                             blocked = True
                             redirect_refusal_reason = "redirect_target_mismatch"
 
+        attempt_number = len(self._http_records(records)) + 1
         record = {
             "record_type": HTTP_RECORD_TYPE,
             "schema_version": SCHEMA_VERSION,
@@ -2173,7 +2318,7 @@ class ProvenanceSession:
             "redirect_refusal_reason": redirect_refusal_reason,
             "final_host": final_host,
             "retained_filename": retained,
-            "remaining_request_budget": plan.max_requests - sequence,
+            "remaining_request_budget": plan.max_requests - attempt_number,
             "remaining_byte_budget": remaining_bytes - actual,
             "body_measured": True,
             "body_complete": body_complete,
