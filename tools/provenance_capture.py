@@ -73,6 +73,7 @@ BLOCKING_CLASSIFICATIONS = {
     "UNEXPECTED_STATUS",
     "RESPONSE_READ_TIMEOUT",
     "RESPONSE_READ_ERROR",
+    "RESPONSE_READ_OVERSIZED",
     "RESPONSE_STORAGE_ERROR",
 }
 
@@ -910,17 +911,24 @@ class ProvenanceSession:
         if self.lock_path.is_symlink():
             raise SessionInvalidError("session lock path must not be a symlink")
 
+    def _assert_regular_single_link_stat(
+        self,
+        st: os.stat_result,
+        path: Path,
+        subject: str,
+    ) -> None:
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise SessionInvalidError(
+                f"{subject} is not a single-link regular file: {path}"
+            )
+
     def _assert_regular_single_link_fd(
         self,
         fd: int,
         path: Path,
         subject: str,
     ) -> None:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            raise SessionInvalidError(
-                f"{subject} is not a single-link regular file: {path}"
-            )
+        self._assert_regular_single_link_stat(os.fstat(fd), path, subject)
 
     def _assert_fd_matches_path(self, fd: int, path: Path, subject: str) -> None:
         fd_st = os.fstat(fd)
@@ -972,6 +980,79 @@ class ProvenanceSession:
                     f"short write while writing {subject}"
                 )
             total += written
+
+    def _read_authoritative_bytes(
+        self,
+        path: Path,
+        subject: str,
+        max_bytes: int,
+        *,
+        validate_path: bool = True,
+    ) -> bytes:
+        if validate_path:
+            self._validate_authoritative_path(path)
+        else:
+            self._reject_symlink_components(path)
+        try:
+            path_st = path.lstat()
+        except OSError as error:
+            raise SessionInvalidError(
+                f"cannot stat {subject} {path}: {error}"
+            ) from error
+        self._assert_regular_single_link_stat(path_st, path, subject)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+        except OSError as error:
+            raise SessionInvalidError(
+                f"cannot open {subject} {path}: {error}"
+            ) from error
+        try:
+            self._assert_regular_single_link_fd(fd, path, subject)
+            fd_st = os.fstat(fd)
+            if (path_st.st_dev, path_st.st_ino) != (fd_st.st_dev, fd_st.st_ino):
+                raise SessionInvalidError(
+                    f"{subject} path and descriptor identity do not match: {path}"
+                )
+            try:
+                current_st = path.lstat()
+            except OSError as error:
+                raise SessionInvalidError(
+                    f"cannot re-stat {subject} {path}: {error}"
+                ) from error
+            if (fd_st.st_dev, fd_st.st_ino) != (current_st.st_dev, current_st.st_ino):
+                raise SessionInvalidError(
+                    f"{subject} path changed while opening: {path}"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                try:
+                    chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+                except OSError as error:
+                    raise SessionInvalidError(
+                        f"cannot read {subject} {path}: {error}"
+                    ) from error
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
+        if len(raw) > max_bytes:
+            raise SessionInvalidError(
+                f"{subject} {path} exceeds the {max_bytes}-byte size limit"
+            )
+        return raw
+
+    def _decode_authoritative_utf8(self, raw: bytes, subject: str) -> str:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise SessionInvalidError(f"{subject} is not valid UTF-8") from error
 
     def _write_exclusive_bytes(
         self,
@@ -1033,10 +1114,14 @@ class ProvenanceSession:
         return self.plan
 
     def _plan_from_disk(self) -> SessionPlan:
-        value = _load_json_file_bounded(
+        raw = self._read_authoritative_bytes(
             self.plan_path,
             "session plan",
             MAX_PLAN_BYTES,
+        )
+        value = _load_json_text(
+            self._decode_authoritative_utf8(raw, "session plan"),
+            "session plan",
         )
         plan_hash = value.get("plan_hash")
         if (
@@ -1049,20 +1134,32 @@ class ProvenanceSession:
         return SessionPlan.from_dict(value)
 
     def _read_state(self) -> dict[str, Any]:
-        value = _load_json_file_bounded(
-            self.state_path,
+        value = _load_json_text(
+            self._decode_authoritative_utf8(
+                self._read_authoritative_bytes(
+                    self.state_path,
+                    "session state",
+                    MAX_STATE_BYTES,
+                ),
+                "session state",
+            ),
             "session state",
-            MAX_STATE_BYTES,
         )
         if not isinstance(value, dict):
             raise SessionInvalidError("session state must be a JSON object")
         return value
 
     def _read_summary(self) -> dict[str, Any]:
-        value = _load_json_file_bounded(
-            self.summary_path,
+        value = _load_json_text(
+            self._decode_authoritative_utf8(
+                self._read_authoritative_bytes(
+                    self.summary_path,
+                    "session summary",
+                    MAX_SUMMARY_BYTES,
+                ),
+                "session summary",
+            ),
             "session summary",
-            MAX_SUMMARY_BYTES,
         )
         if not isinstance(value, dict):
             raise SessionInvalidError("session summary must be a JSON object")
@@ -1229,7 +1326,12 @@ class ProvenanceSession:
         }
 
     def load_records(self) -> list[dict[str, Any]]:
-        text = _read_utf8_bounded(self.log_path, "session log", MAX_LOG_BYTES)
+        raw = self._read_authoritative_bytes(
+            self.log_path,
+            "session log",
+            MAX_LOG_BYTES,
+        )
+        text = self._decode_authoritative_utf8(raw, "session log")
         lines = text.splitlines()
         return _parse_log_lines(lines)
 
@@ -1442,21 +1544,13 @@ class ProvenanceSession:
                 raise SessionInvalidError(
                     f"retained body is not a regular file: {filename!r}"
                 )
-            try:
-                st = target.lstat()
-                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-                    raise SessionInvalidError(
-                        f"retained body must be a single-link regular file: {filename!r}"
-                    )
-                size = st.st_size
-                body = target.read_bytes()
-            except SessionInvalidError:
-                raise
-            except OSError as error:
-                raise SessionInvalidError(
-                    f"cannot read retained body {target}: {error}"
-                ) from error
-            if size != record.get("response_body_bytes"):
+            body = self._read_authoritative_bytes(
+                target,
+                "retained body",
+                DEFAULT_MAX_BYTES,
+                validate_path=False,
+            )
+            if len(body) != record.get("response_body_bytes"):
                 raise SessionInvalidError(
                     f"retained body size mismatch for {filename!r}"
                 )
@@ -1744,12 +1838,12 @@ class ProvenanceSession:
                 return b"".join(chunks), False, "RESPONSE_READ_ERROR"
             if not isinstance(chunk, (bytes, bytearray)):
                 return b"".join(chunks), False, "RESPONSE_READ_ERROR"
-            if len(chunk) > remaining:
-                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
             if not chunk:
                 break
             chunks.append(bytes(chunk))
             remaining -= len(chunk)
+            if remaining < 0:
+                return b"".join(chunks), False, "RESPONSE_READ_OVERSIZED"
         return b"".join(chunks), remaining == 0, None
 
     def _read_streaming_observed(
@@ -1770,12 +1864,12 @@ class ProvenanceSession:
                 return b"".join(chunks), False, "RESPONSE_READ_ERROR"
             if not isinstance(chunk, (bytes, bytearray)):
                 return b"".join(chunks), False, "RESPONSE_READ_ERROR"
-            if len(chunk) > remaining:
-                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
             if not chunk:
                 return b"".join(chunks), True, None
             chunks.append(bytes(chunk))
             remaining -= len(chunk)
+            if remaining < 0:
+                return b"".join(chunks), False, "RESPONSE_READ_OVERSIZED"
 
     def _record_authorizes_redirect_target(
         self,
@@ -2189,17 +2283,20 @@ class ProvenanceSession:
                 if blocked:
                     classification = "BYTE_BUDGET_EXCEEDED"
 
-        try:
-            retained_sequence = len(self._http_records(records)) + 1
-            retained = self._save_body(
-                body,
-                request=request,
-                sequence=retained_sequence,
-            )
-        except ProvenanceError:
+        if read_classification is not None:
             retained = None
-            classification = "RESPONSE_STORAGE_ERROR"
-            blocked = True
+        else:
+            try:
+                retained_sequence = len(self._http_records(records)) + 1
+                retained = self._save_body(
+                    body,
+                    request=request,
+                    sequence=retained_sequence,
+                )
+            except ProvenanceError:
+                retained = None
+                classification = "RESPONSE_STORAGE_ERROR"
+                blocked = True
         body_hash = sha256_bytes(body)
 
         context = dict(target_context or {})

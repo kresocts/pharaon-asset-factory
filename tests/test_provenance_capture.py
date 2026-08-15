@@ -65,6 +65,24 @@ class FlakyResponse(FakeResponse):
         return super().read(amount)
 
 
+class OversizedResponse(FakeResponse):
+    def read(self, amount=-1):
+        if amount < 0:
+            amount = 1024
+        return b"x" * (amount + 5)
+
+
+class SequenceResponse(FakeResponse):
+    def __init__(self, status, chunks, headers=None, final_host=None):
+        super().__init__(status, b"", headers, final_host)
+        self.chunks = list(chunks)
+
+    def read(self, amount=-1):
+        if not self.chunks:
+            return b""
+        return self.chunks.pop(0)
+
+
 class FakeTransport:
     def __init__(self, responses=None, error=None):
         self.responses = list(responses or [])
@@ -2127,6 +2145,147 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.SessionInvalidError):
             session.request_one("r2", later)
         self.assertEqual(later.calls, 0)
+
+
+    def test_secure_authoritative_reads_refuse_inode_swap(self):
+        plan = make_plan([make_request("r1", "https://example.com/a", retain=True)])
+        session = self.init_session(plan)
+        session.execute(FakeTransport([FakeResponse(200, b"retained")]))
+
+        replacements = {
+            "plan": session.plan_path,
+            "state": session.state_path,
+            "summary": session.summary_path,
+            "log": session.log_path,
+            "retained": session.responses_dir / "0001.bin",
+        }
+        for name, target in replacements.items():
+            with self.subTest(name=name):
+                replacement = Path(self.tmp.name) / f"{name}-replacement"
+                replacement.write_bytes(target.read_bytes())
+                original_bytes = replacement.read_bytes()
+                real_open = os.open
+
+                def fake_open(path, flags, mode=0o777):
+                    if Path(path) == target:
+                        return real_open(replacement, flags, mode)
+                    return real_open(path, flags, mode)
+
+                with mock.patch("tools.provenance_capture.os.open", side_effect=fake_open):
+                    with self.assertRaises(pc.SessionInvalidError):
+                        if name == "plan":
+                            session._read_authoritative_bytes(
+                                target, "session plan", pc.MAX_PLAN_BYTES
+                            )
+                        elif name == "state":
+                            session._read_authoritative_bytes(
+                                target, "session state", pc.MAX_STATE_BYTES
+                            )
+                        elif name == "summary":
+                            session._read_authoritative_bytes(
+                                target, "session summary", pc.MAX_SUMMARY_BYTES
+                            )
+                        elif name == "log":
+                            session._read_authoritative_bytes(
+                                target, "session log", pc.MAX_LOG_BYTES
+                            )
+                        else:
+                            session._read_authoritative_bytes(
+                                target, "retained body", pc.DEFAULT_MAX_BYTES
+                            )
+                self.assertEqual(replacement.read_bytes(), original_bytes)
+
+    def test_oversized_first_read_accounts_exact_bytes(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ],
+            max_bytes=5,
+        )
+        session = self.init_session(plan)
+        response = OversizedResponse(200, b"ok")
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", FakeTransport([response]))
+        records = http_records(session.load_records())
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_READ_OVERSIZED")
+        self.assertEqual(records[0]["response_body_bytes"], 10)
+        self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"x" * 10))
+        self.assertFalse(records[0]["body_complete"])
+        session.verify_session()
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionFinalizedError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
+
+    def test_oversized_read_after_valid_chunks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        response = SequenceResponse(
+            200,
+            [b"ab", b"xyzw"],
+            {"content-length": ["5"]},
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", FakeTransport([response]))
+        records = http_records(session.load_records())
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_READ_OVERSIZED")
+        self.assertEqual(records[0]["response_body_bytes"], 6)
+        self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"abxyzw"))
+
+    def test_oversized_read_crosses_byte_budget(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ],
+            max_bytes=3,
+        )
+        session = self.init_session(plan)
+        response = SequenceResponse(200, [b"abcdef"])
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", FakeTransport([response]))
+        records = http_records(session.load_records())
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_READ_OVERSIZED")
+        self.assertEqual(records[0]["response_body_bytes"], 6)
+        self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"abcdef"))
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionFinalizedError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
+
+    def test_symlink_swap_refused_without_transport_and_external_unchanged(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a", retain=True),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one(
+            "r1",
+            FakeTransport([FakeResponse(200, b"retained")]),
+        )
+
+        external = Path(self.tmp.name) / "external-identical.bin"
+        external.write_bytes(b"retained")
+        target = session.responses_dir / "0001.bin"
+        target.unlink()
+        try:
+            target.symlink_to(external)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionInvalidError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
+        self.assertEqual(external.read_bytes(), b"retained")
 
 
 if __name__ == "__main__":

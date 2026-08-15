@@ -25,9 +25,15 @@ fields are rejected, duplicate allowed hosts are rejected, and the stored author
 plan must contain its canonical lowercase 64-hex `plan_hash`. Conflicting
 `Content-Length`/`Transfer-Encoding` framing blocks the session. Every attempt first
 appends a durable `REQUEST_RESERVED` record; response, metadata, read, and projection
-failures cannot make the session appear unused. All retained-body, atomic JSON, and
-JSONL writes use full-write loops and fail closed on `OSError`, short writes, or
-fsync failures. Authoritative file opens compare descriptor and path identity.
+failures cannot make the session appear unused or allow a second transport for that
+entry. Response-body retention failures become a blocking `RESPONSE_STORAGE_ERROR`
+record; state/summary projection failures become a blocking `SESSION_STORAGE_ERROR`
+record whenever the log remains writable. All retained-body, atomic JSON, and JSONL
+writes use full-write loops and fail closed on `OSError`, short writes, or fsync
+failures. Authoritative file opens and reads compare descriptor and path identity
+(`st_dev`/`st_ino`) and refuse path swaps. An oversized `response.read()` result
+blocks the session and records the exact returned byte count and SHA-256 under
+`RESPONSE_READ_OVERSIZED`.
 
 Run with:
 

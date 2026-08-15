@@ -62,10 +62,22 @@ Use a standard-library-only Python logger with these invariants:
   measured; malformed, duplicated, mixed-case-normalized, or unsupported codings are
   blocking.
 - Retained-body persistence, atomic JSON temporary writes, and JSONL append use
-  robust full-write loops. Real `OSError`, short writes, and fsync failures become
-  authoritative `RESPONSE_STORAGE_ERROR` records rather than escaping or allowing a
-  retry. Every authorized attempt first appends a durable `REQUEST_RESERVED` record;
-  authoritative file opens compare `fstat`/`lstat` identity and reject path swaps.
+  robust full-write loops. Response-body retention failures become a blocking
+  `RESPONSE_STORAGE_ERROR` HTTP record; state/summary projection failures after a
+  successful response append become a blocking `SESSION_STORAGE_ERROR` record
+  whenever the log remains writable. Every authorized attempt first appends a
+  durable `REQUEST_RESERVED` record, so a later failure cannot leave the session
+  looking unused or allow a second transport for that entry.
+- Authoritative reads open files read-only with no-follow semantics where
+  supported, require a single-link regular file, compare the opened descriptor with
+  the path using `st_dev`/`st_ino` before and after opening, and read through the
+  already validated descriptor. This covers `session-plan.json`,
+  `session-state.json`, `session-summary.json`, `session.log.jsonl`, and retained
+  bodies, whose size and SHA-256 are derived from that same validated inode.
+- An `os.read()` that returns more bytes than requested is an invalid oversized
+  read. The session is blocked, later transports are refused, and the record stores
+  the exact returned byte count and SHA-256 (including earlier chunks) under
+  `RESPONSE_READ_OVERSIZED`; it never claims an oversized body was retained.
 
 ## Consequences
 
