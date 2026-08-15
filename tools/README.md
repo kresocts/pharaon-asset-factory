@@ -7,9 +7,17 @@ network research and authorizes no public endpoint use.
 
 The logger enforces an explicit HTTPS official-host allowlist, request and aggregate
 byte budgets, no ambient credentials, no automatic retries, and no checkpoint/weight
-body URLs. It writes one hash-chained JSONL record per request/hop and verifies the
-complete chain before every append. Plans are immutable, canonical SHA-256-bound,
-and must explicitly link a redirect source to its one exact target.
+body URLs in raw or decoded path/query content. It writes one hash-chained JSONL
+record per request/hop and verifies the complete chain before every append. Plans
+are immutable, canonical SHA-256-bound, use strict portable request IDs, reject
+canonically equivalent duplicate URLs, and must explicitly link a redirect source
+to its one exact target.
+
+A redirect source records authorization only after exact target validation; it does
+not claim the redirect was followed until the adjacent target record exists and binds
+back to the source record hash. Finalization appends a terminal hash-chained record.
+Retained bodies use sequence-only filenames and are verified for safe containment,
+size, and SHA-256 during session verification.
 
 Run with:
 

@@ -289,7 +289,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         plan = make_plan([make_request("r1", "https://example.com/raw", retain=True)])
         session = self.init_session(plan)
         session.execute(FakeTransport([FakeResponse(200, body)]))
-        retained = session.responses_dir / "01-r1.bin"
+        retained = session.responses_dir / "0001.bin"
         self.assertTrue(retained.exists())
         self.assertEqual(retained.read_bytes(), body)
 
@@ -534,8 +534,14 @@ class ProvenanceCaptureTests(unittest.TestCase):
             records[0]["redirect_resolved_url"],
             "https://huggingface.co/api/resolve-cache/models/x/resolve/main/config.yaml",
         )
-        self.assertTrue(records[0]["redirect_followed"])
+        self.assertTrue(records[0]["redirect_authorized"])
         self.assertTrue(records[0]["redirect_exact_match"])
+        self.assertFalse(records[0]["redirect_followed"])
+        self.assertTrue(records[1]["redirect_followed"])
+        self.assertEqual(
+            records[1]["redirect_source_record_hash"],
+            records[0]["current_hash"],
+        )
         self.assertEqual(records[1]["status"], 200)
 
     def test_redirect_response_body_logged_before_target_request(self):
@@ -593,8 +599,14 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 ]
             )
         )
-        self.assertTrue(records[0]["redirect_followed"])
+        self.assertTrue(records[0]["redirect_authorized"])
         self.assertTrue(records[0]["redirect_exact_match"])
+        self.assertFalse(records[0]["redirect_followed"])
+        self.assertTrue(records[1]["redirect_followed"])
+        self.assertEqual(
+            records[1]["redirect_source_record_hash"],
+            records[0]["current_hash"],
+        )
 
     def test_scheme_relative_redirect_succeeds_exact(self):
         plan = make_plan(
@@ -612,7 +624,9 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 ]
             )
         )
-        self.assertTrue(records[0]["redirect_followed"])
+        self.assertTrue(records[0]["redirect_authorized"])
+        self.assertFalse(records[0]["redirect_followed"])
+        self.assertTrue(records[1]["redirect_followed"])
 
     def test_redirect_to_wrong_host_fails(self):
         plan = make_plan(
@@ -920,7 +934,8 @@ class ProvenanceCaptureTests(unittest.TestCase):
                 [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
             ),
         )
-        self.assertTrue(record["redirect_followed"])
+        self.assertTrue(record["redirect_authorized"])
+        self.assertFalse(record["redirect_followed"])
         self.assertEqual(len(session.load_records()), 1)
 
     def test_request_one_target_without_source_fails(self):
@@ -950,6 +965,8 @@ class ProvenanceCaptureTests(unittest.TestCase):
         )
         record = session.request_one("r2", FakeTransport([FakeResponse(200, b"ok")]))
         self.assertEqual(record["status"], 200)
+        self.assertTrue(record["redirect_followed"])
+        self.assertEqual(record["redirect_source_entry_id"], "r1")
         self.assertEqual(len(session.load_records()), 2)
 
 
@@ -1131,6 +1148,168 @@ class ProvenanceCaptureTests(unittest.TestCase):
         self.assertEqual(exit_code, pc.EXIT_POLICY_REFUSAL)
         self.assertNotIn("Traceback", buffer.getvalue())
         self.assertIn("out-of-order", buffer.getvalue())
+
+
+    def test_blocked_state_tamper_cannot_revive_session(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one(
+                "r1",
+                FakeTransport(error=RuntimeError("boom")),
+            )
+        state = json.loads(session.state_path.read_text(encoding="utf-8"))
+        summary = json.loads(session.summary_path.read_text(encoding="utf-8"))
+        state["blocked_reason"] = None
+        summary["blocked_reason"] = None
+        session.state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        session.summary_path.write_text(json.dumps(summary, sort_keys=True), encoding="utf-8")
+        transport = FakeTransport([FakeResponse(200, b"ok")])
+        with self.assertRaises(pc.SessionInvalidError):
+            session.request_one("r2", transport)
+        self.assertEqual(transport.calls, 0)
+        self.assertEqual(len(session.load_records()), 1)
+
+    def test_finalized_state_tamper_cannot_revive_session(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one("r1", FakeTransport([FakeResponse(200, b"ok")]))
+        session.finalize()
+        state = json.loads(session.state_path.read_text(encoding="utf-8"))
+        summary = json.loads(session.summary_path.read_text(encoding="utf-8"))
+        state["finalized"] = False
+        summary["finalized"] = False
+        session.state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        session.summary_path.write_text(json.dumps(summary, sort_keys=True), encoding="utf-8")
+        transport = FakeTransport([FakeResponse(200, b"ok")])
+        with self.assertRaises(pc.SessionInvalidError):
+            session.request_one("r2", transport)
+        self.assertEqual(transport.calls, 0)
+
+    def test_state_summary_terminal_mismatch_fails(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        session.execute(FakeTransport([FakeResponse(200, b"ok")]))
+        session.finalize()
+        state = json.loads(session.state_path.read_text(encoding="utf-8"))
+        state["finalized"] = False
+        session.state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_modified_retained_body_fails_verification(self):
+        body = b"retained-body"
+        plan = make_plan([make_request("r1", "https://example.com/a", retain=True)])
+        session = self.init_session(plan)
+        session.execute(FakeTransport([FakeResponse(200, body)]))
+        target = session.responses_dir / "0001.bin"
+        target.write_bytes(b"changed")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_missing_retained_body_fails_verification(self):
+        body = b"retained-body"
+        plan = make_plan([make_request("r1", "https://example.com/a", retain=True)])
+        session = self.init_session(plan)
+        session.execute(FakeTransport([FakeResponse(200, body)]))
+        (session.responses_dir / "0001.bin").unlink()
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_retained_path_escape_and_symlink_are_rejected(self):
+        session = pc.ProvenanceSession(self.session_dir)
+        session.responses_dir.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(pc.SessionInvalidError):
+            session._safe_retained_target("..\\0001.bin")
+        with self.assertRaises(pc.SessionInvalidError):
+            session._safe_retained_target("0001.bin/extra")
+        target = session.responses_dir / "0001.bin"
+        target.write_bytes(b"ok")
+        link = session.responses_dir / "0002.bin"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        with self.assertRaises(pc.SessionInvalidError):
+            session._safe_retained_target("0002.bin")
+
+    def test_unsafe_request_ids_are_rejected(self):
+        for value in (
+            "x/../outside",
+            "a\\b",
+            "a:b",
+            "a b",
+            "..",
+            ".",
+            "CON",
+            "a..",
+            "UPPER",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(pc.PlanValidationError):
+                    pc._validate_request_id(value)
+
+    def test_canonically_duplicate_urls_are_rejected(self):
+        with self.assertRaises(pc.PlanValidationError):
+            make_plan(
+                [
+                    make_request("r1", "https://example.com/a"),
+                    make_request("r2", "https://EXAMPLE.COM:443/a"),
+                ]
+            )
+
+    def test_query_and_encoded_checkpoint_urls_are_rejected(self):
+        cases = [
+            ("https://example.com/download?file=model.ckpt", True),
+            ("https://example.com/model%2Eckpt", False),
+            ("https://example.com/model%252Eckpt", False),
+            ("https://example.com/MODEL.CKPT", False),
+            ("https://example.com/download?file=model%252Eckpt", True),
+        ]
+        for index, (url, allow_query) in enumerate(cases):
+            with self.subTest(url=url):
+                with self.assertRaises(pc.PlanValidationError):
+                    make_plan(
+                        [
+                            make_request(
+                                f"r{index}",
+                                url,
+                                allow_query=allow_query,
+                            )
+                        ]
+                    )
+
+    def test_valid_redirect_target_binds_source_hash(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/start", redirect_target_id="r2", expected_statuses=[307]),
+                make_request("r2", "https://example.com/end", redirect_from_id="r1", expected_statuses=[200]),
+            ]
+        )
+        session = self.init_session(plan)
+        records = session.execute(
+            FakeTransport(
+                [
+                    FakeResponse(307, b"r", {"location": ["https://example.com/end"]}),
+                    FakeResponse(200, b"ok"),
+                ]
+            )
+        )
+        self.assertTrue(records[0]["redirect_authorized"])
+        self.assertFalse(records[0]["redirect_followed"])
+        self.assertTrue(records[1]["redirect_followed"])
+        self.assertEqual(records[1]["redirect_source_entry_id"], "r1")
+        self.assertEqual(records[1]["redirect_source_record_hash"], records[0]["current_hash"])
 
 
 if __name__ == "__main__":

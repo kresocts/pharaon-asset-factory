@@ -58,10 +58,11 @@ python tools/provenance_capture.py finalize --session-dir DIR
 ```
 
 The logger is append-only, hash-chained, and plan-bound. It resolves relative
-redirects safely and follows a redirect only when the session plan explicitly names
-the exact approved target. T-0027 performs no live research and authorizes no future
-network use; a later ticket must obtain fresh operator authorization before using it
-against public endpoints.
+redirects safely, records authorization separately from the later actual target
+follow, verifies retained bodies by safe containment/size/hash, and binds
+finalization to a terminal hash-chained record. T-0027 performs no live research and
+authorizes no future network use; a later ticket must obtain fresh operator
+authorization before using it against public endpoints.
 
 Shape generation, texture generation, post-processing, packaging, and API/server work
 remain future tickets, and Phase 2 is not complete.

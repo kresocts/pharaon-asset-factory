@@ -25,13 +25,17 @@ Use a standard-library-only Python logger with these invariants:
 - Requests are budgeted, credentials/cookies/range requests are forbidden, and only
   the explicit official-host HTTPS allowlist is accepted.
 - The session plan is parsed with a finite UTF-8 byte limit, duplicate-key and
-  non-finite-number rejection, bounded nesting, unique IDs, unique URLs, and exact
-  order semantics.
+  non-finite-number rejection, bounded nesting, strict portable request IDs,
+  canonically unique URLs, and exact order semantics. Checkpoint/weight markers are
+  screened in raw and safely decoded path/query content.
 - A canonical plan SHA-256 is stored in session state and bound to every record and
   summary. Changing the plan after initialization is fatal.
 - Redirect entries use explicit bidirectional linkage: the source names one
   `redirect_target_id`, and the target names the same source in `redirect_from_id`.
-  The target must be the immediate next planned entry.
+  The target must be the immediate next planned entry. A source record records
+  `redirect_authorized` only after exact target validation; it does not claim
+  `redirect_followed` until the adjacent target record exists and binds back to the
+  source record hash.
 - Relative and scheme-relative `Location` values are resolved with
   `urllib.parse.urljoin`, validated after resolution, and compared to the approved
   target under a narrow URL contract: scheme and host case-insensitive, absent port
@@ -40,7 +44,11 @@ Use a standard-library-only Python logger with these invariants:
 - Records form an append-only JSONL hash chain starting from the all-zero hash.
   `current_hash` is computed over canonical JSON excluding itself. Verification runs
   before every append and rejects inserted, removed, reordered, duplicated, modified,
-  or truncated records.
+  or truncated records. Finalization appends a terminal `SESSION_FINALIZED` record;
+  blocked and finalized state are derived from the chain, not trusted mutable flags.
+- Retained response bodies use sequence-only filenames, are written only after safe
+  resolved-path containment checks, and are verified for regular-file status, size,
+  SHA-256, and absence of symlink/escape/orphan anomalies.
 - The CLI exposes `validate-plan`, `init`, `request`, `verify`, and `finalize`.
   `request` executes exactly one planned hop, so a valid redirect response is logged
   before the target request is separately issued.

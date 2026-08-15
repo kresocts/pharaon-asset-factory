@@ -80,6 +80,10 @@ FORBIDDEN_BODY_PATH_FRAGMENTS = (
 )
 
 FOLLOW_REDIRECT_STATUSES = frozenset({300, 301, 302, 303, 307, 308})
+REQUEST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+SAFE_RETAINED_FILENAME_RE = re.compile(r"^[0-9]{4}\.bin$")
+HTTP_RECORD_TYPE = "HTTP"
+TERMINAL_RECORD_TYPE = "SESSION_FINALIZED"
 
 
 class ProvenanceError(Exception):
@@ -243,11 +247,16 @@ def _validate_exact_plan_prefix(
     plan: "SessionPlan",
     records: Sequence[Mapping[str, Any]],
 ) -> None:
-    if len(records) > len(plan.requests):
+    terminal = bool(
+        records
+        and records[-1].get("record_type") == TERMINAL_RECORD_TYPE
+    )
+    http_records = list(records[:-1]) if terminal else list(records)
+    if len(http_records) > len(plan.requests):
         raise SessionInvalidError(
-            "session log contains more records than the plan allows"
+            "session log contains more HTTP records than the plan allows"
         )
-    for index, record in enumerate(records):
+    for index, record in enumerate(http_records):
         expected_id = plan.requests[index].id
         if record.get("plan_entry_id") != expected_id:
             raise SessionInvalidError(
@@ -255,6 +264,10 @@ def _validate_exact_plan_prefix(
                 f"record {index + 1} has plan_entry_id "
                 f"{record.get('plan_entry_id')!r}; expected {expected_id!r}"
             )
+    if terminal and records[-1].get("record_type") != TERMINAL_RECORD_TYPE:
+        raise SessionInvalidError(
+            "extra record after the plan is not a terminal finalization record"
+        )
 
 
 def _normalise_host(url: str) -> str:
@@ -277,6 +290,51 @@ def _parse_boolean_field(
             f"requests[{index}].{name} must be a boolean"
         )
     return value
+
+
+def _validate_request_id(request_id: str) -> None:
+    if not REQUEST_ID_RE.fullmatch(request_id):
+        raise PlanValidationError(
+            f"request id must match {REQUEST_ID_RE.pattern!r}: {request_id!r}"
+        )
+    lowered = request_id.lower()
+    if lowered in {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }:
+        raise PlanValidationError(f"request id is Windows-unsafe: {request_id!r}")
+    if request_id.endswith((".", " ")):
+        raise PlanValidationError(f"request id has an unsafe suffix: {request_id!r}")
+
+
+def canonical_url_identity(url: str) -> tuple[str, str, int, str, str]:
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname
+    if not host:
+        raise PlanValidationError(f"URL is missing a host: {url!r}")
+    return (
+        parts.scheme.lower(),
+        host.lower(),
+        parts.port or 443,
+        parts.path,
+        parts.query,
+    )
+
+
+def _contains_forbidden_body_marker(value: str) -> bool:
+    lowered = value.lower()
+    if any(token in lowered for token in FORBIDDEN_BODY_PATH_FRAGMENTS):
+        return True
+    decoded = lowered
+    for _ in range(2):
+        decoded = urllib.parse.unquote(decoded)
+        if any(token in decoded for token in FORBIDDEN_BODY_PATH_FRAGMENTS):
+            return True
+    return False
 
 
 def _validate_public_url(
@@ -307,9 +365,10 @@ def _validate_public_url(
     host = parsed.hostname.lower()
     if host not in allowed_hosts:
         raise RequestPolicyError(f"host is not authorized: {host!r}")
-    lowered_path = parsed.path.lower()
-    if any(token in lowered_path for token in FORBIDDEN_BODY_PATH_FRAGMENTS):
+    if _contains_forbidden_body_marker(parsed.path):
         raise RequestPolicyError("checkpoint/weight body paths are not authorized")
+    if _contains_forbidden_body_marker(parsed.query):
+        raise RequestPolicyError("checkpoint/weight body query values are not authorized")
     return parsed
 
 
@@ -481,6 +540,7 @@ class SessionPlan:
                 )
             if request_id in ids:
                 raise PlanValidationError(f"duplicate request id: {request_id}")
+            _validate_request_id(request_id)
             ids.add(request_id)
             method = str(raw.get("method", "GET")).upper()
             if method != "GET":
@@ -488,9 +548,6 @@ class SessionPlan:
             url = raw.get("url")
             if not isinstance(url, str) or not url:
                 raise PlanValidationError(f"requests[{index}].url must be a non-empty string")
-            if url in urls:
-                raise PlanValidationError(f"duplicate request URL: {url}")
-            urls.add(url)
             allow_query = _parse_boolean_field(
                 raw,
                 index=index,
@@ -514,6 +571,15 @@ class SessionPlan:
                 )
             except RequestPolicyError as error:
                 raise PlanValidationError(str(error)) from error
+            try:
+                url_identity = canonical_url_identity(url)
+            except (ValueError, PlanValidationError) as error:
+                raise PlanValidationError(str(error)) from error
+            if url_identity in urls:
+                raise PlanValidationError(
+                    f"canonically duplicate request URL: {url}"
+                )
+            urls.add(url_identity)
             purpose = raw.get("purpose")
             if not isinstance(purpose, str) or not purpose:
                 raise PlanValidationError(
@@ -548,6 +614,10 @@ class SessionPlan:
             if redirect_from_id is not None and not isinstance(redirect_from_id, str):
                 raise PlanValidationError(
                     f"requests[{index}].redirect_from_id must be a string when present"
+                )
+            if redirect_target_id is not None and redirect_from_id is not None:
+                raise PlanValidationError(
+                    f"requests[{index}] cannot be both a redirect source and target"
                 )
             if redirect_target_id is not None:
                 if not statuses or any(
@@ -748,6 +818,7 @@ class ProvenanceSession:
                 [],
                 plan,
                 session_id=session_id,
+                blocked_reason=None,
                 finalized=False,
             ),
             "session summary",
@@ -766,6 +837,35 @@ class ProvenanceSession:
         except OSError as error:
             raise SessionInvalidError(f"cannot write {subject} {path}: {error}") from error
 
+    def _http_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(record)
+            for record in records
+            if record.get("record_type") != TERMINAL_RECORD_TYPE
+        ]
+
+    def _blocked_reason_from_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+    ) -> str | None:
+        for record in reversed(records):
+            if record.get("record_type") == TERMINAL_RECORD_TYPE:
+                continue
+            return self._is_blocking_classification(record)
+        return None
+
+    def _terminal_from_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        return bool(
+            records
+            and records[-1].get("record_type") == TERMINAL_RECORD_TYPE
+        )
+
     def _new_state(
         self,
         plan: SessionPlan,
@@ -776,19 +876,23 @@ class ProvenanceSession:
         created_utc: str,
         finalized: bool,
     ) -> dict[str, Any]:
-        aggregate = sum(int(record.get("response_body_bytes", 0)) for record in records)
+        http_records = self._http_records(records)
+        aggregate = sum(
+            int(record.get("response_body_bytes", 0))
+            for record in http_records
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "session_id": session_id,
             "plan_sha256": plan.plan_hash,
-            "request_count": len(records),
+            "request_count": len(http_records),
             "aggregate_bytes": aggregate,
-            "remaining_requests": plan.max_requests - len(records),
+            "remaining_requests": plan.max_requests - len(http_records),
             "remaining_bytes": plan.max_bytes - aggregate,
             "completed_entries": sorted(
                 {
                     record["plan_entry_id"]
-                    for record in records
+                    for record in http_records
                     if "plan_entry_id" in record
                 }
             ),
@@ -803,17 +907,23 @@ class ProvenanceSession:
         plan: SessionPlan,
         *,
         session_id: str,
+        blocked_reason: str | None,
         finalized: bool,
     ) -> dict[str, Any]:
-        aggregate = sum(int(record.get("response_body_bytes", 0)) for record in records)
+        http_records = self._http_records(records)
+        aggregate = sum(
+            int(record.get("response_body_bytes", 0))
+            for record in http_records
+        )
         final_hash = records[-1]["current_hash"] if records else None
         return {
             "schema_version": SCHEMA_VERSION,
             "session_id": session_id,
             "plan_sha256": plan.plan_hash,
-            "request_count": len(records),
+            "request_count": len(http_records),
             "aggregate_bytes": aggregate,
             "final_hash": final_hash,
+            "blocked_reason": blocked_reason,
             "finalized": finalized,
         }
 
@@ -822,7 +932,11 @@ class ProvenanceSession:
         lines = text.splitlines()
         return _parse_log_lines(lines)
 
-    def verify_session(self) -> list[dict[str, Any]]:
+    def verify_session(
+        self,
+        *,
+        allow_pending_retained: bool = False,
+    ) -> list[dict[str, Any]]:
         try:
             plan = self._plan_from_disk()
         except PlanValidationError as error:
@@ -843,25 +957,47 @@ class ProvenanceSession:
         if state.get("session_id") != summary.get("session_id"):
             raise SessionInvalidError("session state and summary session IDs do not match")
         _validate_exact_plan_prefix(plan, records)
-        aggregate = sum(int(record.get("response_body_bytes", 0)) for record in records)
-        if state.get("request_count") != len(records):
+        http_records = self._http_records(records)
+        aggregate = sum(
+            int(record.get("response_body_bytes", 0))
+            for record in http_records
+        )
+        terminal = self._terminal_from_records(records)
+        blocked_reason = self._blocked_reason_from_records(records)
+        if state.get("request_count") != len(http_records):
             raise SessionInvalidError("session state request count does not match the log")
         if state.get("aggregate_bytes") != aggregate:
             raise SessionInvalidError("session state aggregate bytes do not match the log")
-        if summary.get("request_count") != len(records):
+        if summary.get("request_count") != len(http_records):
             raise SessionInvalidError("session summary request count does not match the log")
         if summary.get("aggregate_bytes") != aggregate:
             raise SessionInvalidError("session summary aggregate bytes do not match the log")
+        if state.get("blocked_reason") != blocked_reason:
+            raise SessionInvalidError(
+                "session state blocked_reason does not match the authoritative log"
+            )
+        if summary.get("blocked_reason") != blocked_reason:
+            raise SessionInvalidError(
+                "session summary blocked_reason does not match the authoritative log"
+            )
+        if state.get("finalized") != terminal:
+            raise SessionInvalidError(
+                "session state finalized flag does not match the authoritative log"
+            )
+        if summary.get("finalized") != terminal:
+            raise SessionInvalidError(
+                "session summary finalized flag does not match the authoritative log"
+            )
         expected_completed = sorted(
             {
                 record["plan_entry_id"]
-                for record in records
+                for record in http_records
                 if "plan_entry_id" in record
             }
         )
         if state.get("completed_entries") != expected_completed:
             raise SessionInvalidError("session state completed entries do not match the log")
-        expected_remaining_requests = plan.max_requests - len(records)
+        expected_remaining_requests = plan.max_requests - len(http_records)
         expected_remaining_bytes = plan.max_bytes - aggregate
         if state.get("remaining_requests") != expected_remaining_requests:
             raise SessionInvalidError("session state remaining requests are invalid")
@@ -875,11 +1011,18 @@ class ProvenanceSession:
                 raise SessionInvalidError("record session ID does not match session state")
             if record.get("plan_sha256") != plan.plan_hash:
                 raise SessionInvalidError("record plan hash does not match the plan")
+            if record.get("record_type") == TERMINAL_RECORD_TYPE:
+                continue
             entry_id = record.get("plan_entry_id")
             if entry_id not in {request.id for request in plan.requests}:
                 raise SessionInvalidError(
                     f"record references unknown plan entry id: {entry_id!r}"
                 )
+        self._validate_redirect_follow_chain(plan, records)
+        self._verify_retained_bodies(
+            records,
+            allow_pending_retained=allow_pending_retained,
+        )
         return records
 
     def _is_blocking_classification(self, record: Mapping[str, Any]) -> str | None:
@@ -888,14 +1031,135 @@ class ProvenanceSession:
             return classification
         return None
 
+    def _validate_redirect_follow_chain(
+        self,
+        plan: SessionPlan,
+        records: Sequence[Mapping[str, Any]],
+    ) -> None:
+        http_records = self._http_records(records)
+        for index, record in enumerate(http_records):
+            request = plan.requests[index]
+            if request.redirect_from_id is not None:
+                if index == 0:
+                    raise SessionInvalidError(
+                        f"redirect target {request.id!r} has no preceding source record"
+                    )
+                source = plan.requests[index - 1]
+                source_record = http_records[index - 1]
+                status = source_record.get("status")
+                source_authorized = (
+                    source_record.get("plan_entry_id") == source.id
+                    and isinstance(status, int)
+                    and 300 <= status < 400
+                    and status != 304
+                    and source_record.get("redirect_authorized") is True
+                    and source_record.get("redirect_exact_match") is True
+                    and source_record.get("redirect_followed") is False
+                    and source_record.get("redirect_target_id") == request.id
+                    and self._is_blocking_classification(source_record) is None
+                )
+                target_authorized = (
+                    record.get("redirect_followed") is True
+                    and record.get("redirect_source_entry_id") == source.id
+                    and record.get("redirect_source_record_hash")
+                    == source_record.get("current_hash")
+                )
+                if not source_authorized or not target_authorized:
+                    raise SessionInvalidError(
+                        f"adjacent redirect records do not prove an authorized follow "
+                        f"for target {request.id!r}"
+                    )
+            elif request.redirect_target_id is not None:
+                if record.get("redirect_followed") is not False:
+                    raise SessionInvalidError(
+                        f"redirect source {request.id!r} must not claim "
+                        f"redirect_followed before its target executes"
+                    )
+
+    def _safe_retained_target(self, filename: str) -> Path:
+        if not SAFE_RETAINED_FILENAME_RE.fullmatch(filename):
+            raise SessionInvalidError(f"unsafe retained filename: {filename!r}")
+        root = self.responses_dir.resolve()
+        candidate = self.responses_dir / filename
+        if candidate.is_symlink() or self.responses_dir.is_symlink():
+            raise SessionInvalidError(f"retained path contains a symlink: {candidate}")
+        resolved = candidate.resolve()
+        if resolved.parent != root:
+            raise SessionInvalidError(
+                f"retained path escapes responses directory: {filename!r}"
+            )
+        return resolved
+
+    def _verify_retained_bodies(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        allow_pending_retained: bool = False,
+    ) -> None:
+        http_records = self._http_records(records)
+        referenced: dict[str, Mapping[str, Any]] = {}
+        for record in http_records:
+            filename = record.get("retained_filename")
+            if filename is None:
+                continue
+            if not isinstance(filename, str):
+                raise SessionInvalidError("retained_filename must be a string")
+            if filename in referenced:
+                raise SessionInvalidError(
+                    f"duplicate retained filename: {filename!r}"
+                )
+            referenced[filename] = record
+
+        if not self.responses_dir.exists():
+            raise SessionInvalidError("responses directory is missing")
+        if self.responses_dir.is_symlink():
+            raise SessionInvalidError("responses directory must not be a symlink")
+        allowed_pending = set()
+        if allow_pending_retained:
+            allowed_pending.add(f"{len(http_records) + 1:04d}.bin")
+        unexpected = [
+            entry.name
+            for entry in self.responses_dir.iterdir()
+            if entry.name not in referenced
+            and entry.name not in allowed_pending
+        ]
+        if unexpected:
+            raise SessionInvalidError(
+                f"unexpected retained files: {', '.join(sorted(unexpected))}"
+            )
+
+        for filename, record in referenced.items():
+            target = self._safe_retained_target(filename)
+            if not target.is_file():
+                raise SessionInvalidError(
+                    f"retained body is not a regular file: {filename!r}"
+                )
+            try:
+                size = target.stat().st_size
+                body = target.read_bytes()
+            except OSError as error:
+                raise SessionInvalidError(
+                    f"cannot read retained body {target}: {error}"
+                ) from error
+            if size != record.get("response_body_bytes"):
+                raise SessionInvalidError(
+                    f"retained body size mismatch for {filename!r}"
+                )
+            if sha256_bytes(body) != record.get("response_body_sha256"):
+                raise SessionInvalidError(
+                    f"retained body hash mismatch for {filename!r}"
+                )
+
     def _ensure_writable(self) -> None:
-        state = self._read_state()
-        if state.get("finalized"):
-            raise SessionFinalizedError("session is finalized; refusing additional requests")
-        if state.get("blocked_reason"):
+        records = self.verify_session()
+        if self._terminal_from_records(records):
             raise SessionFinalizedError(
-                f"session is blocked; refusing additional requests: "
-                f"{state.get('blocked_reason')}"
+                "session is finalized; refusing additional requests"
+            )
+        blocked_reason = self._blocked_reason_from_records(records)
+        if blocked_reason:
+            raise SessionFinalizedError(
+                f"session is blocked; refusing additional requests: {blocked_reason}"
             )
 
     def _append_record(
@@ -903,9 +1167,8 @@ class ProvenanceSession:
         record: Mapping[str, Any],
         *,
         plan: SessionPlan,
-        blocked_reason: str | None = None,
     ) -> dict[str, Any]:
-        records = self.verify_session()
+        records = self.verify_session(allow_pending_retained=True)
         state = self._read_state()
         session_id = state.get("session_id")
         if not isinstance(session_id, str) or not session_id:
@@ -913,6 +1176,7 @@ class ProvenanceSession:
         sequence = len(records) + 1
         previous_hash = records[-1]["current_hash"] if records else ZERO_HASH
         full_record = dict(record)
+        full_record.setdefault("record_type", HTTP_RECORD_TYPE)
         full_record.update(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -925,6 +1189,8 @@ class ProvenanceSession:
         full_record["current_hash"] = record_hash(full_record)
         self._append_jsonl_line(full_record)
         records.append(full_record)
+        blocked_reason = self._blocked_reason_from_records(records)
+        finalized = full_record.get("record_type") == TERMINAL_RECORD_TYPE
         self._write_json_atomic(
             self.state_path,
             self._new_state(
@@ -933,7 +1199,7 @@ class ProvenanceSession:
                 blocked_reason=blocked_reason,
                 session_id=session_id,
                 created_utc=state.get("created_utc", utc_now()),
-                finalized=False,
+                finalized=finalized,
             ),
             "session state",
         )
@@ -943,7 +1209,8 @@ class ProvenanceSession:
                 records,
                 plan,
                 session_id=session_id,
-                finalized=False,
+                blocked_reason=blocked_reason,
+                finalized=finalized,
             ),
             "session summary",
         )
@@ -970,22 +1237,16 @@ class ProvenanceSession:
     def finalize(self) -> dict[str, Any]:
         plan = self._plan_from_disk()
         records = self.verify_session()
-        state = self._read_state()
-        if state.get("finalized"):
+        if self._terminal_from_records(records):
             raise SessionFinalizedError("session is already finalized")
-        summary = self._read_summary()
-        session_id = state.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise SessionInvalidError("session state is missing a valid session_id")
-        blocked_reason = None
-        if records and self._is_blocking_classification(records[-1]):
-            blocked_reason = records[-1]["transport_classification"]
-        state["blocked_reason"] = blocked_reason
-        state["finalized"] = True
-        self._write_json_atomic(self.state_path, state, "session state")
-        summary["finalized"] = True
-        self._write_json_atomic(self.summary_path, summary, "session summary")
-        return summary
+        self._append_record(
+            {
+                "record_type": TERMINAL_RECORD_TYPE,
+                "timestamp": utc_now(),
+            },
+            plan=plan,
+        )
+        return self._read_summary()
 
     def _headers_dict(self, response: Any) -> dict[str, list[str]]:
         values: dict[str, list[str]] = {}
@@ -1054,8 +1315,12 @@ class ProvenanceSession:
             raise BudgetBlockedError(
                 "retained body exceeds the maximum supported response body size"
             )
-        filename = f"{sequence:02d}-{request.id}.bin"
-        target = self.responses_dir / filename
+        filename = f"{sequence:04d}.bin"
+        target = self._safe_retained_target(filename)
+        if target.exists():
+            raise SessionInvalidError(
+                f"refusing to overwrite retained body {target}"
+            )
         try:
             target.write_bytes(body)
         except OSError as error:
@@ -1101,8 +1366,9 @@ class ProvenanceSession:
             and isinstance(status, int)
             and 300 <= status < 400
             and status != 304
-            and record.get("redirect_followed") is True
+            and record.get("redirect_authorized") is True
             and record.get("redirect_exact_match") is True
+            and record.get("redirect_followed") is False
             and record.get("redirect_target_id") == target.id
             and self._is_blocking_classification(record) is None
         )
@@ -1183,7 +1449,6 @@ class ProvenanceSession:
             self._append_record(
                 record,
                 plan=plan,
-                blocked_reason=blocked_reason,
             )
             records = self.verify_session()
             if blocked_reason is not None:
@@ -1225,7 +1490,6 @@ class ProvenanceSession:
         self._append_record(
             record,
             plan=plan,
-            blocked_reason=blocked_reason,
         )
         if blocked_reason is not None:
             raise BudgetBlockedError(f"session blocked: {blocked_reason}")
@@ -1290,6 +1554,7 @@ class ProvenanceSession:
         detail: str,
     ) -> dict[str, Any]:
         return {
+            "record_type": HTTP_RECORD_TYPE,
             "schema_version": SCHEMA_VERSION,
             "sequence": sequence,
             "timestamp": utc_now(),
@@ -1306,7 +1571,10 @@ class ProvenanceSession:
             "redirect_resolved_url": None,
             "redirect_target_id": None,
             "redirect_exact_match": None,
+            "redirect_authorized": False,
             "redirect_followed": False,
+            "redirect_source_entry_id": None,
+            "redirect_source_record_hash": None,
             "redirect_refusal_reason": None,
             "final_host": host,
             "retained_filename": None,
@@ -1372,13 +1640,24 @@ class ProvenanceSession:
         redirect_target_id: str | None = None
         redirect_resolved_url: str | None = None
         redirect_exact_match: bool | None = None
+        redirect_authorized = False
         redirect_followed = False
+        redirect_source_entry_id: str | None = None
+        redirect_source_record_hash: str | None = None
         redirect_refusal_reason: str | None = None
 
         if request.expected_statuses and status not in request.expected_statuses:
             classification = "UNEXPECTED_STATUS"
             blocked = True
             refusal_reason = "status_not_in_expected_statuses"
+        elif request.redirect_from_id is not None:
+            source_record = records[-1]
+            redirect_target_id = request.id
+            redirect_authorized = True
+            redirect_exact_match = True
+            redirect_followed = True
+            redirect_source_entry_id = request.redirect_from_id
+            redirect_source_record_hash = source_record["current_hash"]
         elif 300 <= status < 400 and status != 304:
             redirect_target_id = request.redirect_target_id
             if len(location_values) != 1:
@@ -1435,13 +1714,14 @@ class ProvenanceSession:
                             blocked = True
                             redirect_refusal_reason = "redirect_target_already_consumed"
                         elif exact_match:
-                            redirect_followed = True
+                            redirect_authorized = True
                         else:
                             classification = "UNEXPECTED_REDIRECT"
                             blocked = True
                             redirect_refusal_reason = "redirect_target_mismatch"
 
         record = {
+            "record_type": HTTP_RECORD_TYPE,
             "schema_version": SCHEMA_VERSION,
             "sequence": sequence,
             "timestamp": utc_now(),
@@ -1458,7 +1738,10 @@ class ProvenanceSession:
             "redirect_resolved_url": redirect_resolved_url,
             "redirect_target_id": redirect_target_id,
             "redirect_exact_match": redirect_exact_match,
+            "redirect_authorized": redirect_authorized,
             "redirect_followed": redirect_followed,
+            "redirect_source_entry_id": redirect_source_entry_id,
+            "redirect_source_record_hash": redirect_source_record_hash,
             "redirect_refusal_reason": redirect_refusal_reason,
             "final_host": final_host,
             "retained_filename": retained,
@@ -1487,6 +1770,7 @@ class ProvenanceSession:
         reason: str,
     ) -> dict[str, Any]:
         return {
+            "record_type": HTTP_RECORD_TYPE,
             "schema_version": SCHEMA_VERSION,
             "sequence": sequence,
             "timestamp": utc_now(),
@@ -1503,7 +1787,10 @@ class ProvenanceSession:
             "redirect_resolved_url": None,
             "redirect_target_id": request.redirect_target_id,
             "redirect_exact_match": None,
+            "redirect_authorized": False,
             "redirect_followed": False,
+            "redirect_source_entry_id": None,
+            "redirect_source_record_hash": None,
             "redirect_refusal_reason": None,
             "final_host": final_host,
             "retained_filename": None,
