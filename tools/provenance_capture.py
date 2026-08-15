@@ -79,6 +79,8 @@ FORBIDDEN_BODY_PATH_FRAGMENTS = (
     ".msgpack",
 )
 
+FOLLOW_REDIRECT_STATUSES = frozenset({300, 301, 302, 303, 307, 308})
+
 
 class ProvenanceError(Exception):
     """Base class for expected provenance-capture failures."""
@@ -237,12 +239,44 @@ def _parse_log_lines(lines: Sequence[str]) -> list[dict[str, Any]]:
     return records
 
 
+def _validate_exact_plan_prefix(
+    plan: "SessionPlan",
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    if len(records) > len(plan.requests):
+        raise SessionInvalidError(
+            "session log contains more records than the plan allows"
+        )
+    for index, record in enumerate(records):
+        expected_id = plan.requests[index].id
+        if record.get("plan_entry_id") != expected_id:
+            raise SessionInvalidError(
+                f"session log is not an exact contiguous plan prefix: "
+                f"record {index + 1} has plan_entry_id "
+                f"{record.get('plan_entry_id')!r}; expected {expected_id!r}"
+            )
+
+
 def _normalise_host(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     host = parsed.hostname
     if not host:
         raise PlanValidationError(f"URL is missing a host: {url!r}")
     return host.lower()
+
+
+def _parse_boolean_field(
+    raw: Mapping[str, Any],
+    *,
+    index: int,
+    name: str,
+) -> bool:
+    value = raw.get(name, False)
+    if type(value) is not bool:
+        raise PlanValidationError(
+            f"requests[{index}].{name} must be a boolean"
+        )
+    return value
 
 
 def _validate_public_url(
@@ -457,7 +491,21 @@ class SessionPlan:
             if url in urls:
                 raise PlanValidationError(f"duplicate request URL: {url}")
             urls.add(url)
-            allow_query = bool(raw.get("allow_query", False))
+            allow_query = _parse_boolean_field(
+                raw,
+                index=index,
+                name="allow_query",
+            )
+            retain = _parse_boolean_field(
+                raw,
+                index=index,
+                name="retain",
+            )
+            range_request = _parse_boolean_field(
+                raw,
+                index=index,
+                name="range_request",
+            )
             try:
                 _validate_public_url(
                     url,
@@ -501,6 +549,15 @@ class SessionPlan:
                 raise PlanValidationError(
                     f"requests[{index}].redirect_from_id must be a string when present"
                 )
+            if redirect_target_id is not None:
+                if not statuses or any(
+                    status not in FOLLOW_REDIRECT_STATUSES
+                    for status in statuses
+                ):
+                    raise PlanValidationError(
+                        f"requests[{index}].expected_statuses must contain only "
+                        f"supported followable redirect statuses"
+                    )
             requests.append(
                 PlanRequest(
                     id=request_id,
@@ -508,8 +565,8 @@ class SessionPlan:
                     url=url,
                     purpose=purpose,
                     allow_query=allow_query,
-                    retain=bool(raw.get("retain", False)),
-                    range_request=bool(raw.get("range_request", False)),
+                    retain=retain,
+                    range_request=range_request,
                     expected_statuses=tuple(sorted(statuses)),
                     redirect_target_id=redirect_target_id,
                     redirect_from_id=redirect_from_id,
@@ -785,6 +842,7 @@ class ProvenanceSession:
             raise SessionInvalidError("session summary plan hash does not match the plan")
         if state.get("session_id") != summary.get("session_id"):
             raise SessionInvalidError("session state and summary session IDs do not match")
+        _validate_exact_plan_prefix(plan, records)
         aggregate = sum(int(record.get("response_body_bytes", 0)) for record in records)
         if state.get("request_count") != len(records):
             raise SessionInvalidError("session state request count does not match the log")
@@ -1031,6 +1089,61 @@ class ProvenanceSession:
             remaining -= len(chunk)
         return b"".join(chunks), eof
 
+    def _record_authorizes_redirect_target(
+        self,
+        record: Mapping[str, Any],
+        source: PlanRequest,
+        target: PlanRequest,
+    ) -> bool:
+        status = record.get("status")
+        return (
+            record.get("plan_entry_id") == source.id
+            and isinstance(status, int)
+            and 300 <= status < 400
+            and status != 304
+            and record.get("redirect_followed") is True
+            and record.get("redirect_exact_match") is True
+            and record.get("redirect_target_id") == target.id
+            and self._is_blocking_classification(record) is None
+        )
+
+    def _authorize_next_entry(
+        self,
+        plan: SessionPlan,
+        records: Sequence[Mapping[str, Any]],
+        requested_id: str | None = None,
+    ) -> PlanRequest:
+        next_index = len(records)
+        if next_index >= len(plan.requests):
+            raise RequestPolicyError("no pending plan entries remain")
+        next_request = plan.requests[next_index]
+        if requested_id is not None and requested_id != next_request.id:
+            raise RequestPolicyError(
+                f"out-of-order request {requested_id!r}; "
+                f"expected next entry {next_request.id!r}"
+            )
+        if next_request.redirect_from_id is not None:
+            if next_index == 0:
+                raise RequestPolicyError(
+                    f"redirect target {next_request.id!r} has no preceding source record"
+                )
+            source = plan.requests[next_index - 1]
+            if source.id != next_request.redirect_from_id:
+                raise RequestPolicyError(
+                    f"redirect target {next_request.id!r} is not linked to "
+                    f"the immediate planned predecessor"
+                )
+            if not self._record_authorizes_redirect_target(
+                records[-1],
+                source,
+                next_request,
+            ):
+                raise RequestPolicyError(
+                    f"redirect target {next_request.id!r} is not authorized by "
+                    f"the immediately preceding source record"
+                )
+        return next_request
+
     def execute(
         self,
         transport: Callable[[str, str, dict[str, str]], Any] | None = None,
@@ -1039,28 +1152,18 @@ class ProvenanceSession:
         transport = transport or _HTTPTransport()
         records = self.verify_session()
         self._ensure_writable()
-        completed_entries = {
-            record["plan_entry_id"]
-            for record in records
-            if "plan_entry_id" in record
-        }
-        start_index = 0
-        while start_index < len(plan.requests) and plan.requests[start_index].id in completed_entries:
-            start_index += 1
-        if start_index >= len(plan.requests):
-            if len(records) >= plan.max_requests:
-                raise BudgetBlockedError("request budget is exhausted")
-            return records
-
-        for request in plan.requests[start_index:]:
+        while True:
             records = self.verify_session()
             self._ensure_writable()
+            if len(records) >= len(plan.requests):
+                return records
+            if len(records) >= plan.max_requests:
+                raise BudgetBlockedError("request budget is exhausted")
+            request = self._authorize_next_entry(plan, records)
             aggregate = sum(
                 int(record.get("response_body_bytes", 0))
                 for record in records
             )
-            if len(records) >= plan.max_requests:
-                raise BudgetBlockedError("request budget is exhausted")
             if aggregate >= plan.max_bytes:
                 raise BudgetBlockedError("response-byte budget is exhausted")
             remaining_bytes = plan.max_bytes - aggregate
@@ -1096,29 +1199,7 @@ class ProvenanceSession:
         transport = transport or _HTTPTransport()
         records = self.verify_session()
         self._ensure_writable()
-        request = plan.get(entry_id)
-        completed_entries = {
-            record["plan_entry_id"]
-            for record in records
-            if "plan_entry_id" in record
-        }
-        if request.id in completed_entries:
-            raise RequestPolicyError(f"request {request.id!r} has already been completed")
-        if request.redirect_from_id is not None:
-            source = plan.get(request.redirect_from_id)
-            authorized_source = any(
-                record.get("plan_entry_id") == source.id
-                and record.get("redirect_followed") is True
-                and record.get("redirect_target_id") == request.id
-                and record.get("redirect_exact_match") is True
-                and isinstance(record.get("status"), int)
-                and 300 <= record["status"] < 400
-                for record in records
-            )
-            if not authorized_source:
-                raise RequestPolicyError(
-                    f"redirect target {request.id!r} has no authorized prior source record"
-                )
+        request = self._authorize_next_entry(plan, records, entry_id)
         aggregate = sum(
             int(record.get("response_body_bytes", 0))
             for record in records

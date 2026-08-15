@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import socket
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from tools import provenance_capture as pc
@@ -227,9 +229,11 @@ class ProvenanceCaptureTests(unittest.TestCase):
         plan = make_plan(requests, max_requests=10, max_bytes=1024 * 1024)
         session = self.init_session(plan)
         transport = FakeTransport([FakeResponse(200, b"x") for _ in range(10)])
-        session.execute(transport)
-        with self.assertRaises(pc.BudgetBlockedError):
-            session.execute(transport)
+        records = session.execute(transport)
+        self.assertEqual(len(records), 10)
+        self.assertEqual(len(session.execute(transport)), 10)
+        with self.assertRaises(pc.RequestPolicyError):
+            session.request_one("r10", transport)
         self.assertEqual(transport.calls, 10)
 
     def test_byte_budget_exhaustion_refused(self):
@@ -343,7 +347,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
     def test_inserted_record_detected(self):
         plan = make_plan(
             [
-                make_request("r1", "https://example.com/a", redirect_target_id="r2"),
+                make_request("r1", "https://example.com/a", redirect_target_id="r2", expected_statuses=[301]),
                 make_request("r2", "https://example.com/b", redirect_from_id="r1"),
             ]
         )
@@ -369,7 +373,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
     def test_deleted_record_detected(self):
         plan = make_plan(
             [
-                make_request("r1", "https://example.com/a", redirect_target_id="r2"),
+                make_request("r1", "https://example.com/a", redirect_target_id="r2", expected_statuses=[301]),
                 make_request("r2", "https://example.com/b", redirect_from_id="r1"),
             ]
         )
@@ -389,7 +393,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
     def test_reordered_record_detected(self):
         plan = make_plan(
             [
-                make_request("r1", "https://example.com/a", redirect_target_id="r2"),
+                make_request("r1", "https://example.com/a", redirect_target_id="r2", expected_statuses=[301]),
                 make_request("r2", "https://example.com/b", redirect_from_id="r1"),
             ]
         )
@@ -810,7 +814,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.PlanValidationError):
             make_plan(
                 [
-                    make_request("r1", "https://example.com/a", redirect_target_id="r2"),
+                    make_request("r1", "https://example.com/a", redirect_target_id="r2", expected_statuses=[301]),
                     make_request("r2", "https://example.com/b", redirect_target_id="r1", redirect_from_id="r1"),
                 ]
             )
@@ -819,7 +823,7 @@ class ProvenanceCaptureTests(unittest.TestCase):
         with self.assertRaises(pc.PlanValidationError):
             make_plan(
                 [
-                    make_request("r1", "https://example.com/a", redirect_target_id="r2"),
+                    make_request("r1", "https://example.com/a", redirect_target_id="r2", expected_statuses=[301]),
                     make_request("r2", "https://example.com/b", redirect_from_id="r1", redirect_target_id="r3"),
                     make_request("r3", "https://example.com/c", redirect_from_id="r2", redirect_target_id="r1"),
                 ]
@@ -947,6 +951,186 @@ class ProvenanceCaptureTests(unittest.TestCase):
         record = session.request_one("r2", FakeTransport([FakeResponse(200, b"ok")]))
         self.assertEqual(record["status"], 200)
         self.assertEqual(len(session.load_records()), 2)
+
+
+    def test_request_one_out_of_order_before_r1_refused(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        transport = FakeTransport([FakeResponse(200, b"ok")])
+        with self.assertRaises(pc.RequestPolicyError):
+            session.request_one("r2", transport)
+        self.assertEqual(transport.calls, 0)
+        self.assertEqual(session.load_records(), [])
+
+    def test_request_one_skips_r2_after_r1_refused(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+                make_request("r3", "https://example.com/c"),
+            ]
+        )
+        session = self.init_session(plan)
+        transport = FakeTransport(
+            [
+                FakeResponse(200, b"a"),
+                FakeResponse(200, b"b"),
+            ]
+        )
+        session.request_one("r1", transport)
+        with self.assertRaises(pc.RequestPolicyError):
+            session.request_one("r3", transport)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(len(session.load_records()), 1)
+
+    def test_execute_refuses_redirect_target_after_normal_200(self):
+        plan = make_plan(
+            [
+                make_request(
+                    "r1",
+                    "https://example.com/start",
+                    redirect_target_id="r2",
+                    expected_statuses=[307],
+                ),
+                make_request(
+                    "r2",
+                    "https://example.com/end",
+                    redirect_from_id="r1",
+                    expected_statuses=[200],
+                ),
+            ]
+        )
+        session = self.init_session(plan)
+        transport = FakeTransport([FakeResponse(200, b"source-ok")])
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.execute(transport)
+        self.assertEqual(transport.calls, 1)
+        records = session.load_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["plan_entry_id"], "r1")
+        self.assertEqual(records[0]["transport_classification"], "UNEXPECTED_STATUS")
+        self.assertFalse(records[0]["redirect_followed"])
+
+    def test_redirect_target_authorized_only_by_immediate_predecessor(self):
+        plan = make_plan(
+            [
+                make_request(
+                    "r1",
+                    "https://example.com/start",
+                    redirect_target_id="r2",
+                    expected_statuses=[307],
+                ),
+                make_request(
+                    "r2",
+                    "https://example.com/end",
+                    redirect_from_id="r1",
+                    expected_statuses=[200],
+                ),
+            ]
+        )
+        session = self.init_session(plan)
+        source_record = session.request_one(
+            "r1",
+            FakeTransport(
+                [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
+            ),
+        )
+        self.assertEqual(
+            session._authorize_next_entry(plan, [source_record], "r2").id,
+            "r2",
+        )
+        forged = dict(source_record)
+        forged["plan_entry_id"] = "wrong-source"
+        with self.assertRaises(pc.RequestPolicyError):
+            session._authorize_next_entry(plan, [forged], "r2")
+
+    def test_exact_plan_prefix_rejects_gap(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+                make_request("r3", "https://example.com/c"),
+            ]
+        )
+        with self.assertRaises(pc.SessionInvalidError):
+            pc._validate_exact_plan_prefix(
+                plan,
+                [{"plan_entry_id": "r2"}],
+            )
+        with self.assertRaises(pc.SessionInvalidError):
+            pc._validate_exact_plan_prefix(
+                plan,
+                [
+                    {"plan_entry_id": "r1"},
+                    {"plan_entry_id": "r3"},
+                ],
+            )
+
+    def test_boolean_plan_fields_reject_non_booleans(self):
+        for name in ("allow_query", "retain", "range_request"):
+            for value in ("false", "true", 0, 1, None, [], {}):
+                with self.subTest(name=name, value=value):
+                    raw = make_request("r1", "https://example.com/a")
+                    raw[name] = value
+                    payload = {
+                        "schema_version": pc.SCHEMA_VERSION,
+                        "max_requests": 1,
+                        "max_bytes": 1024,
+                        "allowed_hosts": ["example.com"],
+                        "requests": [raw],
+                    }
+                    with self.assertRaises(pc.PlanValidationError):
+                        pc.SessionPlan.from_dict(payload)
+
+    def test_missing_boolean_plan_fields_default_false(self):
+        raw = {
+            "id": "r1",
+            "method": "GET",
+            "url": "https://example.com/a",
+            "purpose": "test",
+            "expected_statuses": [],
+            "redirect_target_id": None,
+            "redirect_from_id": None,
+        }
+        payload = {
+            "schema_version": pc.SCHEMA_VERSION,
+            "max_requests": 1,
+            "max_bytes": 1024,
+            "allowed_hosts": ["example.com"],
+            "requests": [raw],
+        }
+        plan = pc.SessionPlan.from_dict(payload)
+        self.assertFalse(plan.requests[0].allow_query)
+        self.assertFalse(plan.requests[0].retain)
+        self.assertFalse(plan.requests[0].range_request)
+
+    def test_cli_out_of_order_error_is_structured(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            exit_code = pc.main(
+                [
+                    "request",
+                    "--session-dir",
+                    str(self.session_dir),
+                    "--entry-id",
+                    "r2",
+                ]
+            )
+        self.assertEqual(exit_code, pc.EXIT_POLICY_REFUSAL)
+        self.assertNotIn("Traceback", buffer.getvalue())
+        self.assertIn("out-of-order", buffer.getvalue())
 
 
 if __name__ == "__main__":
