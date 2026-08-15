@@ -22,6 +22,7 @@ committed. Raw response bodies are not intended to be committed to the repositor
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import http.client
 import json
@@ -32,6 +33,7 @@ import ssl
 import sys
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,8 @@ MAX_PLAN_BYTES = 1024 * 1024
 MAX_STATE_BYTES = 256 * 1024
 MAX_SUMMARY_BYTES = 256 * 1024
 MAX_LOG_BYTES = 8 * 1024 * 1024
+MAX_URL_CHARS = 8192
+MAX_PERCENT_DECODE_PASSES = 10
 CHUNK_SIZE = 64 * 1024
 TIMEOUT_SECONDS = 30.0
 ZERO_HASH = "0" * 64
@@ -66,6 +70,9 @@ BLOCKING_CLASSIFICATIONS = {
     "BYTE_BUDGET_EXCEEDED",
     "UNEXPECTED_REDIRECT",
     "UNEXPECTED_STATUS",
+    "RESPONSE_READ_TIMEOUT",
+    "RESPONSE_READ_ERROR",
+    "RESPONSE_STORAGE_ERROR",
 }
 
 FORBIDDEN_BODY_PATH_FRAGMENTS = (
@@ -115,6 +122,11 @@ class BudgetBlockedError(ProvenanceError):
 
 class SessionFinalizedError(ProvenanceError):
     classification = "SESSION_FINALIZED"
+    exit_code = EXIT_SESSION_INVALID
+
+
+class SessionBusyError(ProvenanceError):
+    classification = "SESSION_BUSY"
     exit_code = EXIT_SESSION_INVALID
 
 
@@ -325,16 +337,20 @@ def canonical_url_identity(url: str) -> tuple[str, str, int, str, str]:
     )
 
 
-def _contains_forbidden_body_marker(value: str) -> bool:
-    lowered = value.lower()
-    if any(token in lowered for token in FORBIDDEN_BODY_PATH_FRAGMENTS):
-        return True
-    decoded = lowered
-    for _ in range(2):
-        decoded = urllib.parse.unquote(decoded)
-        if any(token in decoded for token in FORBIDDEN_BODY_PATH_FRAGMENTS):
-            return True
-    return False
+def _screen_forbidden_body_markers(value: str) -> None:
+    current = value.lower()
+    for _ in range(MAX_PERCENT_DECODE_PASSES):
+        if any(token in current for token in FORBIDDEN_BODY_PATH_FRAGMENTS):
+            raise RequestPolicyError(
+                "checkpoint/weight body markers are not authorized"
+            )
+        decoded = urllib.parse.unquote(current)
+        if decoded == current:
+            return
+        current = decoded
+    raise RequestPolicyError(
+        "URL percent-decoding did not stabilize within the security bound"
+    )
 
 
 def _validate_public_url(
@@ -345,6 +361,10 @@ def _validate_public_url(
 ) -> urllib.parse.SplitResult:
     if not isinstance(url, str) or not url:
         raise RequestPolicyError("URL must be a non-empty string")
+    if len(url) > MAX_URL_CHARS:
+        raise RequestPolicyError(
+            f"URL exceeds the {MAX_URL_CHARS}-character size limit"
+        )
     try:
         parsed = urllib.parse.urlsplit(url)
         port = parsed.port
@@ -365,10 +385,8 @@ def _validate_public_url(
     host = parsed.hostname.lower()
     if host not in allowed_hosts:
         raise RequestPolicyError(f"host is not authorized: {host!r}")
-    if _contains_forbidden_body_marker(parsed.path):
-        raise RequestPolicyError("checkpoint/weight body paths are not authorized")
-    if _contains_forbidden_body_marker(parsed.query):
-        raise RequestPolicyError("checkpoint/weight body query values are not authorized")
+    _screen_forbidden_body_markers(parsed.path)
+    _screen_forbidden_body_markers(parsed.query)
     return parsed
 
 
@@ -423,6 +441,14 @@ def compute_plan_hash(plan_payload: Mapping[str, Any]) -> str:
         ],
     }
     return sha256_bytes(canonical_json_bytes(payload))
+
+
+def _locked_session(method: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(method)
+    def wrapper(self: "ProvenanceSession", *args: Any, **kwargs: Any) -> Any:
+        with self._session_lock():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 @dataclass(frozen=True, slots=True)
@@ -750,6 +776,81 @@ class ProvenanceSession:
         self.summary_path = self.root / "session-summary.json"
         self.plan_path = self.root / "session-plan.json"
         self.responses_dir = self.root / "responses"
+        self.lock_path = self.root / ".session.lock"
+
+    def _reject_symlink_components(self, path: Path) -> None:
+        root = self.root
+        candidate = path
+        while True:
+            if candidate.is_symlink():
+                raise SessionInvalidError(
+                    f"session path contains a symlink component: {candidate}"
+                )
+            if candidate == root:
+                break
+            parent = candidate.parent
+            if parent == candidate:
+                break
+            candidate = parent
+
+    def _validate_session_root(self) -> None:
+        self._reject_symlink_components(self.root)
+        if not self.root.exists():
+            raise SessionInvalidError("session root does not exist")
+        if not self.root.is_dir():
+            raise SessionInvalidError("session root must be a directory")
+
+    def _validate_authoritative_path(self, path: Path, *, directory: bool = False) -> None:
+        self._reject_symlink_components(path)
+        resolved_root = self.root.resolve()
+        resolved_path = path.resolve()
+        if resolved_path.parent != resolved_root:
+            raise SessionInvalidError(
+                f"session path escapes the canonical session root: {path}"
+            )
+        if directory:
+            if not resolved_path.is_dir():
+                raise SessionInvalidError(f"expected directory is missing: {path}")
+        else:
+            if resolved_path.exists() and not resolved_path.is_file():
+                raise SessionInvalidError(
+                    f"authoritative path must be a regular file: {path}"
+                )
+
+    def _validate_authoritative_files(self) -> None:
+        self._validate_session_root()
+        for path in (
+            self.plan_path,
+            self.state_path,
+            self.summary_path,
+            self.log_path,
+        ):
+            self._validate_authoritative_path(path)
+        self._validate_authoritative_path(self.responses_dir, directory=True)
+        if self.lock_path.is_symlink():
+            raise SessionInvalidError("session lock path must not be a symlink")
+
+    @contextmanager
+    def _session_lock(self) -> Any:
+        self._validate_session_root()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._validate_authoritative_files()
+        if self.lock_path.is_symlink():
+            raise SessionInvalidError("session lock path must not be a symlink")
+        try:
+            fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        except FileExistsError as error:
+            raise SessionBusyError("session is busy; lock already held") from error
+        except OSError as error:
+            raise SessionInvalidError(f"cannot create session lock: {error}") from error
+        try:
+            yield
+        finally:
+            os.close(fd)
+            try:
+                self.lock_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _ensure_plan(self) -> SessionPlan:
         if self.plan is None:
@@ -789,42 +890,43 @@ class ProvenanceSession:
         self.plan = plan
         self.root.mkdir(parents=True, exist_ok=True)
         self.responses_dir.mkdir(parents=True, exist_ok=True)
-        if self.log_path.exists() and self.log_path.stat().st_size > 0:
-            raise SessionInvalidError(
-                f"session log already exists; refusing to reinitialize {self.log_path}"
+        with self._session_lock():
+            if self.log_path.exists() and self.log_path.stat().st_size > 0:
+                raise SessionInvalidError(
+                    f"session log already exists; refusing to reinitialize {self.log_path}"
+                )
+            if self.state_path.exists() or self.summary_path.exists():
+                raise SessionInvalidError(
+                    "session state or summary already exists; refusing to reinitialize"
+                )
+            session_id = uuid.uuid4().hex
+            created_utc = utc_now()
+            self._write_json_atomic(self.plan_path, plan.to_dict(), "session plan")
+            self._write_json_atomic(
+                self.state_path,
+                self._new_state(
+                    plan,
+                    [],
+                    blocked_reason=None,
+                    session_id=session_id,
+                    created_utc=created_utc,
+                    finalized=False,
+                ),
+                "session state",
             )
-        if self.state_path.exists() or self.summary_path.exists():
-            raise SessionInvalidError(
-                "session state or summary already exists; refusing to reinitialize"
+            self._write_json_atomic(
+                self.summary_path,
+                self._summary_from(
+                    [],
+                    plan,
+                    session_id=session_id,
+                    blocked_reason=None,
+                    finalized=False,
+                ),
+                "session summary",
             )
-        session_id = uuid.uuid4().hex
-        created_utc = utc_now()
-        self._write_json_atomic(self.plan_path, plan.to_dict(), "session plan")
-        self._write_json_atomic(
-            self.state_path,
-            self._new_state(
-                plan,
-                [],
-                blocked_reason=None,
-                session_id=session_id,
-                created_utc=created_utc,
-                finalized=False,
-            ),
-            "session state",
-        )
-        self._write_json_atomic(
-            self.summary_path,
-            self._summary_from(
-                [],
-                plan,
-                session_id=session_id,
-                blocked_reason=None,
-                finalized=False,
-            ),
-            "session summary",
-        )
-        if not self.log_path.exists():
-            self.log_path.touch(mode=0o600, exist_ok=True)
+            if not self.log_path.exists():
+                self.log_path.touch(mode=0o600, exist_ok=True)
 
     def _write_json_atomic(self, path: Path, value: Any, subject: str) -> None:
         temporary = path.with_name(path.name + ".tmp")
@@ -937,6 +1039,7 @@ class ProvenanceSession:
         *,
         allow_pending_retained: bool = False,
     ) -> list[dict[str, Any]]:
+        self._validate_authoritative_files()
         try:
             plan = self._plan_from_disk()
         except PlanValidationError as error:
@@ -1079,10 +1182,11 @@ class ProvenanceSession:
     def _safe_retained_target(self, filename: str) -> Path:
         if not SAFE_RETAINED_FILENAME_RE.fullmatch(filename):
             raise SessionInvalidError(f"unsafe retained filename: {filename!r}")
+        self._validate_session_root()
+        self._reject_symlink_components(self.responses_dir)
         root = self.responses_dir.resolve()
         candidate = self.responses_dir / filename
-        if candidate.is_symlink() or self.responses_dir.is_symlink():
-            raise SessionInvalidError(f"retained path contains a symlink: {candidate}")
+        self._reject_symlink_components(candidate)
         resolved = candidate.resolve()
         if resolved.parent != root:
             raise SessionInvalidError(
@@ -1234,6 +1338,7 @@ class ProvenanceSession:
                 f"cannot append to session log {self.log_path}: {error}"
             ) from error
 
+    @_locked_session
     def finalize(self) -> dict[str, Any]:
         plan = self._plan_from_disk()
         records = self.verify_session()
@@ -1354,6 +1459,47 @@ class ProvenanceSession:
             remaining -= len(chunk)
         return b"".join(chunks), eof
 
+    def _read_exact_observed(
+        self,
+        response: Any,
+        amount: int,
+    ) -> tuple[bytes, bool, str | None]:
+        chunks: list[bytes] = []
+        remaining = amount
+        while remaining > 0:
+            try:
+                chunk = response.read(min(CHUNK_SIZE, remaining))
+            except (socket.timeout, TimeoutError):
+                return b"".join(chunks), False, "RESPONSE_READ_TIMEOUT"
+            except Exception:
+                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks), remaining == 0, None
+
+    def _read_streaming_observed(
+        self,
+        response: Any,
+        remaining_bytes: int,
+    ) -> tuple[bytes, bool, str | None]:
+        chunks: list[bytes] = []
+        remaining = remaining_bytes
+        while True:
+            if remaining <= 0:
+                return b"".join(chunks), False, None
+            try:
+                chunk = response.read(min(CHUNK_SIZE, remaining))
+            except (socket.timeout, TimeoutError):
+                return b"".join(chunks), False, "RESPONSE_READ_TIMEOUT"
+            except Exception:
+                return b"".join(chunks), False, "RESPONSE_READ_ERROR"
+            if not chunk:
+                return b"".join(chunks), True, None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
     def _record_authorizes_redirect_target(
         self,
         record: Mapping[str, Any],
@@ -1410,6 +1556,7 @@ class ProvenanceSession:
                 )
         return next_request
 
+    @_locked_session
     def execute(
         self,
         transport: Callable[[str, str, dict[str, str]], Any] | None = None,
@@ -1455,6 +1602,7 @@ class ProvenanceSession:
                 raise BudgetBlockedError(f"session blocked: {blocked_reason}")
         return self.load_records()
 
+    @_locked_session
     def request_one(
         self,
         entry_id: str,
@@ -1581,6 +1729,7 @@ class ProvenanceSession:
             "remaining_request_budget": plan.max_requests - sequence,
             "remaining_byte_budget": remaining_bytes,
             "body_measured": False,
+            "body_complete": False,
             "refusal_reason": None,
             "plan_entry_id": request.id,
             "detail": detail,
@@ -1597,7 +1746,16 @@ class ProvenanceSession:
         records: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
         status = int(response.status)
-        content_length = self._parse_content_length(response)
+        try:
+            content_length = self._parse_content_length(response)
+        except SessionInvalidError:
+            return self._invalid_content_length_record(
+                request=request,
+                plan=plan,
+                host=host,
+                sequence=sequence,
+                status=status,
+            )
         location_values = self._header_values(response, "location")
         redirect_location = location_values[0] if len(location_values) == 1 else None
         final_host = getattr(response, "final_host", host)
@@ -1617,23 +1775,43 @@ class ProvenanceSession:
                 reason="content_length_exceeds_remaining_budget",
             )
 
+        body_complete = False
+        read_classification: str | None = None
         if content_length is not None:
-            body = self._read_exact(response, content_length)
+            body, body_complete, read_classification = self._read_exact_observed(
+                response,
+                content_length,
+            )
             actual = len(body)
-            eof = actual == content_length
-            classification: str | None = None
-            blocked = not eof
-            if blocked:
-                classification = "CONTENT_LENGTH_INVALID"
+            if read_classification is not None:
+                classification = read_classification
+                blocked = True
+            else:
+                classification = None
+                blocked = not body_complete
+                if blocked:
+                    classification = "CONTENT_LENGTH_INVALID"
         else:
-            body, eof = self._read_streaming(response, remaining_bytes)
+            body, body_complete, read_classification = self._read_streaming_observed(
+                response,
+                remaining_bytes,
+            )
             actual = len(body)
-            classification = None
-            blocked = not eof
-            if blocked:
-                classification = "BYTE_BUDGET_EXCEEDED"
+            if read_classification is not None:
+                classification = read_classification
+                blocked = True
+            else:
+                classification = None
+                blocked = not body_complete
+                if blocked:
+                    classification = "BYTE_BUDGET_EXCEEDED"
 
-        retained = self._save_body(body, request=request, sequence=sequence)
+        try:
+            retained = self._save_body(body, request=request, sequence=sequence)
+        except ProvenanceError:
+            retained = None
+            classification = "RESPONSE_STORAGE_ERROR"
+            blocked = True
         body_hash = sha256_bytes(body)
 
         refusal_reason: str | None = None
@@ -1646,11 +1824,15 @@ class ProvenanceSession:
         redirect_source_record_hash: str | None = None
         redirect_refusal_reason: str | None = None
 
-        if request.expected_statuses and status not in request.expected_statuses:
+        if (
+            classification is None
+            and request.expected_statuses
+            and status not in request.expected_statuses
+        ):
             classification = "UNEXPECTED_STATUS"
             blocked = True
             refusal_reason = "status_not_in_expected_statuses"
-        elif request.redirect_from_id is not None:
+        elif classification is None and request.redirect_from_id is not None:
             source_record = records[-1]
             redirect_target_id = request.id
             redirect_authorized = True
@@ -1658,7 +1840,7 @@ class ProvenanceSession:
             redirect_followed = True
             redirect_source_entry_id = request.redirect_from_id
             redirect_source_record_hash = source_record["current_hash"]
-        elif 300 <= status < 400 and status != 304:
+        elif classification is None and 300 <= status < 400 and status != 304:
             redirect_target_id = request.redirect_target_id
             if len(location_values) != 1:
                 classification = "UNEXPECTED_REDIRECT"
@@ -1748,9 +1930,10 @@ class ProvenanceSession:
             "remaining_request_budget": plan.max_requests - sequence,
             "remaining_byte_budget": remaining_bytes - actual,
             "body_measured": True,
+            "body_complete": body_complete,
             "refusal_reason": refusal_reason,
             "plan_entry_id": request.id,
-            "detail": "truncated_body" if not eof and not blocked else None,
+            "detail": "truncated_body" if not body_complete and not blocked else None,
         }
         return record
 
@@ -1797,7 +1980,52 @@ class ProvenanceSession:
             "remaining_request_budget": plan.max_requests - sequence,
             "remaining_byte_budget": remaining_bytes,
             "body_measured": False,
+            "body_complete": False,
             "refusal_reason": reason,
+            "plan_entry_id": request.id,
+            "detail": "body_not_read",
+        }
+
+
+    def _invalid_content_length_record(
+        self,
+        *,
+        request: PlanRequest,
+        plan: SessionPlan,
+        host: str,
+        sequence: int,
+        status: int,
+    ) -> dict[str, Any]:
+        return {
+            "record_type": HTTP_RECORD_TYPE,
+            "schema_version": SCHEMA_VERSION,
+            "sequence": sequence,
+            "timestamp": utc_now(),
+            "method": request.method,
+            "url": request.url,
+            "host": host,
+            "status": status,
+            "transport_classification": "CONTENT_LENGTH_INVALID",
+            "response_body_bytes": 0,
+            "response_body_sha256": None,
+            "no_body_identity": "body_not_read",
+            "content_length": None,
+            "redirect_location": None,
+            "redirect_resolved_url": None,
+            "redirect_target_id": request.redirect_target_id,
+            "redirect_exact_match": None,
+            "redirect_authorized": False,
+            "redirect_followed": False,
+            "redirect_source_entry_id": None,
+            "redirect_source_record_hash": None,
+            "redirect_refusal_reason": None,
+            "final_host": host,
+            "retained_filename": None,
+            "remaining_request_budget": plan.max_requests - sequence,
+            "remaining_byte_budget": None,
+            "body_measured": False,
+            "body_complete": False,
+            "refusal_reason": "invalid_content_length",
             "plan_entry_id": request.id,
             "detail": "body_not_read",
         }
@@ -1964,7 +2192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 **_structured_output(
                     args.command,
                     False,
-                    f"{type(error).__name__}: {error}",
+                    "unexpected internal error",
                 ),
                 "classification": "INTERNAL_ERROR",
                 "exit_code": EXIT_INTERNAL,

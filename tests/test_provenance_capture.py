@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
 import socket
 import tempfile
+import threading
+import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from tools import provenance_capture as pc
 
@@ -43,6 +48,21 @@ class FakeResponse:
         result = self.body[self.position : self.position + amount]
         self.position += len(result)
         return result
+
+
+class FlakyResponse(FakeResponse):
+    def __init__(self, status, body=b"", headers=None, final_host=None,
+                 read_error_after=0, error=None):
+        super().__init__(status, body, headers, final_host)
+        self.read_error_after = read_error_after
+        self.error = error or socket.timeout("read timed out")
+
+    def read(self, amount=-1):
+        if self.position >= self.read_error_after:
+            raise self.error
+        if amount < 0 or amount > 1:
+            amount = 1
+        return super().read(amount)
 
 
 class FakeTransport:
@@ -1273,8 +1293,11 @@ class ProvenanceCaptureTests(unittest.TestCase):
             ("https://example.com/download?file=model.ckpt", True),
             ("https://example.com/model%2Eckpt", False),
             ("https://example.com/model%252Eckpt", False),
+            ("https://example.com/model%25252Eckpt", False),
+            ("https://example.com/model%2525252Eckpt", False),
             ("https://example.com/MODEL.CKPT", False),
             ("https://example.com/download?file=model%252Eckpt", True),
+            ("https://example.com/download?file=model%25252Eckpt", True),
         ]
         for index, (url, allow_query) in enumerate(cases):
             with self.subTest(url=url):
@@ -1310,6 +1333,236 @@ class ProvenanceCaptureTests(unittest.TestCase):
         self.assertTrue(records[1]["redirect_followed"])
         self.assertEqual(records[1]["redirect_source_entry_id"], "r1")
         self.assertEqual(records[1]["redirect_source_record_hash"], records[0]["current_hash"])
+
+
+    def test_concurrent_session_lock_allows_one_transport_call(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        started = threading.Event()
+        release = threading.Event()
+        responses = [FakeResponse(200, b"ok")]
+        results = []
+
+        def slow_transport(method, url, headers):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("release timeout")
+            return responses.pop(0)
+
+        def run_winner():
+            winner = pc.ProvenanceSession(self.session_dir)
+            results.append(winner.request_one("r1", slow_transport))
+
+        thread = threading.Thread(target=run_winner)
+        thread.start()
+        self.assertTrue(started.wait(5))
+        loser = pc.ProvenanceSession(self.session_dir)
+        loser_transport = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionBusyError):
+            loser.request_one("r1", loser_transport)
+        release.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(loser_transport.calls, 0)
+        records = session.load_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["sequence"], 1)
+        session.verify_session()
+
+    def test_response_read_timeout_before_body_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        transport = FakeTransport(
+            [FlakyResponse(200, b"hello", read_error_after=0, error=socket.timeout("read"))]
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", transport)
+        records = session.load_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], 200)
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_READ_TIMEOUT")
+        self.assertEqual(records[0]["response_body_bytes"], 0)
+        self.assertFalse(records[0]["body_complete"])
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionFinalizedError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
+
+    def test_response_read_timeout_after_partial_body_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        transport = FakeTransport(
+            [FlakyResponse(200, b"hello", read_error_after=3, error=socket.timeout("read"))]
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", transport)
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_READ_TIMEOUT")
+        self.assertEqual(records[0]["response_body_bytes"], 3)
+        self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"hel"))
+        self.assertFalse(records[0]["body_complete"])
+
+    def test_malformed_content_length_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        response = FakeResponse(200, b"ok", {"content-length": ["abc"]})
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", FakeTransport([response]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
+        self.assertIsNone(records[0]["response_body_sha256"])
+        self.assertFalse(records[0]["body_measured"])
+        self.assertEqual(records[0]["response_body_bytes"], 0)
+
+    def test_conflicting_content_length_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        response = FakeResponse(200, b"ok", {"content-length": ["1", "2"]})
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", FakeTransport([response]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
+        self.assertEqual(records[0]["response_body_bytes"], 0)
+
+    def test_early_eof_blocks_truthfully(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a"),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        response = FakeResponse(200, b"short", {"content-length": ["10"]})
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r1", FakeTransport([response]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "CONTENT_LENGTH_INVALID")
+        self.assertEqual(records[0]["response_body_bytes"], 5)
+        self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"short"))
+        self.assertFalse(records[0]["body_complete"])
+
+    def test_retained_body_write_failure_blocks(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/a", retain=True),
+                make_request("r2", "https://example.com/b"),
+            ]
+        )
+        session = self.init_session(plan)
+        with mock.patch.object(
+            session,
+            "_save_body",
+            side_effect=pc.SessionInvalidError("disk full"),
+        ):
+            with self.assertRaises(pc.BudgetBlockedError):
+                session.request_one("r1", FakeTransport([FakeResponse(200, b"ok")]))
+        records = session.load_records()
+        self.assertEqual(records[0]["transport_classification"], "RESPONSE_STORAGE_ERROR")
+        self.assertIsNone(records[0]["retained_filename"])
+        self.assertTrue(records[0]["body_complete"])
+        self.assertEqual(records[0]["response_body_sha256"], pc.sha256_bytes(b"ok"))
+
+    def test_symlinked_session_root_rejected(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        target = Path(self.tmp.name) / "real-session"
+        target.mkdir()
+        link = Path(self.tmp.name) / "session-link"
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        session = pc.ProvenanceSession(link, plan=plan)
+        with self.assertRaises(pc.SessionInvalidError):
+            session.initialize()
+
+    def test_preexisting_log_symlink_rejected(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        outside = Path(self.tmp.name) / "outside.log"
+        outside.write_text("outside\n", encoding="utf-8")
+        session.log_path.unlink()
+        try:
+            os.symlink(outside, session.log_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_symlinked_responses_ancestor_rejected(self):
+        plan = make_plan([make_request("r1", "https://example.com/a", retain=True)])
+        session = self.init_session(plan)
+        session.execute(FakeTransport([FakeResponse(200, b"ok")]))
+        outside = Path(self.tmp.name) / "outside-responses"
+        outside.mkdir()
+        shutil.rmtree(session.responses_dir)
+        try:
+            os.symlink(outside, session.responses_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_valid_hf_resolve_cache_url_passes(self):
+        plan = make_plan(
+            [
+                make_request(
+                    "config-resolve",
+                    "https://huggingface.co/models/x/resolve/main/config.yaml",
+                    redirect_target_id="config-cache",
+                    expected_statuses=[307],
+                ),
+                make_request(
+                    "config-cache",
+                    "https://huggingface.co/api/resolve-cache/models/x/resolve/main/config.yaml",
+                    redirect_from_id="config-resolve",
+                    expected_statuses=[200],
+                ),
+            ],
+            allowed_hosts=["huggingface.co"],
+        )
+        self.assertEqual(plan.requests[0].id, "config-resolve")
+
+    def test_sanitized_internal_error_does_not_leak_sentinel(self):
+        buffer = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(
+            pc.ProvenanceSession,
+            "verify_session",
+            side_effect=RuntimeError("SECRET_SENTINEL_DO_NOT_LEAK"),
+        ), redirect_stdout(buffer), redirect_stderr(errors):
+            exit_code = pc.main(
+                ["verify", "--session-dir", str(self.session_dir)]
+            )
+        self.assertEqual(exit_code, pc.EXIT_INTERNAL)
+        output = buffer.getvalue()
+        payload = json.loads(output)
+        self.assertEqual(payload["classification"], "INTERNAL_ERROR")
+        self.assertEqual(payload["detail"], "unexpected internal error")
+        self.assertNotIn("SECRET_SENTINEL_DO_NOT_LEAK", output)
+        self.assertNotIn("SECRET_SENTINEL_DO_NOT_LEAK", errors.getvalue())
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn("Traceback", errors.getvalue())
 
 
 if __name__ == "__main__":
