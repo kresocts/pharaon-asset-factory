@@ -30,6 +30,7 @@ import os
 import re
 import socket
 import ssl
+import stat
 import sys
 import urllib.parse
 import uuid
@@ -794,10 +795,14 @@ class ProvenanceSession:
             candidate = parent
 
     def _validate_session_root(self) -> None:
+        absolute = os.path.normcase(os.path.abspath(str(self.root)))
+        real = os.path.normcase(os.path.realpath(str(self.root)))
+        if absolute != real:
+            raise SessionInvalidError(
+                "session root is reached through a symlink or junction"
+            )
         self._reject_symlink_components(self.root)
-        if not self.root.exists():
-            raise SessionInvalidError("session root does not exist")
-        if not self.root.is_dir():
+        if self.root.exists() and not self.root.is_dir():
             raise SessionInvalidError("session root must be a directory")
 
     def _validate_authoritative_path(self, path: Path, *, directory: bool = False) -> None:
@@ -812,10 +817,16 @@ class ProvenanceSession:
             if not resolved_path.is_dir():
                 raise SessionInvalidError(f"expected directory is missing: {path}")
         else:
-            if resolved_path.exists() and not resolved_path.is_file():
-                raise SessionInvalidError(
-                    f"authoritative path must be a regular file: {path}"
-                )
+            if resolved_path.exists():
+                if not resolved_path.is_file():
+                    raise SessionInvalidError(
+                        f"authoritative path must be a regular file: {path}"
+                    )
+                st = path.lstat()
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                    raise SessionInvalidError(
+                        f"authoritative path must be a single-link regular file: {path}"
+                    )
 
     def _validate_authoritative_files(self) -> None:
         self._validate_session_root()
@@ -830,10 +841,62 @@ class ProvenanceSession:
         if self.lock_path.is_symlink():
             raise SessionInvalidError("session lock path must not be a symlink")
 
+    def _assert_regular_single_link_fd(
+        self,
+        fd: int,
+        path: Path,
+        subject: str,
+    ) -> None:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise SessionInvalidError(
+                f"{subject} is not a single-link regular file: {path}"
+            )
+
+    def _open_exclusive_regular_file(
+        self,
+        path: Path,
+        subject: str,
+    ) -> int:
+        self._reject_symlink_components(path)
+        if path.exists() or path.is_symlink():
+            raise SessionInvalidError(
+                f"{subject} already exists; refusing to overwrite: {path}"
+            )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError as error:
+            raise SessionInvalidError(
+                f"{subject} already exists; refusing to overwrite: {path}"
+            ) from error
+        except OSError as error:
+            raise SessionInvalidError(
+                f"cannot create {subject} {path}: {error}"
+            ) from error
+        self._assert_regular_single_link_fd(fd, path, subject)
+        return fd
+
+    def _write_exclusive_bytes(
+        self,
+        path: Path,
+        data: bytes,
+        subject: str,
+    ) -> None:
+        fd = self._open_exclusive_regular_file(path, subject)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     @contextmanager
     def _session_lock(self) -> Any:
         self._validate_session_root()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.responses_dir.mkdir(parents=True, exist_ok=True)
         self._validate_authoritative_files()
         if self.lock_path.is_symlink():
             raise SessionInvalidError("session lock path must not be a symlink")
@@ -888,8 +951,6 @@ class ProvenanceSession:
     def initialize(self, plan: SessionPlan | None = None) -> None:
         plan = plan or self._ensure_plan()
         self.plan = plan
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.responses_dir.mkdir(parents=True, exist_ok=True)
         with self._session_lock():
             if self.log_path.exists() and self.log_path.stat().st_size > 0:
                 raise SessionInvalidError(
@@ -926,18 +987,37 @@ class ProvenanceSession:
                 "session summary",
             )
             if not self.log_path.exists():
-                self.log_path.touch(mode=0o600, exist_ok=True)
+                fd = self._open_exclusive_regular_file(
+                    self.log_path,
+                    "session log",
+                )
+                os.close(fd)
 
     def _write_json_atomic(self, path: Path, value: Any, subject: str) -> None:
+        self._validate_authoritative_path(path)
         temporary = path.with_name(path.name + ".tmp")
+        data = (
+            json.dumps(value, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        fd = self._open_exclusive_regular_file(temporary, subject)
         try:
-            temporary.write_text(
-                json.dumps(value, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._validate_authoritative_path(temporary)
+        self._validate_authoritative_path(path)
+        try:
             os.replace(temporary, path)
         except OSError as error:
-            raise SessionInvalidError(f"cannot write {subject} {path}: {error}") from error
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise SessionInvalidError(
+                f"cannot replace {subject} {path}: {error}"
+            ) from error
+        self._validate_authoritative_path(path)
 
     def _http_records(
         self,
@@ -1239,8 +1319,15 @@ class ProvenanceSession:
                     f"retained body is not a regular file: {filename!r}"
                 )
             try:
-                size = target.stat().st_size
+                st = target.lstat()
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                    raise SessionInvalidError(
+                        f"retained body must be a single-link regular file: {filename!r}"
+                    )
+                size = st.st_size
                 body = target.read_bytes()
+            except SessionInvalidError:
+                raise
             except OSError as error:
                 raise SessionInvalidError(
                     f"cannot read retained body {target}: {error}"
@@ -1329,14 +1416,23 @@ class ProvenanceSession:
                 ensure_ascii=False,
             )
             + "\n"
-        )
+        ).encode("utf-8")
+        self._validate_authoritative_path(self.log_path)
+        flags = os.O_WRONLY | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
         try:
-            with self.log_path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(line)
+            fd = os.open(self.log_path, flags, 0o600)
         except OSError as error:
             raise SessionInvalidError(
                 f"cannot append to session log {self.log_path}: {error}"
             ) from error
+        self._assert_regular_single_link_fd(fd, self.log_path, "session log")
+        try:
+            os.write(fd, line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     @_locked_session
     def finalize(self) -> dict[str, Any]:
@@ -1422,14 +1518,11 @@ class ProvenanceSession:
             )
         filename = f"{sequence:04d}.bin"
         target = self._safe_retained_target(filename)
-        if target.exists():
-            raise SessionInvalidError(
-                f"refusing to overwrite retained body {target}"
-            )
-        try:
-            target.write_bytes(body)
-        except OSError as error:
-            raise SessionInvalidError(f"cannot save response body {target}: {error}") from error
+        self._write_exclusive_bytes(
+            target,
+            body,
+            "retained body",
+        )
         return filename
 
     def _read_exact(self, response: Any, amount: int) -> bytes:
@@ -1643,6 +1736,32 @@ class ProvenanceSession:
             raise BudgetBlockedError(f"session blocked: {blocked_reason}")
         return record
 
+    def _target_attempt_context(
+        self,
+        request: PlanRequest,
+        plan: SessionPlan,
+        records: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        if request.redirect_from_id is None or not records:
+            return {
+                "redirect_target_id": None,
+                "redirect_exact_match": None,
+                "redirect_authorized": False,
+                "redirect_followed": False,
+                "redirect_source_entry_id": None,
+                "redirect_source_record_hash": None,
+            }
+        source = plan.requests[len(records) - 1]
+        source_record = records[-1]
+        return {
+            "redirect_target_id": request.id,
+            "redirect_exact_match": True,
+            "redirect_authorized": True,
+            "redirect_followed": True,
+            "redirect_source_entry_id": source.id,
+            "redirect_source_record_hash": source_record["current_hash"],
+        }
+
     def _perform_one(
         self,
         request: PlanRequest,
@@ -1654,6 +1773,7 @@ class ProvenanceSession:
     ) -> dict[str, Any]:
         sequence = len(records) + 1
         host = _normalise_host(request.url)
+        target_context = self._target_attempt_context(request, plan, records)
         headers = {
             "User-Agent": USER_AGENT,
             "Accept-Encoding": "identity",
@@ -1669,6 +1789,7 @@ class ProvenanceSession:
                 remaining_bytes,
                 "TIMEOUT",
                 detail="timeout",
+                target_context=target_context,
             )
         except Exception:
             return self._transport_record(
@@ -1679,6 +1800,7 @@ class ProvenanceSession:
                 remaining_bytes,
                 "TRANSPORT_ERROR",
                 detail="transport_error",
+                target_context=target_context,
             )
         return self._response_record(
             request,
@@ -1688,6 +1810,7 @@ class ProvenanceSession:
             sequence,
             remaining_bytes,
             records,
+            target_context=target_context,
         )
 
     def _transport_record(
@@ -1700,7 +1823,9 @@ class ProvenanceSession:
         classification: str,
         *,
         detail: str,
+        target_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        context = dict(target_context or {})
         return {
             "record_type": HTTP_RECORD_TYPE,
             "schema_version": SCHEMA_VERSION,
@@ -1717,12 +1842,12 @@ class ProvenanceSession:
             "content_length": None,
             "redirect_location": None,
             "redirect_resolved_url": None,
-            "redirect_target_id": None,
-            "redirect_exact_match": None,
-            "redirect_authorized": False,
-            "redirect_followed": False,
-            "redirect_source_entry_id": None,
-            "redirect_source_record_hash": None,
+            "redirect_target_id": context.get("redirect_target_id"),
+            "redirect_exact_match": context.get("redirect_exact_match"),
+            "redirect_authorized": context.get("redirect_authorized", False),
+            "redirect_followed": context.get("redirect_followed", False),
+            "redirect_source_entry_id": context.get("redirect_source_entry_id"),
+            "redirect_source_record_hash": context.get("redirect_source_record_hash"),
             "redirect_refusal_reason": None,
             "final_host": host,
             "retained_filename": None,
@@ -1744,6 +1869,7 @@ class ProvenanceSession:
         sequence: int,
         remaining_bytes: int,
         records: Sequence[Mapping[str, Any]],
+        target_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         status = int(response.status)
         try:
@@ -1755,6 +1881,7 @@ class ProvenanceSession:
                 host=host,
                 sequence=sequence,
                 status=status,
+                target_context=target_context,
             )
         location_values = self._header_values(response, "location")
         redirect_location = location_values[0] if len(location_values) == 1 else None
@@ -1773,6 +1900,7 @@ class ProvenanceSession:
                 redirect_location=redirect_location,
                 classification="BUDGET_REFUSAL",
                 reason="content_length_exceeds_remaining_budget",
+                target_context=target_context,
             )
 
         body_complete = False
@@ -1814,14 +1942,15 @@ class ProvenanceSession:
             blocked = True
         body_hash = sha256_bytes(body)
 
+        context = dict(target_context or {})
         refusal_reason: str | None = None
-        redirect_target_id: str | None = None
+        redirect_target_id = context.get("redirect_target_id")
         redirect_resolved_url: str | None = None
-        redirect_exact_match: bool | None = None
-        redirect_authorized = False
-        redirect_followed = False
-        redirect_source_entry_id: str | None = None
-        redirect_source_record_hash: str | None = None
+        redirect_exact_match = context.get("redirect_exact_match")
+        redirect_authorized = context.get("redirect_authorized", False)
+        redirect_followed = context.get("redirect_followed", False)
+        redirect_source_entry_id = context.get("redirect_source_entry_id")
+        redirect_source_record_hash = context.get("redirect_source_record_hash")
         redirect_refusal_reason: str | None = None
 
         if (
@@ -1951,7 +2080,9 @@ class ProvenanceSession:
         redirect_location: str | None,
         classification: str,
         reason: str,
+        target_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        context = dict(target_context or {})
         return {
             "record_type": HTTP_RECORD_TYPE,
             "schema_version": SCHEMA_VERSION,
@@ -1968,12 +2099,12 @@ class ProvenanceSession:
             "content_length": content_length,
             "redirect_location": redirect_location,
             "redirect_resolved_url": None,
-            "redirect_target_id": request.redirect_target_id,
-            "redirect_exact_match": None,
-            "redirect_authorized": False,
-            "redirect_followed": False,
-            "redirect_source_entry_id": None,
-            "redirect_source_record_hash": None,
+            "redirect_target_id": context.get("redirect_target_id"),
+            "redirect_exact_match": context.get("redirect_exact_match"),
+            "redirect_authorized": context.get("redirect_authorized", False),
+            "redirect_followed": context.get("redirect_followed", False),
+            "redirect_source_entry_id": context.get("redirect_source_entry_id"),
+            "redirect_source_record_hash": context.get("redirect_source_record_hash"),
             "redirect_refusal_reason": None,
             "final_host": final_host,
             "retained_filename": None,
@@ -1995,7 +2126,9 @@ class ProvenanceSession:
         host: str,
         sequence: int,
         status: int,
+        target_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        context = dict(target_context or {})
         return {
             "record_type": HTTP_RECORD_TYPE,
             "schema_version": SCHEMA_VERSION,
@@ -2012,12 +2145,12 @@ class ProvenanceSession:
             "content_length": None,
             "redirect_location": None,
             "redirect_resolved_url": None,
-            "redirect_target_id": request.redirect_target_id,
-            "redirect_exact_match": None,
-            "redirect_authorized": False,
-            "redirect_followed": False,
-            "redirect_source_entry_id": None,
-            "redirect_source_record_hash": None,
+            "redirect_target_id": context.get("redirect_target_id"),
+            "redirect_exact_match": context.get("redirect_exact_match"),
+            "redirect_authorized": context.get("redirect_authorized", False),
+            "redirect_followed": context.get("redirect_followed", False),
+            "redirect_source_entry_id": context.get("redirect_source_entry_id"),
+            "redirect_source_record_hash": context.get("redirect_source_record_hash"),
             "redirect_refusal_reason": None,
             "final_host": host,
             "retained_filename": None,

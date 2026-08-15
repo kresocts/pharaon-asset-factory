@@ -1565,5 +1565,232 @@ class ProvenanceCaptureTests(unittest.TestCase):
         self.assertNotIn("Traceback", errors.getvalue())
 
 
+    def test_redirect_target_transport_timeout_binds_source(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/start", redirect_target_id="r2", expected_statuses=[307]),
+                make_request("r2", "https://example.com/end", redirect_from_id="r1", expected_statuses=[200]),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one(
+            "r1",
+            FakeTransport(
+                [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
+            ),
+        )
+        target_transport = FakeTransport(error=socket.timeout("timed out"))
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r2", target_transport)
+        records = session.load_records()
+        self.assertEqual(len(records), 2)
+        target = records[1]
+        self.assertEqual(target["plan_entry_id"], "r2")
+        self.assertEqual(target["transport_classification"], "TIMEOUT")
+        self.assertTrue(target["redirect_followed"])
+        self.assertEqual(target["redirect_source_entry_id"], "r1")
+        self.assertEqual(target["redirect_source_record_hash"], records[0]["current_hash"])
+        session.verify_session()
+        later = FakeTransport([FakeResponse(200, b"no")])
+        with self.assertRaises(pc.SessionFinalizedError):
+            session.request_one("r2", later)
+        self.assertEqual(later.calls, 0)
+
+    def test_redirect_target_transport_error_binds_source(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/start", redirect_target_id="r2", expected_statuses=[307]),
+                make_request("r2", "https://example.com/end", redirect_from_id="r1", expected_statuses=[200]),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one(
+            "r1",
+            FakeTransport(
+                [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
+            ),
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r2", FakeTransport(error=RuntimeError("boom")))
+        target = session.load_records()[1]
+        self.assertEqual(target["transport_classification"], "TRANSPORT_ERROR")
+        self.assertTrue(target["redirect_followed"])
+        self.assertEqual(target["redirect_source_entry_id"], "r1")
+        session.verify_session()
+
+    def test_redirect_target_read_timeout_binds_source(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/start", redirect_target_id="r2", expected_statuses=[307]),
+                make_request("r2", "https://example.com/end", redirect_from_id="r1", expected_statuses=[200]),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one(
+            "r1",
+            FakeTransport(
+                [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
+            ),
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one(
+                "r2",
+                FakeTransport(
+                    [FlakyResponse(200, b"hello", read_error_after=0, error=socket.timeout("read"))]
+                ),
+            )
+        target = session.load_records()[1]
+        self.assertEqual(target["transport_classification"], "RESPONSE_READ_TIMEOUT")
+        self.assertTrue(target["redirect_followed"])
+        self.assertEqual(target["redirect_source_entry_id"], "r1")
+        session.verify_session()
+
+    def test_redirect_target_invalid_content_length_binds_source(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/start", redirect_target_id="r2", expected_statuses=[307]),
+                make_request("r2", "https://example.com/end", redirect_from_id="r1", expected_statuses=[200]),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one(
+            "r1",
+            FakeTransport(
+                [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
+            ),
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one(
+                "r2",
+                FakeTransport([FakeResponse(200, b"ok", {"content-length": ["abc"]})]),
+            )
+        target = session.load_records()[1]
+        self.assertEqual(target["transport_classification"], "CONTENT_LENGTH_INVALID")
+        self.assertTrue(target["redirect_followed"])
+        self.assertEqual(target["redirect_source_entry_id"], "r1")
+        session.verify_session()
+
+    def test_redirect_target_unexpected_status_binds_source(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/start", redirect_target_id="r2", expected_statuses=[307]),
+                make_request("r2", "https://example.com/end", redirect_from_id="r1", expected_statuses=[200]),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one(
+            "r1",
+            FakeTransport(
+                [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
+            ),
+        )
+        with self.assertRaises(pc.BudgetBlockedError):
+            session.request_one("r2", FakeTransport([FakeResponse(500, b"error")]))
+        target = session.load_records()[1]
+        self.assertEqual(target["transport_classification"], "UNEXPECTED_STATUS")
+        self.assertTrue(target["redirect_followed"])
+        self.assertEqual(target["redirect_source_entry_id"], "r1")
+        session.verify_session()
+
+    def test_redirect_target_storage_failure_binds_source(self):
+        plan = make_plan(
+            [
+                make_request("r1", "https://example.com/start", redirect_target_id="r2", expected_statuses=[307]),
+                make_request("r2", "https://example.com/end", redirect_from_id="r1", expected_statuses=[200], retain=True),
+            ]
+        )
+        session = self.init_session(plan)
+        session.request_one(
+            "r1",
+            FakeTransport(
+                [FakeResponse(307, b"r", {"location": ["https://example.com/end"]})]
+            ),
+        )
+        with mock.patch.object(
+            session,
+            "_save_body",
+            side_effect=pc.SessionInvalidError("disk full"),
+        ):
+            with self.assertRaises(pc.BudgetBlockedError):
+                session.request_one("r2", FakeTransport([FakeResponse(200, b"ok")]))
+        target = session.load_records()[1]
+        self.assertEqual(target["transport_classification"], "RESPONSE_STORAGE_ERROR")
+        self.assertTrue(target["redirect_followed"])
+        self.assertEqual(target["redirect_source_entry_id"], "r1")
+        session.verify_session()
+
+    def test_preexisting_atomic_temp_file_refused(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = pc.ProvenanceSession(self.session_dir, plan=plan)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        (self.session_dir / "session-plan.json.tmp").write_text("x", encoding="utf-8")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.initialize()
+
+    def test_symlinked_parent_rejected(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        target = Path(self.tmp.name) / "external-parent"
+        target.mkdir()
+        link = Path(self.tmp.name) / "linked-parent"
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        session = pc.ProvenanceSession(link / "session", plan=plan)
+        with self.assertRaises(pc.SessionInvalidError):
+            session.initialize()
+        self.assertFalse((target / "session").exists())
+
+    def test_nested_symlinked_ancestor_rejected(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        target = Path(self.tmp.name) / "external-parent"
+        target.mkdir()
+        link = Path(self.tmp.name) / "linked-parent"
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available on this platform")
+        session = pc.ProvenanceSession(link / "nested" / "session", plan=plan)
+        with self.assertRaises(pc.SessionInvalidError):
+            session.initialize()
+
+    def test_hardlinked_log_rejected_and_external_unchanged(self):
+        plan = make_plan([make_request("r1", "https://example.com/a")])
+        session = self.init_session(plan)
+        outside = Path(self.tmp.name) / "outside.log"
+        outside.write_text("outside-bytes", encoding="utf-8")
+        original = outside.read_bytes()
+        session.log_path.unlink()
+        try:
+            os.link(outside, session.log_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("hardlinks are not available on this platform")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+        self.assertEqual(outside.read_bytes(), original)
+
+    def test_hardlinked_retained_body_fails(self):
+        plan = make_plan([make_request("r1", "https://example.com/a", retain=True)])
+        session = self.init_session(plan)
+        session.execute(FakeTransport([FakeResponse(200, b"ok")]))
+        outside = Path(self.tmp.name) / "outside.bin"
+        outside.write_bytes(b"outside")
+        retained = session.responses_dir / "0001.bin"
+        retained.unlink()
+        try:
+            os.link(outside, retained)
+        except (OSError, NotImplementedError):
+            self.skipTest("hardlinks are not available on this platform")
+        with self.assertRaises(pc.SessionInvalidError):
+            session.verify_session()
+
+    def test_ordinary_single_link_files_still_work(self):
+        plan = make_plan([make_request("r1", "https://example.com/a", retain=True)])
+        session = self.init_session(plan)
+        records = session.execute(FakeTransport([FakeResponse(200, b"ok")]))
+        self.assertEqual(records[0]["status"], 200)
+        session.verify_session()
+
+
 if __name__ == "__main__":
     unittest.main()
